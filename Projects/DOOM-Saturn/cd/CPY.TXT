@@ -1,0 +1,2 @@
+Original DOOM (c) 1993-1997 id Software, licensed GPL-2.0.
+Sega Saturn Jo Engine port - non-commercial use only.

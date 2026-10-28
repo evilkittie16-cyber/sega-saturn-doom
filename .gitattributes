@@ -1,0 +1,26 @@
+# Text files
+*.c     text eol=lf
+*.h     text eol=lf
+*.s     text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+Makefile text eol=lf
+*.bat   text eol=crlf
+
+# Binary Sega Saturn & DOOM assets
+*.WAD   binary
+*.FLT   binary
+*.WL    binary
+*.PVS   binary
+*.LEAF  binary
+*.SEG   binary
+*.TEX   binary
+*.SPR   binary
+*.PAK   binary
+*.BLOB  binary
+*.BIN   binary
+*.TGA   binary
+*.A     binary
+*.O     binary
+*.DAT   binary
+*.TSK   binary

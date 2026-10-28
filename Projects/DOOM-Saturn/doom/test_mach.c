@@ -1,0 +1,4 @@
+
+int test(int a, int b) {
+    return (int)(((long long)a * b) >> 32);
+}

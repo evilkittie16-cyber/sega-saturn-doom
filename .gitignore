@@ -1,0 +1,38 @@
+# No pictures / screenshots / captures
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.mp4
+*.webp
+
+# Commercial retail IWAD (Shareware DOOM1.WAD is tracked)
+DOOM.WAD
+doom.wad
+
+# Build artifacts & intermediate binaries
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.elf
+*.bin
+!Compiler/COMMON/IP.BIN
+!Projects/DOOM-Saturn/cd/TEXTURES.BIN
+*.iso
+*.cue
+*.raw
+*.map
+*.pyc
+__pycache__/
+
+# Emulator state / temporary logs
+*.yss
+*.csv
+*.log
+staging_assets/

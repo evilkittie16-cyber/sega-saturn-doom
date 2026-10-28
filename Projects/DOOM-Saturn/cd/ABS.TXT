@@ -1,0 +1,3 @@
+DOOM for Sega Saturn
+A Jo Engine port of the original 1993 DOOM source release.
+This port is for non-commercial use only; you must own a licensed copy of DOOM to legally load the WAD data.
