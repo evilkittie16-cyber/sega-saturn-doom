@@ -922,6 +922,16 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
         unsigned int holes  = ent[6];
         unsigned int ofs    = ((unsigned int)ent[8] << 24) | ((unsigned int)ent[9] << 16) | ((unsigned int)ent[10] << 8) | (unsigned int)ent[11];
         unsigned int sz     = ((unsigned int)ent[12] << 24) | ((unsigned int)ent[13] << 16) | ((unsigned int)ent[14] << 8) | (unsigned int)ent[15];
+        if (ent[16])
+        {
+            char name_buf[9];
+            D_memcpy(name_buf, ent + 16, 8);
+            name_buf[8] = '\0';
+            int resolved = R_CheckTextureNumForName(name_buf);
+            if (resolved < 0)
+                continue;
+            texnum = (unsigned int)resolved;
+        }
 
         if (texnum < (unsigned int)numtextures && ofs + sz <= (unsigned int)fsize)
         {
@@ -994,6 +1004,16 @@ int Saturn_BakedSprites_Parse(byte *blob, unsigned fsize)
         short to          = (short)(((unsigned int)ent[8] << 8) | ent[9]);
         unsigned int ofs  = ((unsigned int)ent[12] << 24) | ((unsigned int)ent[13] << 16) | ((unsigned int)ent[14] << 8)  | (unsigned int)ent[15];
         unsigned int sz   = ((unsigned int)ent[16] << 24) | ((unsigned int)ent[17] << 16) | ((unsigned int)ent[18] << 8)  | (unsigned int)ent[19];
+        if (ent[20])
+        {
+            char name_buf[9];
+            D_memcpy(name_buf, ent + 20, 8);
+            name_buf[8] = '\0';
+            int lump = W_CheckNumForName(name_buf);
+            if (lump < firstsprite || lump >= firstsprite + numsprites)
+                continue;
+            sidx = (unsigned int)(lump - firstsprite);
+        }
 
         if (sidx < (unsigned int)numsprites && ofs + sz <= (unsigned int)fsize)
         {
