@@ -551,8 +551,10 @@ void D_DoomMain(void)
      * (<16 KB STBAR included) — under the big-patch slice threshold.) */
     {
         extern void Saturn_HUD_Init(void);
+        extern void S_Init(void);
 
         Saturn_HUD_Init();
+        S_Init();
     }
 #ifdef SATURN_WIN32
     printf("D_DoomMain: Saturn_HUD_Init done. Calling R_InitTables\n"); fflush(stdout);

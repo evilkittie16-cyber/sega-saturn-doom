@@ -42,6 +42,7 @@ extern int saturn_leveltime;
 
 /* saturn_vgl.c — sliced big-patch cache (WIMAP* are 68 KB) */
 extern void *Saturn_CachePatchBig(const char *name);
+extern void  S_StartSound(void *origin, int sfx_id);
 
 /* ---- shift-subtract unsigned divide (the SH-2 divide-stub ledger) */
 static unsigned udiv32(unsigned a, unsigned b)
@@ -379,15 +380,18 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
                     cnt_par = par;
                     stats_done = 1;
                     press = 0;
+                    S_StartSound(0, sfx_barexp);
                 }
                 else
                 {
+                    if ((frame & 3) == 0)
+                        S_StartSound(0, sfx_pistol);
                     if (cnt_k < pct_k) { cnt_k += 2; if (cnt_k > pct_k) cnt_k = pct_k; }
                     else if (cnt_i < pct_i) { cnt_i += 2; if (cnt_i > pct_i) cnt_i = pct_i; }
                     else if (cnt_s < pct_s) { cnt_s += 2; if (cnt_s > pct_s) cnt_s = pct_s; }
                     else if (cnt_t < secs)  { cnt_t += 3; if (cnt_t > secs)  cnt_t = secs; }
                     else if (cnt_par < par) { cnt_par += 3; if (cnt_par > par) cnt_par = par; }
-                    else stats_done = 1;
+                    else { stats_done = 1; S_StartSound(0, sfx_barexp); }
                 }
             }
 
@@ -442,6 +446,7 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
             {
                 stage = 1;
                 stage_frame = 0;
+                S_StartSound(0, sfx_sgcock);
             }
         }
         else

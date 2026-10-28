@@ -597,10 +597,7 @@ void M_AddToBox (fixed_t *box, fixed_t x, fixed_t y)
         box[BOXTOP] = y;
 }
 
-/* Positional-sound variant — sound output is not wired on Saturn yet,
- * so no-op (the real body lives in d32xr marssound.c:670). */
-void S_StartFixedSound(int sound_id, fixed_t *origin)
-{ (void)sound_id; (void)origin; }
+/* S_StartFixedSound is now implemented in s_sound.c */
 
 /* ----- R_* renderer stubs (most provided by r_main.c / r_data.c) ----- */
 void R_BSP(void) { }

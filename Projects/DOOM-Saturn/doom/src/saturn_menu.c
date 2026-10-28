@@ -27,6 +27,7 @@ extern int  saturn_show_fps;
 extern volatile int saturn_warp_episode;
 extern volatile int saturn_warp_map;
 extern int  saturn_quit_to_title;
+extern void S_StartSound(void *origin, int sfx_id);
 
 #define MENU_MAIN_X      97
 #define MENU_MAIN_Y0     64
@@ -209,6 +210,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
 
             if (edges & (BT_START | BT_ATTACK | BT_USE | BT_SPEED))
             {
+                S_StartSound(0, sfx_swtchn);
                 state = MENU_STATE_MAIN;
                 menu_wait_release();
             }
@@ -230,12 +232,19 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             draw_skull(MENU_MAIN_X - 32, MENU_MAIN_Y0 + MENU_ITEM_PITCH * main_cursor - 5);
 
             if (edges & BT_MOVEUP)
+            {
                 main_cursor = (main_cursor + 3) & 3;
+                S_StartSound(0, sfx_pstop);
+            }
             if (edges & BT_MOVEDOWN)
+            {
                 main_cursor = (main_cursor + 1) & 3;
+                S_StartSound(0, sfx_pstop);
+            }
 
             if (edges & (BT_START | BT_ATTACK | BT_SPEED))
             {
+                S_StartSound(0, sfx_pistol);
                 if (main_cursor == 0)
                     state = MENU_STATE_EPISODE;
                 else if (main_cursor == 1)
@@ -248,6 +257,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             }
             else if (edges & BT_USE)
             {
+                S_StartSound(0, sfx_swtchx);
                 state = MENU_STATE_TITLE;
                 menu_wait_release();
             }
@@ -275,16 +285,19 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             {
                 if (--epi_cursor < 0)
                     epi_cursor = n_epi - 1;
+                S_StartSound(0, sfx_pstop);
             }
             if (edges & BT_MOVEDOWN)
             {
                 if (++epi_cursor >= n_epi)
                     epi_cursor = 0;
+                S_StartSound(0, sfx_pstop);
             }
 
             if (edges & (BT_START | BT_ATTACK | BT_SPEED))
             {
                 int chosen_ep = epi_cursor + 1;
+                S_StartSound(0, sfx_pistol);
                 if (W_CheckNumForName(epi_maps[chosen_ep - 1]) < 0)
                     chosen_ep = 1; /* Shareware WAD fallback to Episode 1 */
                 episode = chosen_ep;
@@ -293,6 +306,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             }
             else if (edges & BT_USE)
             {
+                S_StartSound(0, sfx_swtchx);
                 state = MENU_STATE_MAIN;
                 menu_wait_release();
             }
@@ -320,15 +334,18 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             {
                 if (--skill_cursor < 0)
                     skill_cursor = 4;
+                S_StartSound(0, sfx_pstop);
             }
             if (edges & BT_MOVEDOWN)
             {
                 if (++skill_cursor >= 5)
                     skill_cursor = 0;
+                S_StartSound(0, sfx_pstop);
             }
 
             if (edges & (BT_START | BT_ATTACK | BT_SPEED))
             {
+                S_StartSound(0, sfx_pistol);
                 *out_episode = episode;
                 *out_skill   = skill_cursor;
                 saturn_map   = menu_start_map;
@@ -340,6 +357,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             }
             else if (edges & BT_USE)
             {
+                S_StartSound(0, sfx_swtchx);
                 state = MENU_STATE_EPISODE;
                 menu_wait_release();
             }
@@ -494,6 +512,7 @@ void Saturn_Pause_Init(void)
     pause_cursor = 0;
     if (saturn_map >= 1 && saturn_map <= 9)
         pause_warp_map = saturn_map;
+    S_StartSound(0, sfx_swtchn);
 }
 
 void Saturn_Pause_Tick(int edges)
@@ -506,11 +525,13 @@ void Saturn_Pause_Tick(int edges)
     {
         if (--pause_cursor < 0)
             pause_cursor = 5;
+        S_StartSound(0, sfx_pstop);
     }
     if (edges & BT_MOVEDOWN)
     {
         if (++pause_cursor >= 6)
             pause_cursor = 0;
+        S_StartSound(0, sfx_pstop);
     }
 
     if (pause_cursor == 1)
@@ -519,40 +540,48 @@ void Saturn_Pause_Tick(int edges)
         {
             if (--pause_warp_map < 1)
                 pause_warp_map = 9;
+            S_StartSound(0, sfx_pstop);
         }
         if (edges & (BT_MOVERIGHT | BT_STRAFERIGHT))
         {
             if (++pause_warp_map > 9)
                 pause_warp_map = 1;
+            S_StartSound(0, sfx_pstop);
         }
     }
     else if (pause_cursor == 3 && (edges & (BT_MOVELEFT | BT_MOVERIGHT | BT_STRAFELEFT | BT_STRAFERIGHT)))
     {
         Saturn_ToggleWallSubdivision();
+        S_StartSound(0, sfx_swtchn);
     }
     else if (pause_cursor == 4 && (edges & (BT_MOVELEFT | BT_MOVERIGHT | BT_STRAFELEFT | BT_STRAFERIGHT)))
     {
         saturn_quiet_hud ^= 1;
         saturn_show_fps  = !saturn_quiet_hud;
+        S_StartSound(0, sfx_swtchn);
     }
 
     if (edges & (BT_ATTACK | BT_SPEED | BT_START))
     {
+        S_StartSound(0, sfx_pistol);
         if (pause_cursor == 0)
         {
             gamepaused = 0;
+            menu_free_big_patches();
         }
         else if (pause_cursor == 1)
         {
             saturn_warp_episode = (saturn_episode > 0) ? saturn_episode : 1;
             saturn_warp_map     = pause_warp_map;
             gamepaused          = 0;
+            menu_free_big_patches();
         }
         else if (pause_cursor == 2)
         {
             saturn_warp_episode = (saturn_episode > 0) ? saturn_episode : 1;
             saturn_warp_map     = (saturn_map > 0) ? saturn_map : 1;
             gamepaused          = 0;
+            menu_free_big_patches();
         }
         else if (pause_cursor == 3)
         {
@@ -567,11 +596,14 @@ void Saturn_Pause_Tick(int edges)
         {
             saturn_quit_to_title = 1;
             gamepaused           = 0;
+            menu_free_big_patches();
         }
     }
     else if (edges & BT_USE)
     {
+        S_StartSound(0, sfx_swtchx);
         gamepaused = 0;
+        menu_free_big_patches();
     }
 }
 
