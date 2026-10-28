@@ -3404,6 +3404,8 @@ static HW_NOINLINE void HW_Worker_EmitFlatQuadDirect(vdp1_cmd_t *cmd_s_out, int 
 
         uint32_t w1 = (pmod << 16) | colr;
         int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
+        if ((dy & 0x3FFF) <= 24)
+            w1 &= ~(0x1000u << 16);
         uint32_t w2 = HW_FlatSizeLOD((uint16_t)srca, 0x0840u, dy);
         *qcount_ptr = qcount + 1;
 
@@ -3836,7 +3838,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
         vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
         aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
         c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
-        c32[1] = w1;
+        c32[1] = ((dy & 0x3FFF) <= 24) ? (w1 & ~(0x1000u << 16)) : w1;
         c32[2] = HW_FlatSizeLOD(base_srca, quad_size, dy);
         if (cw < 0)
         {
@@ -3865,7 +3867,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
             vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
             c32[0] = (cw_t < 0) ? 0x00320000u : 0x00220000u;
-            c32[1] = w1;
+            c32[1] = w1 & ~(0x1000u << 16);
             c32[2] = HW_FlatSizeLOD(base_srca, quad_size, dy);
             if (cw_t < 0)
             {
@@ -4021,7 +4023,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
             vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
             c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
-            c32[1] = w1;
+            c32[1] = ((dy & 0x3FFF) <= 24) ? (w1 & ~(0x1000u << 16)) : w1;
             c32[2] = HW_FlatSizeLOD(base_srca, strip_size, dy);
             if (cw < 0)
             {
@@ -4116,6 +4118,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
 
         uint16_t base_srca = (qpack & 0x80000000u) ? fctx->ceil_srca : fctx->floor_srca;
         int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
+        if ((dy & 0x3FFF) <= 24)
+            w1 &= ~(0x1000u << 16);
         uint32_t w2 = HW_FlatSizeLOD(base_srca, quad_size, dy);
 
         uint32_t w0, w3, w4, w5, w6;
@@ -4656,12 +4660,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
 
             int px0 = pv0->px, px1 = pv1->px, px2 = pv2->px, px3 = pv3->px;
 
-            /* Fast single-branch horizontal screen-edge rejection */
-            int m_neg_x = px0 & px1 & px2 & px3;
-            int pos_x   = (px0 - vw) | (px1 - vw) | (px2 - vw) | (px3 - vw);
-            if ((m_neg_x | ~pos_x) < 0)
-                continue;
-
             int min_x = px0; if (px1 < min_x) min_x = px1; if (px2 < min_x) min_x = px2; if (px3 < min_x) min_x = px3;
             int max_x = px0; if (px1 > max_x) max_x = px1; if (px2 > max_x) max_x = px2; if (px3 > max_x) max_x = px3;
 
@@ -4683,8 +4681,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             if (emit_ceil)
             {
                 int py0_c = pv0->py_c, py1_c = pv1->py_c, py2_c = pv2->py_c, py3_c = pv3->py_c;
-                if ((py0_c > 0 || py1_c > 0 || py2_c > 0 || py3_c > 0) &&
-                    (py0_c < vh || py1_c < vh || py2_c < vh || py3_c < vh))
+                if ((((-py0_c) | (-py1_c) | (-py2_c) | (-py3_c)) &
+                     ((py0_c - vh) | (py1_c - vh) | (py2_c - vh) | (py3_c - vh))) < 0)
                 {
                     cw_c = HW_MulsW_PairAdd(dx20, py3_c - py1_c, dx13, py2_c - py0_c, 0);
                 }
@@ -4692,8 +4690,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             if (emit_floor)
             {
                 int py0_f = pv0->py_f, py1_f = pv1->py_f, py2_f = pv2->py_f, py3_f = pv3->py_f;
-                if ((py0_f < vh || py1_f < vh || py2_f < vh || py3_f < vh) &&
-                    (py0_f > 0 || py1_f > 0 || py2_f > 0 || py3_f > 0))
+                if ((((-py0_f) | (-py1_f) | (-py2_f) | (-py3_f)) &
+                     ((py0_f - vh) | (py1_f - vh) | (py2_f - vh) | (py3_f - vh))) < 0)
                 {
                     cw_f = HW_MulsW_PairAdd(dx20, py3_f - py1_f, dx13, py2_f - py0_f, 0);
                 }
@@ -5439,6 +5437,7 @@ typedef struct {
     uint8_t                  should_subdivide;
     uint8_t                  persp_strips;
     uint8_t                  needs_clip;
+    uint8_t                  portal_recorded;
     fixed_t                  cur_top_z;
     fixed_t                  t0;
     fixed_t                  t1;
@@ -6512,8 +6511,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_FlushDeferredSubsectorWalls(hw_wall_emit_ct
     }
 }
 static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
-    const hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg, int s_A, int s_B)
+    hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg, int s_A, int s_B)
 {
+    ctx->portal_recorded = 1;
     int bsec_idx = seg->back_sec_idx;
     if (ctx->seg_sx >= ctx->seg_ex || bsec_idx < 0 || bsec_idx >= numsectors)
         return;
@@ -6717,7 +6717,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
                 mono_base_srca = srca_mono;
                 mono_tw = 32;
             }
-            else if (tw >= 64 && ((((u_span ^ 64) | (u_start & 63)) == 0) || (u_span >= 48 && dx <= 16) || (p0_use->cz > (512 << FRACBITS) && p1_use->cz > (512 << FRACBITS) && dx <= 20)) && (unsigned)u_start < (unsigned)tw)
+            else if (tw >= 64 && (((u_span ^ 64) | (u_start & 63)) == 0) && (unsigned)u_start < (unsigned)tw)
             {
                 if (dx <= 24 && srca_mono != srca)
                 {
@@ -6805,6 +6805,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
     uint32_t pmod = (seg_flags & SEG_FLAG_MID)
         ? (((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)
         : ((PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu);
+    if (!should_subdivide && mono_tw == 32 && tw >= 64)
+        pmod &= ~PMOD_HSS;
     uint32_t cmd_header1 = (pmod << 16) | (uint32_t)k_shade;
     uint32_t tw_stride = (uint32_t)(mono_tw >> 3);
     uint32_t cmd_size_hi = tw_stride << 8;
@@ -6825,7 +6827,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
     HW_ProjYPair(HW_VIEW_CY, dz_top, s_A, dz_bot, s_A, &ya0, &ya1);
     HW_ProjYPair(HW_VIEW_CY, dz_top, s_B, dz_bot, s_B, &yb0, &yb1);
 
-    if (!is_solid && (seg_flags & (SEG_FLAG_UPPER | SEG_FLAG_LOWER)))
+    if (!is_solid && !ctx->portal_recorded && (seg_flags & (SEG_FLAG_UPPER | SEG_FLAG_LOWER)))
     {
         HW_RecordSegPortalAperture(ctx, seg, s_A, s_B);
     }
@@ -7029,6 +7031,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
         else
         {
             last_pair_key = pair_key;
+            wctx.portal_recorded = 0;
             if (idx0 >= num_pil || idx1 >= num_pil)
             {
                 last_pair_state = -1;
@@ -7186,7 +7189,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
                 if (wctx.seg_sx < wctx.seg_ex)
                     HW_MarkSubSolidSpan(wctx.seg_sx, wctx.seg_ex);
             }
-            else
+            else if (!wctx.portal_recorded)
             {
                 HW_RecordSegPortalAperture(&wctx, seg, p0_use->s, p1_use->s);
             }
@@ -7703,17 +7706,20 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     else
         interp_key = interp_g2;
 
-    /* Teleport / respawn: never blend across a discontinuity (one frame halfway
-     * between source and destination). No legal per-tic move exceeds 128 units. */
-#define HW_INTERP_SNAP ((uint32_t)(128 << FRACBITS))
+    /* Teleport / respawn / vertical step discontinuity: never blend across a discontinuity
+     * (one frame halfway between source and destination). No legal per-tic move exceeds 128 XY or 16 Z units. */
+#define HW_INTERP_SNAP   ((uint32_t)(128 << FRACBITS))
+#define HW_INTERP_Z_SNAP ((uint32_t)(16 << FRACBITS))
     if (((uint32_t)cur_vx - (uint32_t)prev_viewx + HW_INTERP_SNAP > 2u * HW_INTERP_SNAP) ||
-        ((uint32_t)cur_vy - (uint32_t)prev_viewy + HW_INTERP_SNAP > 2u * HW_INTERP_SNAP))
+        ((uint32_t)cur_vy - (uint32_t)prev_viewy + HW_INTERP_SNAP > 2u * HW_INTERP_SNAP) ||
+        ((uint32_t)cur_vz - (uint32_t)prev_viewz + HW_INTERP_Z_SNAP > 2u * HW_INTERP_Z_SNAP))
     {
         prev_viewx = cur_vx;
         prev_viewy = cur_vy;
         prev_viewz = cur_vz;
         prev_viewangle = cur_va;
     }
+#undef HW_INTERP_Z_SNAP
 #undef HW_INTERP_SNAP
     hw_viewx = prev_viewx + ((cur_vx - prev_viewx) >> 1);
     hw_viewy = prev_viewy + ((cur_vy - prev_viewy) >> 1);
