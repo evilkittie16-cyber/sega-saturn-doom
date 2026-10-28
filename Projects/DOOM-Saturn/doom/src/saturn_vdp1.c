@@ -231,10 +231,8 @@ static unsigned int    v1_page_base[2] = { V1_PAGE0_START, V1_PAGE1_START };
 static int             v1_page_flush[2] = { 1, 1 };
 /* Preemptive flush: re-start a page whose free space dropped under this
  * when it comes back into use, so a growing working set doesn't hit a
- * mid-frame refusal (= missing walls for a frame).
- * Keep at 16 KB (1 max-size 128x128 texture) so scenes with a ~330 KB wall+flat
- * working set never fall into a catastrophic per-frame full-cache flush loop. */
-#define V1_PAGE_LOWWATER  (16u * 1024u)
+ * mid-frame refusal (= missing walls/sprites for a frame). */
+#define V1_PAGE_LOWWATER  (48u * 1024u)
 /* diagnostics for the HUD row */
 int saturn_v1w_modr;            /* MODR readback (TVM/FCM/VBE bits)   */
 int saturn_v1w_edsr = 3;        /* EDSR at HUD paint time             */
@@ -875,23 +873,19 @@ static void v1_copy_strip_major(unsigned int off, const byte *src, int w, int h)
 }
 
 /* Copies a >=64-wide wall texture as contiguous 32 x h horizontally-downsampled
- * blocks (each covering 64 world texels at 2:1 horizontal LOD) followed by
- * 32 x (h/2) blocks, so 64-unit wall segments emit a single 32-wide VDP1 quad
- * with 50% to 75% fewer VDP1 DDA steps and only 0.75x extra VDP1 VRAM (1.75x total vs 2.75x). */
+ * blocks (each covering 64 world texels at 2:1 horizontal LOD) for distant
+ * walls (dx <= 24 screen pixels), saving 50% VDP1 DDA steps at only 0.5x extra
+ * VDP1 VRAM when >= 128 KB of arena headroom remains. */
 static void v1_copy_32_blocks(unsigned int off, const byte *src, int w, int h)
 {
     int num_blocks = w >> 6;
-    int h_half = h >> 1;
-    unsigned int half_base = off + (unsigned int)((w >> 1) * h);
     int b, y;
     for (b = 0; b < num_blocks; b++)
     {
         unsigned int block_off = off + (unsigned int)(b * (32 * h));
-        unsigned int half_off  = half_base + (unsigned int)(b * (32 * h_half));
         const byte *bsrc = src + b * 64;
 #ifdef SATURN_WIN32
         uint8_t *dst = (uint8_t *)(V1_BASE + block_off);
-        uint8_t *dst_h = (uint8_t *)(V1_BASE + half_off);
         int x;
         for (y = 0; y < h; y++)
         {
@@ -900,28 +894,14 @@ static void v1_copy_32_blocks(unsigned int off, const byte *src, int w, int h)
             for (x = 0; x < 32; x++)
                 dr[x] = sr[x * 2];
         }
-        for (y = 0; y < h_half; y++)
-        {
-            const byte *sr = bsrc + (y * 2) * w;
-            uint8_t *dr = dst_h + y * 32;
-            for (x = 0; x < 32; x++)
-                dr[x] = sr[x * 2];
-        }
 #else
         volatile unsigned short *dst = (volatile unsigned short *)(V1_BASE + block_off);
-        volatile unsigned short *dst_h = (volatile unsigned short *)(V1_BASE + half_off);
         int xw;
         for (y = 0; y < h; y++)
         {
             const byte *sr = bsrc + y * w;
             for (xw = 0; xw < 16; xw++)
                 *dst++ = (unsigned short)(((unsigned)sr[xw * 4] << 8) | (unsigned)sr[xw * 4 + 2]);
-        }
-        for (y = 0; y < h_half; y++)
-        {
-            const byte *sr = bsrc + (y * 2) * w;
-            for (xw = 0; xw < 16; xw++)
-                *dst_h++ = (unsigned short)(((unsigned)sr[xw * 4] << 8) | (unsigned)sr[xw * 4 + 2]);
         }
 #endif
     }
@@ -1011,8 +991,8 @@ static int v1_tex_get(int texnum, int *w, int *h)
         tag->srca_64   = tag->srca;
         if (tw >= 64 && (tw & 63) == 0)
         {
-            int bytes_32 = (tw >> 1) * th + (tw >> 1) * (th >> 1);
-            if (v1_arena_off + (unsigned int)bytes_32 + (16u * 1024u) <= v1_arena_end)
+            int bytes_32 = (tw >> 1) * th;
+            if (v1_arena_off + (unsigned int)bytes_32 + (128u * 1024u) <= v1_arena_end)
             {
                 unsigned int off_32 = v1_arena_alloc(bytes_32);
                 if (off_32 != 0)
@@ -1022,7 +1002,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
                 }
             }
         }
-        else if (v1_arena_off + (unsigned int)(tw * th) + (48u * 1024u) <= v1_arena_end)
+        else if (v1_arena_off + (unsigned int)(tw * th) + (128u * 1024u) <= v1_arena_end)
         {
             unsigned int off_mono = v1_arena_alloc(tw * th);
             if (off_mono != 0)
@@ -1030,7 +1010,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
                 v1_copy_block(off_mono, src, tw * th);
                 tag->srca_mono = (unsigned short)(off_mono / 8u);
                 if (tw == 32 && th <= 16 &&
-                    v1_arena_off + (unsigned int)(64 * th) + (48u * 1024u) <= v1_arena_end)
+                    v1_arena_off + (unsigned int)(64 * th) + (128u * 1024u) <= v1_arena_end)
                 {
                     unsigned int off_64 = v1_arena_alloc(64 * th);
                     if (off_64 != 0)
@@ -1066,21 +1046,21 @@ static int v1_tex_get(int texnum, int *w, int *h)
             int y, x;
             for (y = 0; y < 32; y++)
             {
-                const byte *sr = src + (y * 2) * 64;
+                const byte *sr = src + (y * 2 + 1) * 64;
                 for (x = 0; x < 32; x++)
-                    dst32[y * 32 + x] = sr[x * 2];
+                    dst32[y * 32 + x] = sr[x * 2 + 1];
             }
             for (y = 0; y < 16; y++)
             {
-                const byte *sr = src + (y * 4) * 64;
+                const byte *sr = src + (y * 4 + 2) * 64;
                 for (x = 0; x < 16; x++)
-                    dst16[y * 16 + x] = sr[x * 4];
+                    dst16[y * 16 + x] = sr[x * 4 + 2];
             }
             for (y = 0; y < 8; y++)
             {
-                const byte *sr = src + (y * 8) * 64;
+                const byte *sr = src + (y * 8 + 4) * 64;
                 for (x = 0; x < 8; x++)
-                    dst8[y * 8 + x] = sr[x * 8];
+                    dst8[y * 8 + x] = sr[x * 8 + 4];
             }
         }
 #else
@@ -1091,21 +1071,21 @@ static int v1_tex_get(int texnum, int *w, int *h)
             int y, xw;
             for (y = 0; y < 32; y++)
             {
-                const byte *sr = src + (y * 2) * 64;
+                const byte *sr = src + (y * 2 + 1) * 64;
                 for (xw = 0; xw < 16; xw++)
-                    *dst32++ = (unsigned short)(((unsigned)sr[xw * 4] << 8) | (unsigned)sr[xw * 4 + 2]);
+                    *dst32++ = (unsigned short)(((unsigned)sr[xw * 4 + 1] << 8) | (unsigned)sr[xw * 4 + 3]);
             }
             for (y = 0; y < 16; y++)
             {
-                const byte *sr = src + (y * 4) * 64;
+                const byte *sr = src + (y * 4 + 2) * 64;
                 for (xw = 0; xw < 8; xw++)
-                    *dst16++ = (unsigned short)(((unsigned)sr[xw * 8] << 8) | (unsigned)sr[xw * 8 + 4]);
+                    *dst16++ = (unsigned short)(((unsigned)sr[xw * 8 + 2] << 8) | (unsigned)sr[xw * 8 + 6]);
             }
             for (y = 0; y < 8; y++)
             {
-                const byte *sr = src + (y * 8) * 64;
+                const byte *sr = src + (y * 8 + 4) * 64;
                 for (xw = 0; xw < 4; xw++)
-                    *dst8++ = (unsigned short)(((unsigned)sr[xw * 16] << 8) | (unsigned)sr[xw * 16 + 8]);
+                    *dst8++ = (unsigned short)(((unsigned)sr[xw * 16 + 4] << 8) | (unsigned)sr[xw * 16 + 12]);
             }
         }
 #endif

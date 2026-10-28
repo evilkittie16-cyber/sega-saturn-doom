@@ -99,7 +99,8 @@ void Z_Free2 (memzone_t *mainzone, void *ptr)
 	if (adj && !adj->tag)
 	{
 		adj->next = block->next;
-		adj->next->prev = adj;
+		if (adj->next)
+			adj->next->prev = adj;
 		adj->size += block->size;
 		if (mainzone->rover == block)
 			mainzone->rover = adj;

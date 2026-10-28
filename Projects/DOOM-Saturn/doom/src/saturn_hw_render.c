@@ -3257,7 +3257,8 @@ HW_ALWAYS_INLINE int HW_FlatQuadDy(int x0, int y0, int x1, int y1,
     int d12 = cy2 - cy1; if (d12 < 0) d12 = -d12;
     int d01 = cy1 - cy0; if (d01 < 0) d01 = -d01;
     int d32 = cy2 - cy3; if (d32 < 0) d32 = -d32;
-    int dy = (d03 > d12) ? d03 : d12;
+    int dy_depth = (d03 > d12) ? d03 : d12;
+    int dy = dy_depth;
     if (d01 > dy) dy = d01;
     if (d32 > dy) dy = d32;
     if (__builtin_expect(dy > 16, 1))
@@ -3266,6 +3267,12 @@ HW_ALWAYS_INLINE int HW_FlatQuadDy(int x0, int y0, int x1, int y1,
              (x2 == x3 && y2 == y3) | (x3 == x0 && y3 == y0)))
             dy = 16;
     }
+    /* Flag grazing oblique quads where horizontal edge shear >> vertical depth span */
+    int dx03 = x3 - x0; if (dx03 < 0) dx03 = -dx03;
+    int dx12 = x2 - x1; if (dx12 < 0) dx12 = -dx12;
+    int dx_shear = (dx03 > dx12) ? dx03 : dx12;
+    if (dy_depth <= 6 && dx_shear > (dy_depth << 1))
+        dy |= 0x4000;
     return dy;
 }
 
@@ -3283,15 +3290,22 @@ HW_ALWAYS_INLINE int HW_FlatTriDy(int y0, int y1, int y2)
 /* Takes 3 register arguments (r4=base_srca, r5=quad_size, r6=dy), 0 stack arguments, 0 callee-saved reg pushes */
 static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_size, int dy)
 {
+    int grazing = (dy & 0x4000);
+    dy &= 0x3FFF;
     int v0   = (int)(quad_size >> 16);
     int rows = (int)(quad_size & 0xFFu);
+    if (__builtin_expect(grazing != 0 && rows >= 32, 0))
+    {
+        v0   += 8;
+        rows -= 16;
+    }
 
-    if (dy > 38)
+    if (dy > 24)
     {
         uint32_t srca = (uint32_t)base_srca + (uint32_t)(v0 << 3);
         return (srca << 16) | 0x0800u | (uint32_t)rows;
     }
-    if (dy > 16)
+    if (dy > 10)
     {
         int v0_32   = v0 >> 1;
         int rows_32 = (rows + 1) >> 1;
@@ -3300,7 +3314,7 @@ static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_siz
         uint32_t srca = (uint32_t)base_srca + 512u + (uint32_t)(v0_32 << 2);
         return (srca << 16) | 0x0400u | (uint32_t)rows_32;
     }
-    if (dy > 7)
+    if (dy > 3)
     {
         int v0_16   = v0 >> 2;
         int rows_16 = (rows + 3) >> 2;
@@ -4476,9 +4490,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
         else
         {
             ProjectPillar_2D(dx, dy, vcos, vsin, cz_origin, cx_origin, &cz, &cx);
+            p_ptr->cx = cx;
             p_ptr->cz = cz;
-            if (__builtin_expect(cz < (288 << FRACBITS), 0))
-                p_ptr->cx = cx;
         }
 
         if (cz >= HW_NEAR_Z)
@@ -4794,17 +4807,20 @@ static HW_NOINLINE HW_HOT_O2 void HW_SelectFlatLOD(int subnum, int *io_v_first, 
         if (l_qcount > 0 && l_vcount > 0)
         {
             int cx = 0, cy = 0;
+            int min_dist = (384 << 12);
             if (__builtin_expect(saturn_baked_flat_bboxes != NULL, 1))
             {
                 const saturn_flat_bbox_t *bbox = &saturn_baked_flat_bboxes[subnum];
                 cx = (hw_bbox_nidx_Nx == BOXLEFT) ? bbox->min_x : bbox->max_x;
                 cy = (hw_bbox_nidx_Ny == BOXBOTTOM) ? bbox->min_y : bbox->max_y;
+                if ((bbox->max_x - bbox->min_x) > 128 || (bbox->max_y - bbox->min_y) > 128)
+                    min_dist = (512 << 12);
             }
             int dx = cx - hw_cam_x;
             int dy = cy - hw_cam_y;
             if (dx > 16384) dx = 16384; else if (dx < -16384) dx = -16384;
             if (dy > 16384) dy = 16384; else if (dy < -16384) dy = -16384;
-            if (HW_MulsW_PairAdd(dx, hw_bbox_Nx, dy, hw_bbox_Ny, 0) >= (132 << 12))
+            if (HW_MulsW_PairAdd(dx, hw_bbox_Nx, dy, hw_bbox_Ny, 0) >= min_dist)
             {
                 if (*io_q_count > l_qcount)
                     saturn_hw_flat_lod_saved_quads += (unsigned int)(*io_q_count - l_qcount);
@@ -5468,19 +5484,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     int can_coalesce_64 = (tw >= 64 && (srca_64 != srca || srca_mono != srca));
     int srca32_v = srca_mono + (cur_v << 2);
     int step32   = th << 2;
-    int rows_32  = rows;
-    if (tw >= 64 && (th & 1) == 0 && rows >= 8)
-    {
-        int dya = s_ya1 - s_ya0;
-        int dyb = end_ya1 - end_ya0;
-        int max_dy = (dya > dyb) ? dya : dyb;
-        if (max_dy <= (rows >> 1) && (cur_v >> 1) + ((rows + 1) >> 1) <= (th >> 1))
-        {
-            srca32_v = srca_mono + ((tw * th) >> 4) + ((cur_v >> 1) << 2);
-            step32   = th << 1;
-            rows_32  = (rows + 1) >> 1;
-        }
-    }
+
     int srca64_v = srca_64 + (cur_v << 3);
 
     for (int s = s_min; s <= s_max; s++)
@@ -5516,16 +5520,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
             int c_uhi = (c_end == s_max) ? u_end : ((c_end + 1) << 4);
             int adv = coal_strips - 1;
             int next_px1 = (c_uhi == u_end) ? p1->px : ((cur_px_fp + step_px_fp * adv + 0x8000) >> 16);
-            int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? 64 : 1000;
+            int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? 24 : 1000;
             if (next_px1 - s_px0 <= max_coal_dx)
             {
                 s_end = c_end;
                 u_hi  = c_uhi;
                 s_px1 = next_px1;
-                if (coal_strips == 4 && (s_px1 - s_px0 <= 36 || srca_64 == srca) && srca_mono != srca)
+                if (coal_strips == 4 && (s_px1 - s_px0 <= 24 || srca_64 == srca) && srca_mono != srca)
                 {
                     emit_srca = srca32_v + (cur_strip_idx >> 2) * step32;
-                    emit_rows = rows_32;
                     emit_size_hi = 4u << 8;
                 }
                 if (u_hi == u_end)
@@ -5917,19 +5920,18 @@ HW_ALWAYS_INLINE int HW_NeedPerspectiveStrips(int dx, int u_span, fixed_t cz0, f
 {
     if (!saturn_wall_subdivision) return 0;
     if (tw <= 16) return 0;
-    /* Distant walls: both ends > 380 units have negligible affine distortion */
-    if (cz0 > (380 << FRACBITS) && cz1 > (380 << FRACBITS)) return 0;
-    /* Narrow on screen: < 28 pixels has < 0.25px affine sag */
-    if (dx < 28) return 0;
-    /* Perpendicular walls: < 25% depth change across the wall has 0 affine warping */
+    /* Distant walls: both ends > 512 units have negligible affine distortion */
+    if (cz0 > (512 << FRACBITS) && cz1 > (512 << FRACBITS)) return 0;
+    /* Narrow on screen: < 20 pixels has < 0.25px affine sag */
+    if (dx < 20) return 0;
+    /* Perpendicular walls: < 12.5% depth change across the wall has minimal affine warping */
     fixed_t min_z = (cz0 < cz1) ? cz0 : cz1;
     fixed_t max_z = (cz0 > cz1) ? cz0 : cz1;
-    if ((max_z - min_z) < (min_z >> 2)) return 0;
-    /* Don't subdivide if average strip is < 8 screen pixels wide */
-    if ((dx << 4) < (u_span * 8)) return 0;
-    /* Medium-to-far walls (min_z > 160): require >= 50% depth change and >= 10px per strip
-     * before disabling 64-texel / 32-texel block coalescing */
-    if (min_z > (160 << FRACBITS) && ((max_z - min_z) < (min_z >> 1) || (dx << 4) < (u_span * 10)))
+    if ((max_z - min_z) < (min_z >> 3)) return 0;
+    /* Don't subdivide if average strip is < 6 screen pixels wide */
+    if ((dx << 4) < (u_span * 6)) return 0;
+    /* Medium-to-far walls (min_z > 256): require >= 25% depth change and >= 8px per strip */
+    if (min_z > (256 << FRACBITS) && ((max_z - min_z) < (min_z >> 2) || (dx << 4) < (u_span * 8)))
         return 0;
     return 1;
 }
@@ -6680,9 +6682,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
                 mono_base_srca = srca_mono;
                 mono_tw = 32;
             }
-            else if (tw >= 64 && ((((u_span ^ 64) | (u_start & 63)) == 0) || (u_span >= 48 && dx <= 24) || (p0_use->cz > (400 << FRACBITS) && p1_use->cz > (400 << FRACBITS) && dx <= 28)) && (unsigned)u_start < (unsigned)tw)
+            else if (tw >= 64 && ((((u_span ^ 64) | (u_start & 63)) == 0) || (u_span >= 48 && dx <= 16) || (p0_use->cz > (512 << FRACBITS) && p1_use->cz > (512 << FRACBITS) && dx <= 20)) && (unsigned)u_start < (unsigned)tw)
             {
-                if ((dx <= 36 || (srca_64 == srca && dx <= 64)) && srca_mono != srca)
+                if (dx <= 24 && srca_mono != srca)
                 {
                     should_subdivide = 0;
                     needs_clip = 0;
@@ -6706,11 +6708,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
             should_subdivide = 0;
             needs_clip = 0;
         }
-        else if (tw == 64 && ((srca_mono != srca && dx <= 64) || srca_64 != srca))
+        else if (tw == 64 && ((srca_mono != srca && dx <= 24) || srca_64 != srca))
         {
             should_subdivide = 0;
             needs_clip = 0;
-            if ((dx <= 36 || srca_64 == srca) && srca_mono != srca)
+            if ((dx <= 24 || srca_64 == srca) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono;
                 mono_tw = 32;
@@ -6778,11 +6780,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
     int dz_top = HW_DZQ(top_world_z, vz);
     int top_overlap = (seg_flags & SEG_FLAG_LOWER) ? ((wall_h <= 16) ? 0 : 1) : 1;
     int max_first_h = (th > 0) ? (th - cur_v) : rem_h;
-    if (rem_h > max_first_h && max_first_h >= 32 &&
-        p0_use->cz > (800 << FRACBITS) && p1_use->cz > (800 << FRACBITS))
-    {
-        rem_h = max_first_h;
-    }
     int is_single_band = (rem_h <= max_first_h) && (rem_h <= 255);
     int dz_bot = HW_DZQ(bot_world_z, vz);
     int bot_overlap = (seg_flags & SEG_FLAG_UPPER)
@@ -6844,17 +6841,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
             HW_WALL_XYCLAMP(s_xa, s_xb, q_ya0, q_yb0, q_ya1, q_yb1);
             int rows = (th > 0 && rem_h > th) ? th : rem_h;
             if (rows > 255) rows = 255;
-            if (mono_tw == 32 && tw >= 64 && (th & 1) == 0 && rows >= 8)
-            {
-                int dya = q_ya1 - q_ya0;
-                int dyb = q_yb1 - q_yb0;
-                int max_dy = (dya > dyb) ? dya : dyb;
-                if (max_dy <= (rows >> 1) && (cur_v >> 1) + ((rows + 1) >> 1) <= (th >> 1))
-                {
-                    strip_srca = srca_mono + ((tw * th) >> 4) + (u_start >> 6) * (th << 1) + ((cur_v >> 1) << 2);
-                    rows = (rows + 1) >> 1;
-                }
-            }
+
 
             uint16_t m_cnt = saturn_cmd_m_count;
             uint32_t xa_p = ((uint32_t)s_xa << 16);

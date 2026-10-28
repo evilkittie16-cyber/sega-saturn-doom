@@ -115,24 +115,23 @@ def build_cell(ss, SSECTORS, SEGS, VERTEXES, NODES, paths):
     return poly
 
 def quadify_poly(poly):
-    """Decompose any 2D convex polygon into pure 4-vertex quadrilaterals."""
+    """Decompose any 2D convex polygon into pure 4-vertex quadrilaterals via direct convex fan.
+    Produces ceil((n - 2) / 2) quads and zero synthetic interior vertices (vs n quads and n+1
+    extra vertices for Catmull-Clark), eliminating both diagonal UV swirling and 50%+ of N-gon quads."""
     n = len(poly)
     if n < 3:
         return []
+    if n == 3:
+        return [[poly[0], poly[1], poly[2], poly[2]]]
     if n == 4:
         return [poly]
-    # Catmull-Clark centroid subdivision
-    cx = sum(p[0] for p in poly) / n
-    cy = sum(p[1] for p in poly) / n
-    C = (cx, cy)
-    M = []
-    for i in range(n):
-        p1, p2 = poly[i], poly[(i + 1) % n]
-        M.append(((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2))
     quads = []
-    for i in range(n):
-        q = [poly[i], M[i], C, M[(i - 1) % n]]
-        quads.append(q)
+    k = 1
+    while n - k >= 3:
+        quads.append([poly[0], poly[k], poly[k + 1], poly[k + 2]])
+        k += 2
+    if n - k == 2:
+        quads.append([poly[0], poly[k], poly[k + 1], poly[k + 1]])
     return quads
 
 def clip_box(poly, x0, x1, y0, y1):
@@ -480,6 +479,8 @@ def bake_map_adaptive(wad_data, directory, map_name):
             a = sum(f_cp[i][0]*f_cp[(i+1)%len(f_cp)][1] - f_cp[(i+1)%len(f_cp)][0]*f_cp[i][1] for i in range(len(f_cp)))
             if a < 0:
                 f_cp = list(reversed(f_cp))
+            k0 = min(range(len(f_cp)), key=lambda i: (f_cp[i][0] - gx)**2 + (f_cp[i][1] - gy)**2)
+            f_cp = [f_cp[(k0 + j) % len(f_cp)] for j in range(len(f_cp))]
             raw_quads = quadify_poly(f_cp)
             res = []
             for q in raw_quads:
@@ -488,7 +489,10 @@ def bake_map_adaptive(wad_data, directory, map_name):
                       q[2][0]*q[3][1] - q[3][0]*q[2][1] +
                       q[3][0]*q[0][1] - q[0][0]*q[3][1])
                 if qa < 0:
-                    q = [q[0], q[3], q[2], q[1]]
+                    if q[2] == q[3]:
+                        q = [q[0], q[2], q[1], q[1]]
+                    else:
+                        q = [q[0], q[3], q[2], q[1]]
                 res.append(q)
             return res
 
@@ -603,22 +607,33 @@ def bake_map_adaptive(wad_data, directory, map_name):
         sub_v_first.append(len(all_verts))
         sub_v_count.append(len(sub_verts))
 
-        # Multi-level LOD (16, 32, 64 for near, 128, 256, 512 for far):
-        # Generate coarse convex quads for LOD1 when distant (> 400 units)
+        # Multi-level LOD:
+        # Generate coarse 128x128 grid quads for LOD1 when distant (>= 384 units)
         lod1_verts = []
         lod1_q_indices = []
         if len(sub_q_indices) > 1 and poly and len(poly) >= 3:
-            poly_l1 = skirt_cell(poly, sub_skirt_segs[ss])
-            f_poly = [(float(p[0]), float(p[1])) for p in poly_l1]
-            raw_lod1 = quadify_poly(f_poly)
+            grid_l1 = 128
+            l1_gx0 = int(min(xs) // grid_l1) * grid_l1
+            l1_gx1 = int(max(xs) // grid_l1 + 1) * grid_l1
+            l1_gy0 = int(min(ys) // grid_l1) * grid_l1
+            l1_gy1 = int(max(ys) // grid_l1 + 1) * grid_l1
+            raw_lod1 = []
+            for lgx in range(l1_gx0, l1_gx1, grid_l1):
+                for lgy in range(l1_gy0, l1_gy1, grid_l1):
+                    lcp = clip_box(poly, Fraction(lgx), Fraction(lgx + grid_l1),
+                                   Fraction(lgy), Fraction(lgy + grid_l1))
+                    if lcp:
+                        lcp = drop_collinear(lcp)
+                        la = float(abs(poly_area2(lcp)) / 2)
+                        if len(lcp) >= 3 and la > 0:
+                            if la >= float(grid_l1 * grid_l1) - 0.5:
+                                raw_lod1.append([(lgx, lgy), (lgx + grid_l1, lgy),
+                                                 (lgx + grid_l1, lgy + grid_l1), (lgx, lgy + grid_l1)])
+                            else:
+                                lcp_sk = skirt_cell(lcp, sub_skirt_segs[ss])
+                                raw_lod1.extend(orient_cell_quads(lcp_sk, lgx, lgy))
             lod1_vmap = {}
             for q in raw_lod1:
-                qa = (q[0][0]*q[1][1] - q[1][0]*q[0][1] +
-                      q[1][0]*q[2][1] - q[2][0]*q[1][1] +
-                      q[2][0]*q[3][1] - q[3][0]*q[2][1] +
-                      q[3][0]*q[0][1] - q[0][0]*q[3][1])
-                if qa < 0:
-                    q = [q[0], q[3], q[2], q[1]]
                 q_idx = []
                 for p in q:
                     pt = (quant16(p[0]), quant16(p[1]))
@@ -627,7 +642,16 @@ def bake_map_adaptive(wad_data, directory, map_name):
                         lod1_verts.append(pt)
                     q_idx.append(lod1_vmap[pt])
                 if len(set(q_idx)) >= 3:
-                    lod1_q_indices.append(q_idx)
+                    p0 = lod1_verts[q_idx[0]]
+                    p1 = lod1_verts[q_idx[1]]
+                    p2 = lod1_verts[q_idx[2]]
+                    p3 = lod1_verts[q_idx[3]]
+                    area = (p0[0]*p1[1] - p1[0]*p0[1] +
+                            p1[0]*p2[1] - p2[0]*p1[1] +
+                            p2[0]*p3[1] - p3[0]*p2[1] +
+                            p3[0]*p0[1] - p0[0]*p3[1])
+                    if area != 0:
+                        lod1_q_indices.append(q_idx)
 
         # Only activate LOD1 if it offers genuine quad reduction
         if len(lod1_q_indices) > 0 and len(lod1_q_indices) < len(sub_q_indices):

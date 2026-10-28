@@ -505,6 +505,39 @@ static void composite_texture(int texnum)
     if (pcount < 0) pcount = 0;
     if (pcount > 256) pcount = 256;
 
+    /* Vanilla DOOM parity (linuxdoom-1.10/r_data.c R_GenerateLookup & R_GetColumn):
+     * Any texture column covered by only a single patch (col_patchcount[x] == 1)
+     * reads directly from the raw patch column, ignoring patch->originy (oy = 0).
+     * Multi-patch columns (col_patchcount[x] > 1) composite with patch->originy.
+     * This fixes the 8-pixel vertical SKY1 shift (RSKY1 has originy = -8) and
+     * single-patch wall textures (TEKWALL5, BROWN144, SW1DIRT, SW2DIRT, BIGDOOR7). */
+    byte col_patchcount[512];
+    int clamp_w = (w > 512) ? 512 : w;
+    D_memset(col_patchcount, 0, clamp_w);
+    for (j = 0; j < pcount; j++)
+    {
+        byte *mp = mt + MT_PATCHES + MP_SIZE * j;
+        int ox = rd16(mp + MP_OX);
+        int pindex = rd16(mp + MP_PATCH);
+        int plen = 0;
+
+        byte *patch = get_patch(pindex, &plen);
+        if (!patch || plen < PT_COLDEFS) continue;
+
+        int pw = rd16(patch + PT_WIDTH);
+        int ph = rd16(patch + PT_HEIGHT);
+        if (pw < 1 || pw > 1024 || ph < 1) continue;
+
+        int x1 = (ox < 0) ? 0 : ox;
+        int x2 = ox + pw;
+        if (x2 > clamp_w) x2 = clamp_w;
+        for (int x = x1; x < x2; x++)
+        {
+            if (col_patchcount[x] < 255)
+                col_patchcount[x]++;
+        }
+    }
+
     for (j = 0; j < pcount; j++)
     {
         byte *mp = mt + MT_PATCHES + MP_SIZE * j;
@@ -524,6 +557,7 @@ static void composite_texture(int texnum)
         {
             int texcol = ox + c;
             if (texcol < 0 || texcol >= w) continue;
+            int oy_col = (texcol < clamp_w && col_patchcount[texcol] == 1) ? 0 : oy;
             
             /* Buffer Over-Read Fix: Clamp invalid column arrays */
             if (PT_COLDEFS + 4 * c + 3 >= plen) break;
@@ -546,7 +580,7 @@ static void composite_texture(int texnum)
                 byte *px = post + 3;
                 
                 /* Multiplication elimination (strength reduction) */
-                int ty = oy + top;
+                int ty = oy_col + top;
                 int offset = ty * w + texcol;
                 for (int k = 0; k < len; k++)
                 {

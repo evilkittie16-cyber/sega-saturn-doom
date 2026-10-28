@@ -106,6 +106,21 @@ def bake_all_textures(wad_data, directory):
             buf = bytearray(width * height)
 
             patch_base = off + 22
+            # Vanilla DOOM parity (linuxdoom-1.10/r_data.c R_GenerateLookup & R_GetColumn):
+            # Any column covered by only a single patch (col_patchcount[x] == 1) ignores
+            # patch->originy (oy = 0). Multi-patch columns composite with patch->originy.
+            col_patchcount = [0] * width
+            for p in range(pcount):
+                ox, oy, pindex, stepdir, colormap = struct.unpack_from("<hhhhh", tex_data, patch_base + p * 10)
+                patch = patches.get(pindex)
+                if not patch:
+                    continue
+                pw = patch["w"]
+                x1 = max(0, ox)
+                x2 = min(width, ox + pw)
+                for x in range(x1, x2):
+                    col_patchcount[x] += 1
+
             for p in range(pcount):
                 ox, oy, pindex, stepdir, colormap = struct.unpack_from("<hhhhh", tex_data, patch_base + p * 10)
                 patch = patches.get(pindex)
@@ -117,9 +132,10 @@ def bake_all_textures(wad_data, directory):
                     texcol = ox + c
                     if texcol < 0 or texcol >= width:
                         continue
+                    oy_col = 0 if col_patchcount[texcol] == 1 else oy
                     for top, length, pixels in patch["cols"][c]:
                         for k in range(length):
-                            ty = oy + top + k
+                            ty = oy_col + top + k
                             if 0 <= ty < height:
                                 buf[ty * width + texcol] = 247 if pixels[k] == 0 else pixels[k]
 
