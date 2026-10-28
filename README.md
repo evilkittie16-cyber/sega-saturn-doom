@@ -2,7 +2,17 @@
 
 A bespoke hardware-accelerated **Sega Saturn** port of **DOOM** built on **Jo Engine** and **Sega Graphics Library (SGL 3.02j)**.
 
-Unlike the original 1997 Rage Software port of Saturn DOOM—which discarded VDP1 3D geometry acceleration and ran a slow CPU column/span software renderer bottled through a single VDP1 sprite upload—this engine drives **Sega Saturn's VDP1 32-bit 4-vertex distorted-sprite rasterizer**, **VDP2 background planes**, and **dual Hitachi SH7604 (Master + Slave SH-2) asymmetric multiprocessing (SMP)** directly.
+Unlike the original 1997 Rage Software port of Saturn DOOM—which discarded VDP1 3D geometry acceleration and ran a slow CPU column/span software renderer bottled through a single VDP1 sprite upload—this engine drives **Sega Saturn's VDP1 32-bit 4-vertex distorted-sprite rasterizer**, **VDP2 background planes**, **SCSP 8-voice hardware PCM sound processor**, and **dual Hitachi SH7604 (Master + Slave SH-2) asymmetric multiprocessing (SMP)** directly.
+
+---
+
+## Playable Shareware Episode 1 ISO Release (`E1M1`–`E1M9`)
+
+A ready-to-play Sega Saturn disc image containing the legally redistributable **Shareware `DOOM1.WAD`** and all 9 Episode 1 levels (*Knee-Deep in the Dead*: `E1M1` through `E1M9`), complete with menus, intermission screens, level progression, and SCSP hardware sound effects:
+
+- **Compressed Release Archive (`10.4 MB`):** [`releases/Sega-Saturn-DOOM-Shareware-E1M1-E1M9-ISO.zip`](releases/Sega-Saturn-DOOM-Shareware-E1M1-E1M9-ISO.zip)
+- **Uncompressed Disc Image (`32.5 MB`):** [`Projects/DOOM-Saturn/game.iso`](Projects/DOOM-Saturn/game.iso) + [`Projects/DOOM-Saturn/game.cue`](Projects/DOOM-Saturn/game.cue)
+- Compatible with **Kronos**, **Mednafen**, **YabaSanshiro**, **BizHawk**, and real Sega Saturn hardware (via Saroo, Fenrir, Satiator, Mode, or Rhea/Phoebe; configure with **4 MB Extended RAM Cartridge** enabled).
 
 ---
 
