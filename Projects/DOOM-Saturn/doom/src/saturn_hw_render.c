@@ -206,6 +206,7 @@ static fixed_t   hw_viewx, hw_viewy, hw_viewz;
 static angle_t   hw_viewangle;
 static fixed_t   hw_viewsin, hw_viewcos;
 static fixed_t   cam_cz_origin, cam_cx_origin;
+static fixed_t   hw_f_xcos, hw_f_ysin, hw_f_xsin, hw_f_ycos;
 static int       hw_cam_x, hw_cam_y;
 sector_t        *hw_psec = NULL;
 int              saturn_hw_is_sky = 0;
@@ -497,9 +498,26 @@ typedef struct {
     int16_t yb_att;
 } hw_portal_span_t;
 
-#define HW_NODE_PVS_WORDS   32
-#define HW_MAX_PORTAL_SPANS 32
-#define HW_MAX_AP_SECTORS   256
+typedef struct {
+    int16_t x0;
+    int16_t y0;
+    int16_t x1;
+    int16_t y1;
+    int16_t back_sec_idx;
+} hw_portal_seg_t;
+
+#define HW_NODE_PVS_WORDS     32
+#define HW_MAX_PORTAL_SPANS   32
+#define HW_MAX_AP_SECTORS     256
+#define HW_MAX_AP_SUBSECTORS  1024
+#define HW_MAX_PORTAL_SEGS    512
+
+typedef struct {
+    int              portal_num_subsectors;
+    uint16_t         sub_portal_first[HW_MAX_AP_SUBSECTORS];
+    uint8_t          sub_portal_count[HW_MAX_AP_SUBSECTORS];
+    hw_portal_seg_t  portal_segs[HW_MAX_PORTAL_SEGS];
+} hw_level_portals_t;
 
 typedef struct {
     uint32_t         node_pvs_vis[HW_NODE_PVS_WORDS];
@@ -517,27 +535,33 @@ typedef struct {
     uint32_t         dirty_words;
     int16_t          cur_sub_yt_attach;
     int16_t          cur_sub_yb_attach;
+    uint8_t          cur_sub_ytop;
+    uint8_t          cur_sub_ybot;
 } hw_aperture_state_t;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(hw_aperture_state_t) <= SATURN_WRAM_L_SECSHADOW_SIZE,
-               "hw_aperture_state_t must fit inside SATURN_WRAM_L_SECSHADOW_ADDR");
+_Static_assert(sizeof(hw_level_portals_t) <= SATURN_WRAM_L_SECSHADOW_SIZE,
+               "hw_level_portals_t must fit inside SATURN_WRAM_L_PILLARS_ADDR + 0x2000");
 #elif defined(_MSC_VER)
-static_assert(sizeof(hw_aperture_state_t) <= SATURN_WRAM_L_SECSHADOW_SIZE,
-              "hw_aperture_state_t must fit inside SATURN_WRAM_L_SECSHADOW_ADDR");
+static_assert(sizeof(hw_level_portals_t) <= SATURN_WRAM_L_SECSHADOW_SIZE,
+              "hw_level_portals_t must fit inside SATURN_WRAM_L_PILLARS_ADDR + 0x2000");
 #endif
 
-#define HW_APERTURE ((hw_aperture_state_t *)((uintptr_t)SATURN_WRAM_L_PILLARS_ADDR + 0x2000u))
+static HW_ALIGN16 hw_aperture_state_t hw_aperture_state;
+#define HW_APERTURE      (&hw_aperture_state)
+#define HW_LEVEL_PORTALS ((hw_level_portals_t *)((uintptr_t)SATURN_WRAM_L_PILLARS_ADDR + 0x2000u))
 
 HW_ALWAYS_INLINE void HW_RecordPortalSpan(int sx, int ex, int ytop, int ybot, int yt_att, int yb_att)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
-    if (sx >= ex || (ytop <= 0 && ybot >= HW_VIEW_H))
-        return;
     if (ytop < 0) ytop = 0;
     if (ybot > HW_VIEW_H) ybot = HW_VIEW_H;
     if (yt_att < 0) yt_att = 0;
     if (yb_att > HW_VIEW_H) yb_att = HW_VIEW_H;
+    if (yt_att > ytop + 1) ytop = 0;
+    if (yb_att < ybot - 1) ybot = HW_VIEW_H;
+    if (sx >= ex || (ytop <= 0 && ybot >= HW_VIEW_H))
+        return;
     int idx = ap->portal_span_count;
     if (idx > 0 && ap->portal_spans[idx - 1].sx == sx && ap->portal_spans[idx - 1].ex == ex)
     {
@@ -572,10 +596,37 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex, int16_t *out
     }
     int w0 = sx >> 5;
     int w1 = (ex - 1) >> 5;
+    if (!(ap->dirty_words & (hw_span_mask_lut[w1 + 1] ^ hw_span_mask_lut[w0])))
+    {
+        *out_ytop_min = 0;
+        *out_ybot_max = (int16_t)HW_VIEW_H;
+        return 0;
+    }
+    int b0 = sx & 31;
+    int b1 = (ex - 1) & 31;
+    if (w0 == w1)
+    {
+        uint32_t mask = hw_mask_left[b0] & hw_mask_right[b1];
+        if ((hw_solid_mask[w0] & mask) == mask)
+        {
+            *out_ytop_min = (int16_t)HW_VIEW_H;
+            *out_ybot_max = 0;
+            return 1;
+        }
+    }
+    else
+    {
+        if (b0 != 0 && (hw_solid_mask[w0] & hw_mask_left[b0]) == hw_mask_left[b0])
+            w0++;
+        if (b1 != 31 && (hw_solid_mask[w1] & hw_mask_right[b1]) == hw_mask_right[b1])
+            w1--;
+    }
     int yt_min = HW_VIEW_H;
     int yb_max = 0;
     for (int w = w0; w <= w1; w++)
     {
+        if (hw_solid_mask[w] == 0xFFFFFFFFu)
+            continue;
         if (ap->ytop_min_w[w] < yt_min) yt_min = ap->ytop_min_w[w];
         if (ap->ybot_max_w[w] > yb_max) yb_max = ap->ybot_max_w[w];
     }
@@ -611,41 +662,58 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
             if (sx >= ex)
                 continue;
 
-            int check_yt = (new_yt > 0);
-            int check_yb = (new_yb < vh);
+            int check_yt = (new_yt > 0 && yt_att <= new_yt + 1);
+            int check_yb = (new_yb < vh && yb_att >= new_yb - 1);
             if (!check_yt && !check_yb)
                 continue;
 
             int w0 = sx >> 5;
             int w1 = (ex - 1) >> 5;
-            touched_words |= (hw_span_mask_lut[w1 + 1] ^ hw_span_mask_lut[w0]);
-
-            for (int x = sx; x < ex; x++)
+            for (int w = w0; w <= w1; w++)
             {
-                int yt = ytop[x];
-                int yb = ybot[x];
-                if (check_yt && yt_att <= yt + 2 && new_yt > yt) { yt = new_yt; ytop[x] = (int16_t)yt; }
-                if (check_yb && yb_att >= yb - 2 && new_yb < yb) { yb = new_yb; ybot[x] = (int16_t)yb; }
-                if (yt >= yb)
+                if (hw_solid_mask[w] == 0xFFFFFFFFu)
+                    continue;
+                int x_s = w << 5;
+                int x_e = x_s + 32;
+                if (sx > x_s) x_s = sx;
+                if (ex < x_e) x_e = ex;
+                int w_mod = 0;
+                for (int x = x_s; x < x_e; x++)
                 {
-                    int w = x >> 5;
-                    sub_solid_mask[w] |= hw_bit_lut[x & 31];
-                    if (!sub_solid_active)
+                    int yt = ytop[x];
+                    int yb = ybot[x];
+                    int mod = 0;
+                    if (check_yt && yt_att <= yt + 2 && new_yt > yt) { yt = new_yt; ytop[x] = (int16_t)yt; mod = 1; }
+                    if (check_yb && yb_att >= yb - 2 && new_yb < yb) { yb = new_yb; ybot[x] = (int16_t)yb; mod = 1; }
+                    if (mod)
                     {
-                        sub_solid_active = 1;
-                        sub_solid_min_w = w;
-                        sub_solid_max_w = w;
-                    }
-                    else
-                    {
-                        if (w < sub_solid_min_w) sub_solid_min_w = w;
-                        if (w > sub_solid_max_w) sub_solid_max_w = w;
+                        w_mod = 1;
+                        if (yt >= yb)
+                        {
+                            sub_solid_mask[w] |= hw_bit_lut[x & 31];
+                            if (!sub_solid_active)
+                            {
+                                sub_solid_active = 1;
+                                sub_solid_min_w = w;
+                                sub_solid_max_w = w;
+                            }
+                            else
+                            {
+                                if (w < sub_solid_min_w) sub_solid_min_w = w;
+                                if (w > sub_solid_max_w) sub_solid_max_w = w;
+                            }
+                        }
                     }
                 }
+                if (w_mod)
+                    touched_words |= hw_bit_lut[w];
             }
         }
-        if (touched_words != 0)
+        if (touched_words != 0 && !ap->aperture_active)
+        {
             ap->aperture_active = 1;
+            touched_words |= hw_solid_any;
+        }
     }
 
     if (sub_solid_active)
@@ -917,6 +985,36 @@ HW_ALWAYS_INLINE void HW_FixedMulPair(fixed_t a1, fixed_t b1, fixed_t a2, fixed_
 }
 #undef FixedMul
 #define FixedMul(a, b) HW_FixedMul_SH2(a, b)
+
+/* Zero-stall integer delta * 16.16 trig + fractional offset pair:
+ * Computes out0 = d0 * trig + f_off, out1 = d1 * trig + f_off.
+ * Mathematically bit-identical to FixedMul((x << 16) - viewx, trig) when
+ * d0 = x - (viewx >> 16) and f_off = FixedMul(-(viewx & 0xFFFF), trig). */
+HW_ALWAYS_INLINE void HW_MulAddPair(int d0, int d1, fixed_t trig, fixed_t f_off,
+                                    fixed_t *out0, fixed_t *out1)
+{
+#ifndef SATURN_WIN32
+    int r0, r1, tmp;
+    __asm__(
+        "dmuls.l %3, %5 \n\t"   /* Start m1 = d0 * trig */
+        "mov     %6, %0 \n\t"   /* r0 = f_off (hides 1st cycle latency of m1) */
+        "mov     %6, %1 \n\t"   /* r1 = f_off (hides 2nd cycle latency of m1!) */
+        "sts     macl, %2 \n\t" /* tmp = macl(m1) (0 STALLS!) */
+        "dmuls.l %4, %5 \n\t"   /* Start m2 = d1 * trig */
+        "add     %2, %0 \n\t"   /* r0 = f_off + d0 * trig (hides 1st cycle latency of m2) */
+        "sts     macl, %2 \n\t" /* tmp = macl(m2) */
+        "add     %2, %1 \n\t"   /* r1 = f_off + d1 * trig */
+        : "=&r"(r0), "=&r"(r1), "=&r"(tmp)
+        : "r"(d0), "r"(d1), "r"(trig), "r"(f_off)
+        : "mach", "macl"
+    );
+    *out0 = r0;
+    *out1 = r1;
+#else
+    *out0 = (fixed_t)((int64_t)d0 * (int64_t)trig + f_off);
+    *out1 = (fixed_t)((int64_t)d1 * (int64_t)trig + f_off);
+#endif
+}
 
 /* Direct 32x32->upper 32-bit hardware signed multiplier:
  * For multiplying two 16.16 fixed-point numbers and extracting the integer part.
@@ -1298,7 +1396,7 @@ static HW_NOINLINE HW_COLD_OS void HW_WallXYClamp_Slow(int *c)
         }                                                                                  \
     } while (0)
 
-HW_ALWAYS_INLINE int HW_FastDiv_Slow(unsigned int dist)
+static HW_NOINLINE HW_COLD_OS int HW_FastDiv_Slow(unsigned int dist)
 {
     /* Evaluates to shift = 1, 2, 3, or 4 with zero pipeline flushes */
     unsigned int shift = 1 + (dist >= 4096) + (dist >= 8192) + (dist >= 16384);
@@ -1316,7 +1414,7 @@ HW_ALWAYS_INLINE int HW_FastDiv(fixed_t cz)
     return HW_FastDiv_Slow(dist);
 }
 
-#define HW_VCACHE_SIZE 1024
+#define HW_VCACHE_SIZE 256
 #define HW_VCACHE_MASK (HW_VCACHE_SIZE - 1)
 
 /* Padded to exactly 32 bytes for 1-cycle bit-shift array indexing (idx << 5).
@@ -1989,6 +2087,87 @@ void Saturn_HW_RenderInit(void)
     HW_APERTURE->last_pvs_row = NULL;
     HW_APERTURE->last_pvs_numnodes = 0;
     HW_APERTURE->dirty_words = 0xFFFFFFFFu;
+    HW_LEVEL_PORTALS->portal_num_subsectors = 0;
+    if (numsubsectors > 0 && numsubsectors <= HW_MAX_AP_SUBSECTORS &&
+        segs && lines && sides && sectors && vertexes)
+    {
+        hw_level_portals_t *lp = HW_LEVEL_PORTALS;
+        int p_total = 0;
+        for (int subnum = 0; subnum < numsubsectors; subnum++)
+        {
+            const subsector_t *sub = &subsectors[subnum];
+            int fsec_idx = sub->sector;
+            int first = sub->firstline;
+            int count = (subnum == numsubsectors - 1) ? (numsegs - first) : SSEC_NUMLINES(sub);
+            int sub_first = p_total;
+            int sub_cnt = 0;
+            if ((unsigned)fsec_idx < (unsigned)numsectors &&
+                count > 0 && count <= 1024 && first >= 0 && first + count <= numsegs)
+            {
+                int is_fsky = ((int16_t)sectors[fsec_idx].ceilingpic == -1);
+                for (int j = 0; j < count; j++)
+                {
+                    const seg_t *sg = &segs[first + j];
+                    int line_idx = SEG_UNPACK_LINEDEF(sg);
+                    int side_idx = SEG_UNPACK_SIDE(sg);
+                    if ((unsigned)line_idx >= (unsigned)numlines || (unsigned)side_idx > 1)
+                        continue;
+                    const line_t *ld = &lines[line_idx];
+                    int s0 = ld->sidenum[side_idx];
+                    int s1 = ld->sidenum[side_idx ^ 1];
+                    if ((unsigned)s0 >= (unsigned)numsides || (unsigned)s1 >= (unsigned)numsides)
+                        continue;
+                    int bsec_idx = sides[s1].sector;
+                    if (bsec_idx == fsec_idx || (unsigned)bsec_idx >= (unsigned)numsectors)
+                        continue;
+                    int is_bsky = ((int16_t)sectors[bsec_idx].ceilingpic == -1);
+                    int has_upper = (!is_fsky || !is_bsky) && (sides[s0].toptexture > 0);
+                    int has_lower = (sides[s0].bottomtexture > 0);
+                    if (has_upper || has_lower)
+                        continue;
+                    int v1_idx = SEG_UNPACK_V1(sg);
+                    int v2_idx = SEG_UNPACK_V2(sg);
+                    if ((unsigned)v1_idx >= (unsigned)numvertexes ||
+                        (unsigned)v2_idx >= (unsigned)numvertexes || v1_idx == v2_idx)
+                        continue;
+                    if (p_total < HW_MAX_PORTAL_SEGS && sub_cnt < 255)
+                    {
+                        int16_t vx0 = vertexes[v1_idx].x;
+                        int16_t vy0 = vertexes[v1_idx].y;
+                        int16_t vx1 = vertexes[v2_idx].x;
+                        int16_t vy1 = vertexes[v2_idx].y;
+                        if (sub_cnt > 0)
+                        {
+                            hw_portal_seg_t *prev = &lp->portal_segs[p_total - 1];
+                            if (prev->back_sec_idx == bsec_idx && prev->x1 == vx0 && prev->y1 == vy0)
+                            {
+                                int dx0 = (int)prev->x1 - (int)prev->x0;
+                                int dy0 = (int)prev->y1 - (int)prev->y0;
+                                int dx1 = (int)vx1 - (int)vx0;
+                                int dy1 = (int)vy1 - (int)vy0;
+                                if (dx0 * dy1 == dy0 * dx1 && (dx0 * dx1 + dy0 * dy1) >= 0)
+                                {
+                                    prev->x1 = vx1;
+                                    prev->y1 = vy1;
+                                    continue;
+                                }
+                            }
+                        }
+                        lp->portal_segs[p_total].x0 = vx0;
+                        lp->portal_segs[p_total].y0 = vy0;
+                        lp->portal_segs[p_total].x1 = vx1;
+                        lp->portal_segs[p_total].y1 = vy1;
+                        lp->portal_segs[p_total].back_sec_idx = (int16_t)bsec_idx;
+                        p_total++;
+                        sub_cnt++;
+                    }
+                }
+            }
+            lp->sub_portal_first[subnum] = (uint16_t)sub_first;
+            lp->sub_portal_count[subnum] = (uint8_t)sub_cnt;
+        }
+        lp->portal_num_subsectors = numsubsectors;
+    }
 
     /* Precompute 1-sided convex pillar corner floor clamps */
     saturn_vertex_floor_clamp = NULL;
@@ -2141,8 +2320,8 @@ static HW_HOT_O2 void HW_FillBackground(void)
     hw_sky_dirty        = 0;
     saturn_hw_sky_latch = 2;
 
-    /* 1-time angle table initialization */
-    static int hw_col_bam[HW_MAX_SCREEN_W];
+    /* 1-time angle table initialization (stored in Low WRAM scratch at 0x00234800 to save 1,408 B of High WRAM .bss) */
+    int *hw_col_bam = (int *)((uintptr_t)SATURN_WRAM_L_PILLARS_ADDR + 0x4800u);
     static int last_bam_w = 0;
     if (__builtin_expect(last_bam_w != saturn_view_w, 0))
     {
@@ -3203,8 +3382,9 @@ typedef struct {
     fixed_t  y_floor_w;     /* floor - viewz (HW_DZQ) */
     const uint8_t *vfrac;   /* per-vertex 1/16-unit fractions (seam fix) */
     fixed_t  y_ceil_w;      /* ceiling - viewz (HW_DZQ) */
-    int16_t  sec_light;
-    int16_t  sub_idx;
+    uint8_t  ap_ytop;
+    uint8_t  ap_ybot;
+    uint16_t light_and_sub;
     uint32_t solid_summary; /* Summary of fully occluded words (0xFFFFFFFFu) */
     int16_t  solid_count;   /* hw_solid_count at submit time */
     int16_t  pad;
@@ -3281,15 +3461,11 @@ static int hw_def_flat_count = 0;
 static int hw_frame_flat_jobs = 0;
 static unsigned int hw_master_job_tail = 0;
 
-HW_ALWAYS_INLINE int HW_FlatQuadDy(int x0, int y0, int x1, int y1,
-                                   int x2, int y2, int x3, int y3)
+HW_ALWAYS_INLINE int HW_FlatQuadDy_PreClamped(int x0, int y0, int x1, int y1,
+                                              int x2, int y2, int x3, int y3,
+                                              int cy0, int cy1, int cy2, int cy3,
+                                              int d03, int d12)
 {
-    int cy0 = (y0 < 0) ? 0 : ((y0 > HW_VIEW_H) ? HW_VIEW_H : y0);
-    int cy1 = (y1 < 0) ? 0 : ((y1 > HW_VIEW_H) ? HW_VIEW_H : y1);
-    int cy2 = (y2 < 0) ? 0 : ((y2 > HW_VIEW_H) ? HW_VIEW_H : y2);
-    int cy3 = (y3 < 0) ? 0 : ((y3 > HW_VIEW_H) ? HW_VIEW_H : y3);
-    int d03 = cy3 - cy0; if (d03 < 0) d03 = -d03;
-    int d12 = cy2 - cy1; if (d12 < 0) d12 = -d12;
     int d01 = cy1 - cy0; if (d01 < 0) d01 = -d01;
     int d32 = cy2 - cy3; if (d32 < 0) d32 = -d32;
     int dy_depth = (d03 > d12) ? d03 : d12;
@@ -3303,12 +3479,29 @@ HW_ALWAYS_INLINE int HW_FlatQuadDy(int x0, int y0, int x1, int y1,
             dy = 16;
     }
     /* Flag grazing oblique quads where horizontal edge shear >> vertical depth span */
-    int dx03 = x3 - x0; if (dx03 < 0) dx03 = -dx03;
-    int dx12 = x2 - x1; if (dx12 < 0) dx12 = -dx12;
-    int dx_shear = (dx03 > dx12) ? dx03 : dx12;
-    if (dy_depth <= 6 && dx_shear > (dy_depth << 1))
-        dy |= 0x4000;
+    if (dy_depth <= 6)
+    {
+        int dx03 = x3 - x0; if (dx03 < 0) dx03 = -dx03;
+        int dx12 = x2 - x1; if (dx12 < 0) dx12 = -dx12;
+        int dx_shear = (dx03 > dx12) ? dx03 : dx12;
+        if (dx_shear > (dy_depth << 1))
+            dy |= 0x4000;
+    }
     return dy;
+}
+
+HW_ALWAYS_INLINE int HW_FlatQuadDy(int x0, int y0, int x1, int y1,
+                                   int x2, int y2, int x3, int y3)
+{
+    const int vh = HW_VIEW_H;
+    int cy0 = (y0 < 0) ? 0 : ((y0 > vh) ? vh : y0);
+    int cy1 = (y1 < 0) ? 0 : ((y1 > vh) ? vh : y1);
+    int cy2 = (y2 < 0) ? 0 : ((y2 > vh) ? vh : y2);
+    int cy3 = (y3 < 0) ? 0 : ((y3 > vh) ? vh : y3);
+    int d03 = cy3 - cy0; if (d03 < 0) d03 = -d03;
+    int d12 = cy2 - cy1; if (d12 < 0) d12 = -d12;
+    return HW_FlatQuadDy_PreClamped(x0, y0, x1, y1, x2, y2, x3, y3,
+                                    cy0, cy1, cy2, cy3, d03, d12);
 }
 
 HW_ALWAYS_INLINE int HW_FlatTriDy(int y0, int y1, int y2)
@@ -3755,12 +3948,17 @@ typedef struct {
     uint8_t                 emit_ceil;
     uint8_t                 fully_inside;
     uint8_t                 solid_count;
+    uint8_t                 ap_ytop;
+    uint8_t                 ap_ybot;
     int                     clip_xy[8];
 } hw_flat_emit_ctx_t;
 
-static hw_flat_emit_ctx_t hw_fctx_master;
+static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_master;
+#ifndef SATURN_WIN32
+static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_slave;
+#endif
 
-HW_ALWAYS_INLINE int HW_Slave_IsSpanOccluded(const hw_flat_emit_ctx_t *fctx, int x0, int x1, int vw)
+static HW_NOINLINE HW_HOT_O2 int HW_Slave_IsSpanOccluded(const hw_flat_emit_ctx_t *fctx, int x0, int x1, int vw)
 {
     if (fctx->solid_count <= 0)
         return 0;
@@ -4117,7 +4315,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         }
 
         uint16_t base_srca = (qpack & 0x80000000u) ? fctx->ceil_srca : fctx->floor_srca;
-        int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
+        int dy = HW_FlatQuadDy_PreClamped(x0, y0, x1, y1, x2, y2, x3, y3,
+                                          cy0, cy1, cy2, cy3, d03, d12);
         if ((dy & 0x3FFF) <= 24)
             w1 &= ~(0x1000u << 16);
         uint32_t w2 = HW_FlatSizeLOD(base_srca, quad_size, dy);
@@ -4273,7 +4472,7 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
     int qcap = fctx->qcap;
     const uint16_t *flat_cmdcolr_lut = fctx->flat_cmdcolr_lut;
 
-    if (fctx->emit_ceil && max_yc > 0 && min_yc < vh)
+    if (fctx->emit_ceil && max_yc > (int)fctx->ap_ytop && min_yc < (int)fctx->ap_ybot)
     {
         unsigned int zb = ((unsigned int)min_cz + (unsigned int)max_cz) >> 21;
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
@@ -4282,7 +4481,7 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
         local_q = qcount;
     }
 
-    if (fctx->emit_floor && max_yf > 0 && min_yf < vh)
+    if (fctx->emit_floor && max_yf > (int)fctx->ap_ytop && min_yf < (int)fctx->ap_ybot)
     {
         unsigned int zb = ((unsigned int)min_cz + (unsigned int)max_cz) >> 21;
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
@@ -4325,8 +4524,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     uint16_t floor_srca = (uint16_t)(w4 >> 16);
     uint16_t ceil_srca  = (uint16_t)(w4 & 0xFFFFu);
     uint32_t w8 = jw[8];
-    int sec_light = (int)(int16_t)(w8 >> 16);
-    int sub_idx   = (int)(int16_t)(w8 & 0xFFFFu);
+    int ap_ytop   = (int)(w8 >> 24);
+    int ap_ybot   = (int)((w8 >> 16) & 0xFFu);
+    int sec_light = (int)((w8 >> 12) & 0x0Fu);
+    int sub_idx   = (int)(w8 & 0x0FFFu);
 #else
     const saturn_flat_vert_t * __restrict verts = job->verts;
     const saturn_flat_quad_idx_t * __restrict quads = job->quads;
@@ -4338,8 +4539,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     uint32_t sky_flags = job->has_sky;
     uint16_t floor_srca = job->floor_srca;
     uint16_t ceil_srca  = job->ceil_srca;
-    int sec_light = (int)job->sec_light;
-    int sub_idx   = (int)job->sub_idx;
+    int ap_ytop   = (int)job->ap_ytop;
+    int ap_ybot   = (int)job->ap_ybot;
+    int sec_light = (int)((job->light_and_sub >> 12) & 0x0Fu);
+    int sub_idx   = (int)(job->light_and_sub & 0x0FFFu);
 #endif
 
 #ifndef SATURN_WIN32
@@ -4367,11 +4570,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             fctx->vcx       = (int)ipc->view_cx;
             fctx->vcy       = (int)ipc->view_cy;
             fctx->cmd_s_out = saturn_cmd_s;
-            fctx->proj_v    = hw_proj_verts_slave;
             fctx->qcap      = HW_SLAVE_FLAT_Q_CAP;
             fctx->local_q   = 0;
             fctx->solid_any     = 0;
             fctx->solid_summary = 0;
+            fctx->proj_v        = hw_proj_verts_slave;
         }
     }
     else
@@ -4453,12 +4656,27 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     fctx->emit_ceil        = (uint8_t)emit_ceil;
     fctx->fully_inside     = (uint8_t)fully_inside;
     fctx->solid_count      = (uint8_t)(solid_count > 255 ? 255 : (solid_count < 0 ? 0 : solid_count));
+    fctx->ap_ytop          = (uint8_t)ap_ytop;
+    fctx->ap_ybot          = (uint8_t)ap_ybot;
 
 #ifndef SATURN_WIN32
-    if (is_master)
+    if (solid_count <= 0)
     {
-        fctx->solid_any     = solid_dirty;
-        fctx->solid_summary = jw[9];
+        fctx->solid_any     = 0;
+        fctx->solid_summary = 0;
+    }
+    else
+    {
+        if (is_master)
+        {
+            fctx->solid_any     = solid_dirty;
+            fctx->solid_summary = jw[9];
+        }
+        else if (__builtin_expect(solid_dirty != 0, 0))
+        {
+            fctx->solid_summary = jw[9];
+            fctx->solid_any |= solid_dirty;
+        }
         if (solid_dirty != 0)
         {
             const volatile aliased_uint32_t *js = &jw[11];
@@ -4469,21 +4687,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             }
         }
     }
-    else if (__builtin_expect(solid_dirty != 0, 0))
-    {
-        fctx->solid_summary = jw[9];
-        fctx->solid_any |= solid_dirty;
-        const volatile aliased_uint32_t *js = &jw[11];
-        for (int w = 0; w < HW_SOLID_WORDS; w++)
-        {
-            if (solid_dirty & hw_bit_lut[w])
-                fctx->solid[w] = js[w];
-        }
-    }
 #else
-    fctx->solid_any     = solid_dirty;
-    fctx->solid_summary = job->solid_summary;
-    if (solid_dirty != 0)
+    fctx->solid_any     = (solid_count <= 0) ? 0 : solid_dirty;
+    fctx->solid_summary = (solid_count <= 0) ? 0 : job->solid_summary;
+    if (solid_count > 0 && solid_dirty != 0)
     {
         const uint32_t *js = (const uint32_t *)job->solid;
         for (int w = 0; w < HW_SOLID_WORDS; w++)
@@ -4561,12 +4768,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
                     : "r"(cx), "r"(s), "r"(y_ceil_w), "r"(y_floor_w), "r"(vcx), "r"(vcy)
                     : "mach", "macl"
                 );
-                int px_cl  = HW_CLAMP_PROJ_WIDE(px);
-                int pyc_cl = HW_CLAMP_PROJ_WIDE(pyc);
-                int pyf_cl = HW_CLAMP_PROJ_WIDE(pyf);
+                if (__builtin_expect((((unsigned int)(px + 8192) | (unsigned int)(pyc + 8192) | (unsigned int)(pyf + 8192)) > 16383u), 0))
+                {
+                    px  = HW_CLAMP_PROJ_WIDE(px);
+                    pyc = HW_CLAMP_PROJ_WIDE(pyc);
+                    pyf = HW_CLAMP_PROJ_WIDE(pyf);
+                }
                 aliased_uint32_t *pw = (aliased_uint32_t *)p_ptr;
-                pw[2] = ((uint32_t)(uint16_t)px_cl << 16) | (uint16_t)pyc_cl;
-                pw[3] = ((uint32_t)(uint16_t)pyf_cl << 16) | 0x0100u;
+                pw[2] = ((uint32_t)(uint16_t)px << 16) | (uint16_t)pyc;
+                pw[3] = ((uint32_t)(uint16_t)pyf << 16) | 0x0100u;
 #else
                 px  = vcx + HW_MulHigh(cx, s);
                 pyc = vcy - HW_MulHigh(y_ceil_w, s);
@@ -4597,11 +4807,14 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
                     : "r"(cx), "r"(s), "r"(y_w), "r"(vcx), "r"(vcy)
                     : "mach", "macl"
                 );
-                int px_cl = HW_CLAMP_PROJ_WIDE(px);
-                int py_cl = HW_CLAMP_PROJ_WIDE(py);
+                if (__builtin_expect((((unsigned int)(px + 8192) | (unsigned int)(py + 8192)) > 16383u), 0))
+                {
+                    px = HW_CLAMP_PROJ_WIDE(px);
+                    py = HW_CLAMP_PROJ_WIDE(py);
+                }
                 aliased_uint32_t *pw = (aliased_uint32_t *)p_ptr;
-                pw[2] = ((uint32_t)(uint16_t)px_cl << 16) | (uint16_t)py_cl;
-                pw[3] = ((uint32_t)(uint16_t)py_cl << 16) | 0x0100u;
+                pw[2] = ((uint32_t)(uint16_t)px << 16) | (uint16_t)py;
+                pw[3] = ((uint32_t)(uint16_t)py << 16) | 0x0100u;
 #else
                 px = vcx + HW_MulHigh(cx, s);
                 py = vcy - HW_MulHigh(y_w, s);
@@ -4668,7 +4881,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
 
             int cl_min_x = (min_x < 0) ? 0 : min_x;
             int cl_max_x = (max_x > vw) ? vw : max_x;
-            if (solid_count > 0 && HW_Slave_IsSpanOccluded(fctx, cl_min_x, cl_max_x, vw))
+            if ((fctx->solid_any & hw_bit_lut[cl_min_x >> 5]) &&
+                HW_Slave_IsSpanOccluded(fctx, cl_min_x, cl_max_x, vw))
                 continue;
 
             int dx20 = px2 - px0;
@@ -4681,8 +4895,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             if (emit_ceil)
             {
                 int py0_c = pv0->py_c, py1_c = pv1->py_c, py2_c = pv2->py_c, py3_c = pv3->py_c;
-                if ((((-py0_c) | (-py1_c) | (-py2_c) | (-py3_c)) &
-                     ((py0_c - vh) | (py1_c - vh) | (py2_c - vh) | (py3_c - vh))) < 0)
+                if ((((ap_ytop - py0_c) | (ap_ytop - py1_c) | (ap_ytop - py2_c) | (ap_ytop - py3_c)) &
+                     ((py0_c - ap_ybot) | (py1_c - ap_ybot) | (py2_c - ap_ybot) | (py3_c - ap_ybot))) < 0)
                 {
                     cw_c = HW_MulsW_PairAdd(dx20, py3_c - py1_c, dx13, py2_c - py0_c, 0);
                 }
@@ -4690,8 +4904,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             if (emit_floor)
             {
                 int py0_f = pv0->py_f, py1_f = pv1->py_f, py2_f = pv2->py_f, py3_f = pv3->py_f;
-                if ((((-py0_f) | (-py1_f) | (-py2_f) | (-py3_f)) &
-                     ((py0_f - vh) | (py1_f - vh) | (py2_f - vh) | (py3_f - vh))) < 0)
+                if ((((ap_ytop - py0_f) | (ap_ytop - py1_f) | (ap_ytop - py2_f) | (ap_ytop - py3_f)) &
+                     ((py0_f - ap_ybot) | (py1_f - ap_ybot) | (py2_f - ap_ybot) | (py3_f - ap_ybot))) < 0)
                 {
                     cw_f = HW_MulsW_PairAdd(dx20, py3_f - py1_f, dx13, py2_f - py0_f, 0);
                 }
@@ -4783,11 +4997,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
     volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
     unsigned int head = 0;
 
-    /* Allocate Slave emit context directly on the dedicated 16 KB Low WRAM stack (0x0021BFF0)
-     * so all fctx reads/writes hit Low WRAM L1 cache with zero High WRAM bus traffic! */
-    hw_flat_emit_ctx_t slave_fctx __attribute__((aligned(16)));
-    slave_fctx.cache_gen = ipc->job_done;
-    slave_fctx.local_q   = 0;
+    hw_fctx_slave.cache_gen = ipc->job_done;
+    hw_fctx_slave.local_q   = 0;
 
     while (1)
     {
@@ -4799,11 +5010,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
         __asm__ volatile("" ::: "memory");
 
         const volatile hw_flat_job_t *uncached_job = &ipc->jobs[head & (HW_JOB_RING - 1)];
-        HW_Worker_ProcessJob(0, ipc, uncached_job, &slave_fctx);
+        HW_Worker_ProcessJob(0, ipc, uncached_job, &hw_fctx_slave);
         head++;
         __asm__ volatile("" ::: "memory");
         if ((int)(head - ipc->job_tail) >= 0)
-            ipc->quad_count = slave_fctx.local_q;
+            ipc->quad_count = hw_fctx_slave.local_q;
         ipc->job_head = head;
         uint32_t dummy_done = ipc->job_head;
         (void)dummy_done;
@@ -4816,8 +5027,8 @@ void HW_Slave_FlatWorker(void)
 {
 #ifndef SATURN_WIN32
     /* Switch Slave SH-2 stack pointer (r15) from SGL's tiny default 0x06000FF0 stack
-     * (which sits only ~1 KB above the BIOS/SGL SCU Interrupt Callback & Mask tables
-     * at 0x06000A00..0x06000AFF) to our dedicated 16 KB stack in WRAM-L (0x0021BFF0). */
+     * to our dedicated 16 KB Slave Stack in Low Work RAM (0x0021BFF0) before creating
+     * any C stack frame. */
     __asm__ volatile(
         "mov   %0, r15 \n\t"
         "jmp   @%1     \n\t"
@@ -4835,25 +5046,25 @@ static HW_NOINLINE HW_HOT_O2 void HW_SelectFlatLOD(int subnum, int *io_v_first, 
     if (saturn_baked_flat_lod1_q_count && saturn_baked_flat_lod1_v_count &&
         saturn_baked_flat_lod1_q_first && saturn_baked_flat_lod1_v_first)
     {
-        int l_qcount = (int)saturn_baked_flat_lod1_q_count[subnum];
-        int l_vcount = (int)saturn_baked_flat_lod1_v_count[subnum];
-        if (l_qcount > 0 && l_vcount > 0)
+        int cx = 0, cy = 0;
+        int min_dist = (384 << 12);
+        if (__builtin_expect(saturn_baked_flat_bboxes != NULL, 1))
         {
-            int cx = 0, cy = 0;
-            int min_dist = (384 << 12);
-            if (__builtin_expect(saturn_baked_flat_bboxes != NULL, 1))
-            {
-                const saturn_flat_bbox_t *bbox = &saturn_baked_flat_bboxes[subnum];
-                cx = (hw_bbox_nidx_Nx == BOXLEFT) ? bbox->min_x : bbox->max_x;
-                cy = (hw_bbox_nidx_Ny == BOXBOTTOM) ? bbox->min_y : bbox->max_y;
-                if ((bbox->max_x - bbox->min_x) > 128 || (bbox->max_y - bbox->min_y) > 128)
-                    min_dist = (512 << 12);
-            }
-            int dx = cx - hw_cam_x;
-            int dy = cy - hw_cam_y;
-            if (dx > 16384) dx = 16384; else if (dx < -16384) dx = -16384;
-            if (dy > 16384) dy = 16384; else if (dy < -16384) dy = -16384;
-            if (HW_MulsW_PairAdd(dx, hw_bbox_Nx, dy, hw_bbox_Ny, 0) >= min_dist)
+            const saturn_flat_bbox_t *bbox = &saturn_baked_flat_bboxes[subnum];
+            cx = (hw_bbox_nidx_Nx == BOXLEFT) ? bbox->min_x : bbox->max_x;
+            cy = (hw_bbox_nidx_Ny == BOXBOTTOM) ? bbox->min_y : bbox->max_y;
+            if ((bbox->max_x - bbox->min_x) > 128 || (bbox->max_y - bbox->min_y) > 128)
+                min_dist = (512 << 12);
+        }
+        int dx = cx - hw_cam_x;
+        int dy = cy - hw_cam_y;
+        if (dx > 16384) dx = 16384; else if (dx < -16384) dx = -16384;
+        if (dy > 16384) dy = 16384; else if (dy < -16384) dy = -16384;
+        if (HW_MulsW_PairAdd(dx, hw_bbox_Nx, dy, hw_bbox_Ny, 0) >= min_dist)
+        {
+            int l_qcount = (int)saturn_baked_flat_lod1_q_count[subnum];
+            int l_vcount = (int)saturn_baked_flat_lod1_v_count[subnum];
+            if (l_qcount > 0 && l_vcount > 0)
             {
                 if (*io_q_count > l_qcount)
                     saturn_hw_flat_lod_saved_quads += (unsigned int)(*io_q_count - l_qcount);
@@ -4897,11 +5108,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     int emit_floor, emit_ceil;
     int floor_srca, ceil_srca;
     fixed_t y_floor_w, y_ceil_w;
+    int allow_sky = (fully_inside >> 3) & 1;
 
     if (sec == hw_last_flat_sec)
     {
         emit_floor = hw_last_emit_floor & ((fully_inside >> 2) & 1);
-        emit_ceil  = hw_last_emit_ceil  & ((fully_inside >> 3) & 1);
+        emit_ceil  = hw_last_emit_ceil  & allow_sky;
         fully_inside &= 3;
 
         if (!emit_ceil && !emit_floor)
@@ -4942,7 +5154,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
         hw_last_y_floor_w  = y_floor_w;
         hw_last_y_ceil_w   = y_ceil_w;
         emit_floor &= (fully_inside >> 2) & 1;
-        emit_ceil  &= (fully_inside >> 3) & 1;
+        emit_ceil  &= allow_sky;
         fully_inside &= 3;
 
         if (!emit_ceil && !emit_floor)
@@ -4958,7 +5170,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     const saturn_flat_vert_t *verts = &saturn_baked_flat_verts[v_first];
     const saturn_flat_quad_idx_t *quads = &saturn_baked_flat_quads[q_first];
     const uint8_t *vfrac = saturn_baked_flat_vfrac ? (saturn_baked_flat_vfrac + v_first) : NULL;
-    uint8_t sky_flags = (uint8_t)((int16_t)sec->ceilingpic == -1);
+    uint8_t sky_flags = (uint8_t)(((int16_t)sec->ceilingpic == -1) && allow_sky);
     int sc = hw_solid_count;
     int fjob_idx = ++hw_frame_flat_jobs;
 
@@ -4977,10 +5189,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
                  ((uint32_t)(uint8_t)fully_inside << 8) |
                  sky_flags;
         mw[4]  = ((uint32_t)(uint16_t)floor_srca << 16) | (uint16_t)ceil_srca;
+        uint32_t w8_pack = ((uint32_t)HW_APERTURE->cur_sub_ytop << 24) |
+                           ((uint32_t)HW_APERTURE->cur_sub_ybot << 16) |
+                           (((uint32_t)((sec->lightlevel >> 4) & 15) << 12) | ((uint32_t)sub_idx & 0x0FFFu));
         mw[5]  = (uint32_t)y_floor_w;
         mw[6]  = (uint32_t)vfrac;
         mw[7]  = (uint32_t)y_ceil_w;
-        mw[8]  = ((uint32_t)(uint16_t)(int16_t)(sec->lightlevel >> 4) << 16) | (uint16_t)(int16_t)sub_idx;
+        mw[8]  = w8_pack;
         mw[9]  = hw_solid_summary;
         mw[10] = ((uint32_t)(uint16_t)(int16_t)sc << 16) | (uint16_t)s_any;
         if (s_any != 0)
@@ -5016,11 +5231,14 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
             ((uint32_t)(uint8_t)emit_ceil << 16) |
             ((uint32_t)(uint8_t)fully_inside << 8) |
             sky_flags;
+    uint32_t w8_pack = ((uint32_t)HW_APERTURE->cur_sub_ytop << 24) |
+                       ((uint32_t)HW_APERTURE->cur_sub_ybot << 16) |
+                       (((uint32_t)((sec->lightlevel >> 4) & 15) << 12) | ((uint32_t)sub_idx & 0x0FFFu));
     jw[4] = ((uint32_t)(uint16_t)floor_srca << 16) | (uint16_t)ceil_srca;
     jw[5] = (uint32_t)y_floor_w;
     jw[6] = (uint32_t)vfrac;
     jw[7] = (uint32_t)y_ceil_w;
-    jw[8] = ((uint32_t)(uint16_t)(int16_t)(sec->lightlevel >> 4) << 16) | (uint16_t)(int16_t)sub_idx;
+    jw[8] = w8_pack;
     jw[10] = ((uint32_t)(uint16_t)(int16_t)sc << 16) | (uint16_t)dirty;
 
     if (__builtin_expect(dirty != 0, 0))
@@ -5052,11 +5270,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
         return;
 
     const fixed_t vz = hw_viewz;
+    int allow_sky  = (fully_inside >> 3) & 1;
     int emit_ceil  = (vz < sec->ceilingheight && ((int16_t)sec->ceilingpic != -1));
     int emit_floor = (vz > sec->floorheight && ((int16_t)sec->floorpic != -1));
     if (saturn_vdp2_plane_active && sec == &sectors[saturn_vdp2_plane_sec]) emit_floor = 0;
     emit_floor &= (fully_inside >> 2) & 1;
-    emit_ceil  &= (fully_inside >> 3) & 1;
+    emit_ceil  &= allow_sky;
     fully_inside &= 3;
 
     if (!emit_ceil && !emit_floor)
@@ -5080,14 +5299,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     job.emit_floor = (uint8_t)emit_floor;
     job.emit_ceil = (uint8_t)emit_ceil;
     job.fully_inside = (uint8_t)fully_inside;
-    job.has_sky = ((int16_t)sec->ceilingpic == -1);
+    job.has_sky = (uint8_t)(((int16_t)sec->ceilingpic == -1) && allow_sky);
     job.floor_srca = (uint16_t)floor_srca;
     job.ceil_srca = (uint16_t)ceil_srca;
     job.y_floor_w = HW_DZQ(sec->floorheight, vz);
     job.vfrac = saturn_baked_flat_vfrac ? (saturn_baked_flat_vfrac + v_first) : NULL;
     job.y_ceil_w = HW_DZQ(sec->ceilingheight, vz);
-    job.sec_light = (int16_t)(sec->lightlevel >> 4);
-    job.sub_idx = (int16_t)sub_idx;
+    job.ap_ytop = HW_APERTURE->cur_sub_ytop;
+    job.ap_ybot = HW_APERTURE->cur_sub_ybot;
+    job.light_and_sub = (uint16_t)((((sec->lightlevel >> 4) & 15) << 12) | (sub_idx & 0x0FFFu));
     job.solid_count = (int16_t)hw_solid_count;
     job.solid_summary = hw_solid_summary;
     job.pad = (int16_t)(uint16_t)hw_solid_any;
@@ -6511,10 +6731,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_FlushDeferredSubsectorWalls(hw_wall_emit_ct
     }
 }
 static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
-    hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg, int s_A, int s_B)
+    hw_wall_emit_ctx_t *ctx, int bsec_idx, int xa, int xb, int s_A, int s_B)
 {
     ctx->portal_recorded = 1;
-    int bsec_idx = seg->back_sec_idx;
     if (ctx->seg_sx >= ctx->seg_ex || bsec_idx < 0 || bsec_idx >= numsectors)
         return;
     const sector_t *bsec = &sectors[bsec_idx];
@@ -6525,7 +6744,24 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     int yt_att = ap->cur_sub_yt_attach;
     int yb_att = ap->cur_sub_yb_attach;
 
-    if (!ctx->is_sky_ceil && (int16_t)bsec->ceilingpic != -1)
+    if (__builtin_expect((xa < 0 || xb > saturn_view_w) && xb > xa, 0))
+    {
+        int dx = xb - xa;
+        int ds = s_B - s_A;
+        int orig_sA = s_A;
+        if (xa < 0)
+        {
+            int f = HW_ClampedFrac((unsigned int)(-xa), (unsigned int)dx);
+            s_A = orig_sA + FixedMul(ds, f);
+        }
+        if (xb > saturn_view_w)
+        {
+            int f = HW_ClampedFrac((unsigned int)(saturn_view_w - xa), (unsigned int)dx);
+            s_B = orig_sA + FixedMul(ds, f);
+        }
+    }
+
+    if (!ctx->is_sky_ceil || ((int16_t)bsec->ceilingpic != -1 && ctx->sec_ceiling > bsec->ceilingheight))
     {
         fixed_t open_top = (ctx->sec_ceiling < bsec->ceilingheight) ? ctx->sec_ceiling : bsec->ceilingheight;
         if (ctx->sec_ceiling > bsec->ceilingheight || open_top > vz)
@@ -6534,20 +6770,23 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
             int yta, ytb;
             HW_ProjYPair(HW_VIEW_CY, dzt, s_A, dzt, s_B, &yta, &ytb);
             int yt_min = (yta < ytb) ? yta : ytb;
-            p_yt = yt_min - 1;
-            if (ctx->sec_ceiling > bsec->ceilingheight)
-            {
-                int dzt_hi = HW_DZQ(ctx->sec_ceiling, vz);
-                int yha, yhb;
-                HW_ProjYPair(HW_VIEW_CY, dzt_hi, s_A, dzt_hi, s_B, &yha, &yhb);
-                int w_yt_att = (yha < yhb) ? yha : yhb;
-                if (w_yt_att < yt_att) yt_att = w_yt_att;
-            }
-            if ((unsigned)bsec_idx < HW_MAX_AP_SECTORS)
+            if ((int16_t)bsec->ceilingpic != -1 && (unsigned)bsec_idx < HW_MAX_AP_SECTORS)
             {
                 int b_yt_att = (yt_min < 0) ? 0 : yt_min;
                 if (b_yt_att < ap->sec_yt_attach[bsec_idx])
                     ap->sec_yt_attach[bsec_idx] = (int16_t)b_yt_att;
+            }
+            if (yt_min - 1 > ctx->ytop_min)
+            {
+                p_yt = yt_min - 1;
+                if (ctx->sec_ceiling > bsec->ceilingheight)
+                {
+                    int dzt_hi = HW_DZQ(ctx->sec_ceiling, vz);
+                    int yha, yhb;
+                    HW_ProjYPair(HW_VIEW_CY, dzt_hi, s_A, dzt_hi, s_B, &yha, &yhb);
+                    int w_yt_att = (yha < yhb) ? yha : yhb;
+                    if (w_yt_att < yt_att) yt_att = w_yt_att;
+                }
             }
         }
     }
@@ -6559,20 +6798,23 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
         int yba, ybb;
         HW_ProjYPair(HW_VIEW_CY, dzb, s_A, dzb, s_B, &yba, &ybb);
         int yb_max = (yba > ybb) ? yba : ybb;
-        p_yb = yb_max + 1;
-        if (ctx->sec_floor < bsec->floorheight)
-        {
-            int dzb_lo = HW_DZQ(ctx->sec_floor, vz);
-            int yla, ylb;
-            HW_ProjYPair(HW_VIEW_CY, dzb_lo, s_A, dzb_lo, s_B, &yla, &ylb);
-            int w_yb_att = (yla > ylb) ? yla : ylb;
-            if (w_yb_att > yb_att) yb_att = w_yb_att;
-        }
         if ((unsigned)bsec_idx < HW_MAX_AP_SECTORS)
         {
             int b_yb_att = (yb_max > HW_VIEW_H) ? HW_VIEW_H : yb_max;
             if (b_yb_att > ap->sec_yb_attach[bsec_idx])
                 ap->sec_yb_attach[bsec_idx] = (int16_t)b_yb_att;
+        }
+        if (yb_max + 1 < ctx->ybot_max)
+        {
+            p_yb = yb_max + 1;
+            if (ctx->sec_floor < bsec->floorheight)
+            {
+                int dzb_lo = HW_DZQ(ctx->sec_floor, vz);
+                int yla, ylb;
+                HW_ProjYPair(HW_VIEW_CY, dzb_lo, s_A, dzb_lo, s_B, &yla, &ylb);
+                int w_yb_att = (yla > ylb) ? yla : ylb;
+                if (w_yb_att > yb_att) yb_att = w_yb_att;
+            }
         }
     }
 
@@ -6829,7 +7071,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
 
     if (!is_solid && !ctx->portal_recorded && (seg_flags & (SEG_FLAG_UPPER | SEG_FLAG_LOWER)))
     {
-        HW_RecordSegPortalAperture(ctx, seg, s_A, s_B);
+        HW_RecordSegPortalAperture(ctx, seg->back_sec_idx, xa, xb, s_A, s_B);
     }
 
     ya0 -= top_overlap;
@@ -6955,6 +7197,127 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
     }
 }
 
+static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals(int subnum, hw_wall_emit_ctx_t *ctx)
+{
+    const hw_level_portals_t *lp = HW_LEVEL_PORTALS;
+    const hw_aperture_state_t *ap = HW_APERTURE;
+    int count = (int)lp->sub_portal_count[subnum];
+    const hw_portal_seg_t *p = &lp->portal_segs[lp->sub_portal_first[subnum]];
+    const int cam_x = hw_cam_x;
+    const int cam_y = hw_cam_y;
+    const int view_w = saturn_view_w;
+    int has_last = 0;
+    int last_x1 = 0, last_y1 = 0;
+    hw_trans_pillar_t tp0, tp1;
+    int i;
+
+    for (i = 0; i < count; i++, p++)
+    {
+        int p0x = (int)p->x0;
+        int p0z = (int)p->y0;
+        int p1x = (int)p->x1;
+        int p1z = (int)p->y1;
+        int seg_dx = p1x - p0x;
+        int seg_dy = p1z - p0z;
+        int obj_dx0 = p0x - cam_x;
+        int obj_dy0 = p0z - cam_y;
+        if (HW_CrossBackface(obj_dy0, seg_dx, obj_dx0, seg_dy) <= 0)
+            continue;
+
+        if (has_last && p0x == last_x1 && p0z == last_y1)
+        {
+            tp0 = tp1;
+        }
+        else if (__builtin_expect((((unsigned int)obj_dx0 + 16384u) | ((unsigned int)obj_dy0 + 16384u)) > 32767u, 0))
+        {
+            HW_TransformPillar_Shifted(&tp0, obj_dx0 * 16, obj_dy0 * 16);
+        }
+        else
+        {
+            fixed_t cz, cx;
+            ProjectPillar_2D(obj_dx0 * 16, obj_dy0 * 16, hw_bbox_Nx, hw_bbox_Ny, cam_cz_origin, cam_cx_origin, &cz, &cx);
+            int s = 0, px = 0;
+            if (cz >= HW_NEAR_Z)
+            {
+                s = HW_FastDiv(cz);
+                px = HW_ProjX(cx, s, saturn_view_cx);
+            }
+            tp0.cx = cx; tp0.cz = cz; tp0.s = s; tp0.px = px;
+        }
+        {
+            int obj_dx1 = p1x - cam_x;
+            int obj_dy1 = p1z - cam_y;
+            if (__builtin_expect((((unsigned int)obj_dx1 + 16384u) | ((unsigned int)obj_dy1 + 16384u)) > 32767u, 0))
+            {
+                HW_TransformPillar_Shifted(&tp1, obj_dx1 * 16, obj_dy1 * 16);
+            }
+            else
+            {
+                fixed_t cz, cx;
+                ProjectPillar_2D(obj_dx1 * 16, obj_dy1 * 16, hw_bbox_Nx, hw_bbox_Ny, cam_cz_origin, cam_cx_origin, &cz, &cx);
+                int s = 0, px = 0;
+                if (cz >= HW_NEAR_Z)
+                {
+                    s = HW_FastDiv(cz);
+                    px = HW_ProjX(cx, s, saturn_view_cx);
+                }
+                tp1.cx = cx; tp1.cz = cz; tp1.s = s; tp1.px = px;
+            }
+            last_x1 = p1x;
+            last_y1 = p1z;
+            has_last = 1;
+        }
+        if ((tp0.cz < HW_NEAR_Z && tp1.cz < HW_NEAR_Z) ||
+            (tp0.cz > HW_FAR_Z  && tp1.cz > HW_FAR_Z))
+            continue;
+
+        const hw_trans_pillar_t *p0_use = &tp0;
+        const hw_trans_pillar_t *p1_use = &tp1;
+        if (__builtin_expect(tp0.cz >= HW_NEAR_Z && tp1.cz >= HW_NEAR_Z, 1))
+        {
+            int xa = tp0.px;
+            int xb = tp1.px;
+            if (xb <= xa || xb <= 0 || xa >= view_w)
+                continue;
+            int seg_sx = (xa < 0) ? 0 : xa;
+            int seg_ex = (xb > view_w) ? view_w : xb;
+            if (hw_solid_count > 0 && HW_CheckSpanOcclusion(seg_sx, seg_ex) == 2)
+                continue;
+            if (ap->aperture_active)
+            {
+                if (HW_GetSpanAperture(seg_sx, seg_ex, &ctx->ytop_min, &ctx->ybot_max))
+                    continue;
+            }
+            else
+            {
+                ctx->ytop_min = 0;
+                ctx->ybot_max = (int16_t)HW_VIEW_H;
+            }
+            ctx->seg_sx = (int16_t)seg_sx;
+            ctx->seg_ex = (int16_t)seg_ex;
+        }
+        else
+        {
+            if (!HW_ClipWallNearPlane(&tp0, &tp1, ctx))
+                continue;
+            p0_use = &hw_p0_clipped;
+            p1_use = &hw_p1_clipped;
+            if (ap->aperture_active)
+            {
+                if (HW_GetSpanAperture(ctx->seg_sx, ctx->seg_ex, &ctx->ytop_min, &ctx->ybot_max))
+                    continue;
+            }
+            else
+            {
+                ctx->ytop_min = 0;
+                ctx->ybot_max = (int16_t)HW_VIEW_H;
+            }
+        }
+        ctx->portal_recorded = 0;
+        HW_RecordSegPortalAperture(ctx, (int)p->back_sec_idx, p0_use->px, p1_use->px, p0_use->s, p1_use->s);
+    }
+}
+
 /* Master Blueprint: Zero-Runtime-Math 1D LOD Subsector Wall Renderer (Phase 3)
  * Fast Culling & Pillar Projection Loop (< 1.5 KB): rejects ~72% of segs in registers
  * and dispatches surviving visible segs to HW_EmitVisibleBakedSeg. */
@@ -6970,7 +7333,17 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
     const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[subnum];
     int num_segs = (int)ss->num_segs;
     if (num_segs <= 0)
+    {
+        if ((unsigned)subnum < (unsigned)HW_LEVEL_PORTALS->portal_num_subsectors &&
+            HW_LEVEL_PORTALS->sub_portal_count[subnum] > 0 && hw_solid_count < saturn_view_w)
+        {
+            wctx.sec_ceiling = sec->ceilingheight;
+            wctx.sec_floor   = sec->floorheight;
+            wctx.is_sky_ceil = (uint8_t)((int16_t)sec->ceilingpic == -1);
+            HW_RecordSubsectorUnbakedPortals(subnum, &wctx);
+        }
         return 1;
+    }
     int num_pil = (int)ss->num_pillars;
     if (num_pil <= 0 || num_pil > HW_MAX_SUBSECTOR_PILLARS)
         return 0;
@@ -7090,9 +7463,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
                     {
                         occlude_only = 1;
                     }
-                    else if (((seg_flags & SEG_FLAG_LOWER) && sec_floor > bsec->floorheight && sec_floor < hw_viewz) ||
-                             ((seg_flags & SEG_FLAG_UPPER) && !is_sky_ceil && (int16_t)bsec->ceilingpic != -1 &&
-                              sec_ceiling < bsec->ceilingheight && sec_ceiling > hw_viewz))
+                    else if (!wctx.portal_recorded &&
+                             ((!is_sky_ceil && (sec_ceiling != bsec->ceilingheight || sec_ceiling > hw_viewz)) ||
+                              (sec_floor != bsec->floorheight || sec_floor < hw_viewz)))
                     {
                         occlude_only = 2;
                     }
@@ -7106,8 +7479,6 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
 
         const hw_trans_pillar_t *p0_use = &local_trans_pillars[idx0];
         const hw_trans_pillar_t *p1_use = &local_trans_pillars[idx1];
-        wctx.u_start = seg->u_start;
-        wctx.u_span  = (seg->u_span > 0) ? (int)seg->u_span : 64;
         wctx.was_near_clipped = 0;
 
         if (last_pair_state == 2)
@@ -7162,10 +7533,18 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
                 wctx.seg_ex = (int16_t)seg_ex;
                 wctx.occl_state = (uint8_t)occl_state;
                 cached_occl_state = (uint8_t)occl_state;
-                if (HW_GetSpanAperture(seg_sx, seg_ex, &wctx.ytop_min, &wctx.ybot_max))
+                if (HW_APERTURE->aperture_active)
                 {
-                    last_pair_state = -1;
-                    continue;
+                    if (HW_GetSpanAperture(seg_sx, seg_ex, &wctx.ytop_min, &wctx.ybot_max))
+                    {
+                        last_pair_state = -1;
+                        continue;
+                    }
+                }
+                else
+                {
+                    wctx.ytop_min = 0;
+                    wctx.ybot_max = (int16_t)HW_VIEW_H;
                 }
                 cached_ytop_min = wctx.ytop_min;
                 cached_ybot_max = wctx.ybot_max;
@@ -7173,12 +7552,22 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
             }
             else
             {
+                wctx.u_start = seg->u_start;
+                wctx.u_span  = (seg->u_span > 0) ? (int)seg->u_span : 64;
                 if (!HW_ClipWallNearPlane(p0_use, p1_use, &wctx))
                     continue;
                 p0_use = &hw_p0_clipped;
                 p1_use = &hw_p1_clipped;
-                if (HW_GetSpanAperture(wctx.seg_sx, wctx.seg_ex, &wctx.ytop_min, &wctx.ybot_max))
-                    continue;
+                if (HW_APERTURE->aperture_active)
+                {
+                    if (HW_GetSpanAperture(wctx.seg_sx, wctx.seg_ex, &wctx.ytop_min, &wctx.ybot_max))
+                        continue;
+                }
+                else
+                {
+                    wctx.ytop_min = 0;
+                    wctx.ybot_max = (int16_t)HW_VIEW_H;
+                }
             }
         }
 
@@ -7191,12 +7580,23 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
             }
             else if (!wctx.portal_recorded)
             {
-                HW_RecordSegPortalAperture(&wctx, seg, p0_use->s, p1_use->s);
+                HW_RecordSegPortalAperture(&wctx, seg->back_sec_idx, p0_use->px, p1_use->px, p0_use->s, p1_use->s);
             }
             continue;
         }
 
+        if (__builtin_expect(!wctx.was_near_clipped, 1))
+        {
+            wctx.u_start = seg->u_start;
+            wctx.u_span  = (seg->u_span > 0) ? (int)seg->u_span : 64;
+        }
         HW_EmitVisibleBakedSeg(&wctx, seg, p0_use, p1_use);
+    }
+
+    if ((unsigned)subnum < (unsigned)HW_LEVEL_PORTALS->portal_num_subsectors &&
+        HW_LEVEL_PORTALS->sub_portal_count[subnum] > 0 && hw_solid_count < view_w)
+    {
+        HW_RecordSubsectorUnbakedPortals(subnum, &wctx);
     }
 
     if (hw_def_wall_count > 0)
@@ -7218,85 +7618,112 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
 static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, const sector_t *sec)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
+    int secnum = subsectors[subnum].sector;
+    int valid_sec = ((unsigned)secnum < HW_MAX_AP_SECTORS);
     ap->cur_sub_yt_attach = 0;
     ap->cur_sub_yb_attach = (int16_t)HW_VIEW_H;
-    if (!ap->aperture_active || !saturn_baked_flat_bboxes)
+    ap->cur_sub_ytop = 0;
+    ap->cur_sub_ybot = (uint8_t)HW_VIEW_H;
+    if (!saturn_baked_flat_bboxes || (!ap->aperture_active && sec == hw_psec))
         return 3;
 
     const saturn_flat_bbox_t *fb = &saturn_baked_flat_bboxes[subnum];
     if (fb->min_x == fb->max_x && fb->min_y == fb->max_y)
         return 3;
 
-    const fixed_t vx = hw_viewx, vy = hw_viewy;
+    const int cx = hw_cam_x, cy = hw_cam_y;
     const fixed_t cs = hw_viewcos, sn = hw_viewsin;
-    fixed_t dx0 = ((fixed_t)fb->min_x << FRACBITS) - vx;
-    fixed_t dx1 = ((fixed_t)fb->max_x << FRACBITS) - vx;
-    fixed_t dy0 = ((fixed_t)fb->min_y << FRACBITS) - vy;
-    fixed_t dy1 = ((fixed_t)fb->max_y << FRACBITS) - vy;
+    int ix0 = (int)fb->min_x - cx;
+    int ix1 = (int)fb->max_x - cx;
+    int iy0 = (int)fb->min_y - cy;
+    int iy1 = (int)fb->max_y - cy;
 
     fixed_t x0c, x1c, y0s, y1s;
-    HW_FixedMulPair(dx0, cs, dx1, cs, &x0c, &x1c);
-    HW_FixedMulPair(dy0, sn, dy1, sn, &y0s, &y1s);
+    HW_MulAddPair(ix0, ix1, cs, hw_f_xcos, &x0c, &x1c);
+    HW_MulAddPair(iy0, iy1, sn, hw_f_ysin, &y0s, &y1s);
 
     fixed_t max_cz = (x0c > x1c ? x0c : x1c) + (y0s > y1s ? y0s : y1s);
     if (max_cz < HW_NEAR_Z)
         return 3;
 
+    fixed_t x0s, x1s, y0c, y1c;
+    HW_MulAddPair(ix0, ix1, sn, hw_f_xsin, &x0s, &x1s);
+    HW_MulAddPair(iy0, iy1, cs, hw_f_ycos, &y0c, &y1c);
+
     fixed_t min_cz = (x0c < x1c ? x0c : x1c) + (y0s < y1s ? y0s : y1s);
+    fixed_t min_cx = (x0s < x1s ? x0s : x1s) - (y0c > y1c ? y0c : y1c);
+    fixed_t max_cx = (x0s > x1s ? x0s : x1s) - (y0c < y1c ? y0c : y1c);
+    fixed_t cz_fmin = 0;
+    if (min_cx > 0)
+        cz_fmin = min_cx - (min_cx >> 3);
+    else if (max_cx < 0)
+        cz_fmin = (-max_cx) - ((-max_cx) >> 3);
+    if (cz_fmin > min_cz)
+        min_cz = cz_fmin;
+    if (min_cz > max_cz)
+        min_cz = max_cz;
+
     const int vw = saturn_view_w;
     int sx, ex;
     int any_behind = 0;
+    int s_max;
+    int s_min = HW_FastDiv(max_cz);
 
     if (min_cz < HW_NEAR_Z)
     {
         any_behind = 1;
         min_cz = HW_NEAR_Z;
+        s_max = HW_FastDiv(min_cz);
         sx = 0;
         ex = vw;
     }
     else
     {
-        fixed_t x0s, x1s, y0c, y1c;
-        HW_FixedMulPair(dx0, sn, dx1, sn, &x0s, &x1s);
-        HW_FixedMulPair(dy0, cs, dy1, cs, &y0c, &y1c);
+        s_max = HW_FastDiv(min_cz);
+        if (ap->aperture_active)
+        {
+            int s_sx = (min_cx < 0) ? s_max : s_min;
+            int s_ex = (max_cx > 0) ? s_max : s_min;
+            HW_ProjXPair(min_cx, s_sx, max_cx, s_ex, saturn_view_cx, &sx, &ex);
 
-        fixed_t cz[4], cx[4];
-        cz[0] = x0c + y0s; cx[0] = x0s - y0c;
-        cz[1] = x1c + y0s; cx[1] = x1s - y0c;
-        cz[2] = x1c + y1s; cx[2] = x1s - y1c;
-        cz[3] = x0c + y1s; cx[3] = x0s - y1c;
-
-        int px0, px1, px2, px3;
-        HW_ProjXPair(cx[0], HW_FastDiv(cz[0]), cx[1], HW_FastDiv(cz[1]), saturn_view_cx, &px0, &px1);
-        HW_ProjXPair(cx[2], HW_FastDiv(cz[2]), cx[3], HW_FastDiv(cz[3]), saturn_view_cx, &px2, &px3);
-        int min01 = (px0 < px1) ? px0 : px1;
-        int min23 = (px2 < px3) ? px2 : px3;
-        int max01 = (px0 > px1) ? px0 : px1;
-        int max23 = (px2 > px3) ? px2 : px3;
-        sx = (min01 < min23) ? min01 : min23;
-        ex = (max01 > max23) ? max01 : max23;
-
-        sx -= 2;
-        ex += 2;
-        if (sx < 0) sx = 0;
-        if (ex > vw) ex = vw;
+            sx -= 2;
+            ex += 2;
+            if (sx < 0) sx = 0;
+            if (ex > vw) ex = vw;
+        }
+        else
+        {
+            sx = 0;
+            ex = vw;
+        }
     }
-    if (sx >= ex)
-        return 3;
 
-    int16_t ytop_min, ybot_max;
-    if (HW_GetSpanAperture(sx, ex, &ytop_min, &ybot_max))
-        return -1;
-    if (ytop_min <= 0 && ybot_max >= HW_VIEW_H)
+    int16_t ytop_min = 0, ybot_max = (int16_t)HW_VIEW_H;
+    int check_ap = 0;
+    if (ap->aperture_active && sx < ex)
+    {
+        if (HW_GetSpanAperture(sx, ex, &ytop_min, &ybot_max))
+            return -1;
+        if (ytop_min > 0 || ybot_max < HW_VIEW_H)
+        {
+            check_ap = 1;
+            ap->cur_sub_ytop = (ytop_min > 2) ? (uint8_t)(ytop_min - 2) : 0;
+            ap->cur_sub_ybot = (ybot_max + 2 < HW_VIEW_H) ? (uint8_t)(ybot_max + 2) : (uint8_t)HW_VIEW_H;
+        }
+    }
+    if (!check_ap && (sec == hw_psec || any_behind))
+    {
+        if (valid_sec)
+        {
+            ap->sec_yb_attach[secnum] = (int16_t)HW_VIEW_H;
+            ap->sec_yt_attach[secnum] = 0;
+        }
         return 3;
+    }
 
-    int s_max = HW_FastDiv(min_cz);
-    int s_min = HW_FastDiv(max_cz);
     const fixed_t vz = hw_viewz;
     int allow_floor = 1;
     int allow_ceil  = 1;
-    int secnum = subsectors[subnum].sector;
-    int valid_sec = ((unsigned)secnum < HW_MAX_AP_SECTORS);
     int yf_min = 0, yf_max = HW_VIEW_H;
     int yc_min = 0, yc_max = HW_VIEW_H;
 
@@ -7319,54 +7746,75 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, const sec
         {
             ap->sec_yb_attach[secnum] = (int16_t)HW_VIEW_H;
         }
-        if (yf_min - 2 >= ybot_max || yf_max + 2 <= ytop_min)
+        if (check_ap && (yf_min - 2 >= ybot_max || yf_max + 2 <= ytop_min))
             allow_floor = 0;
     }
     else if (!any_behind && sec != hw_psec)
     {
         ap->cur_sub_yb_attach = valid_sec ? ap->sec_yb_attach[secnum] : 0;
     }
-    if ((int16_t)sec->ceilingpic != -1 && sec->ceilingheight > vz)
+    if ((int16_t)sec->ceilingpic != -1)
     {
-        int dzc = HW_DZQ(sec->ceilingheight, vz);
-        HW_ProjYPair(HW_VIEW_CY, dzc, s_max, dzc, s_min, &yc_min, &yc_max);
-        if (!any_behind && sec != hw_psec)
+        if (sec->ceilingheight > vz)
         {
-            int yt_att = (yc_min < 0) ? 0 : yc_min;
-            if (valid_sec)
+            int dzc = HW_DZQ(sec->ceilingheight, vz);
+            HW_ProjYPair(HW_VIEW_CY, dzc, s_max, dzc, s_min, &yc_min, &yc_max);
+            if (!any_behind && sec != hw_psec)
             {
-                if (yt_att < ap->sec_yt_attach[secnum])
-                    ap->sec_yt_attach[secnum] = (int16_t)yt_att;
-                yt_att = ap->sec_yt_attach[secnum];
+                int yt_att = (yc_min < 0) ? 0 : yc_min;
+                if (valid_sec)
+                {
+                    if (yt_att < ap->sec_yt_attach[secnum])
+                        ap->sec_yt_attach[secnum] = (int16_t)yt_att;
+                    yt_att = ap->sec_yt_attach[secnum];
+                }
+                ap->cur_sub_yt_attach = (int16_t)yt_att;
             }
-            ap->cur_sub_yt_attach = (int16_t)yt_att;
+            else if (valid_sec)
+            {
+                ap->sec_yt_attach[secnum] = 0;
+            }
+            if (check_ap && (yc_max + 2 <= ytop_min || yc_min - 2 >= ybot_max))
+                allow_ceil = 0;
         }
-        else if (valid_sec)
+        else if (!any_behind && sec != hw_psec)
         {
-            ap->sec_yt_attach[secnum] = 0;
+            ap->cur_sub_yt_attach = valid_sec ? ap->sec_yt_attach[secnum] : (int16_t)HW_VIEW_H;
         }
-        if (yc_max + 2 <= ytop_min || yc_min - 2 >= ybot_max)
-            allow_ceil = 0;
     }
     else if (!any_behind && sec != hw_psec)
     {
         ap->cur_sub_yt_attach = valid_sec ? ap->sec_yt_attach[secnum] : (int16_t)HW_VIEW_H;
+        if (check_ap && sec->ceilingheight > vz)
+        {
+            int dzc = HW_DZQ(sec->ceilingheight, vz);
+            yc_max = HW_ProjY(dzc, s_min, HW_VIEW_CY);
+            if (yc_max + 2 <= ytop_min)
+                allow_ceil = 0;
+        }
     }
 
-    if (!sec->thinglist && (int16_t)sec->ceilingpic != -1)
+    if (check_ap && !sec->thinglist)
     {
-        int sub_y_min = (sec->ceilingheight > vz)
-            ? yc_min
-            : HW_ProjY(HW_DZQ(sec->ceilingheight, vz), (sec->ceilingheight >= vz) ? s_max : s_min, HW_VIEW_CY);
         int sub_y_max = (sec->floorheight < vz)
             ? yf_max
             : HW_ProjY(HW_DZQ(sec->floorheight, vz), (sec->floorheight <= vz) ? s_max : s_min, HW_VIEW_CY);
-        if (sub_y_min - 2 >= ybot_max || sub_y_max + 2 <= ytop_min)
+        if (sub_y_max + 2 <= ytop_min)
             return -1;
+        if ((int16_t)sec->ceilingpic != -1)
+        {
+            int sub_y_min = (sec->ceilingheight > vz)
+                ? yc_min
+                : HW_ProjY(HW_DZQ(sec->ceilingheight, vz), (sec->ceilingheight >= vz) ? s_max : s_min, HW_VIEW_CY);
+            if (sub_y_min - 2 >= ybot_max)
+                return -1;
+        }
     }
 
     return allow_floor | (allow_ceil << 1);
 }
+
+static unsigned int hw_prof_segs_acc = 0;
 
 /* Walk a subsector */
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, const byte *pvs_row, int fully_inside)
@@ -7424,7 +7872,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, const byte *pvs
     }
     int flat_flags = (fully_inside & 3) | (flat_mask << 2);
 
-    if ((int16_t)sec->ceilingpic == -1)
+    if ((int16_t)sec->ceilingpic == -1 && (flat_mask & 2))
     {
         saturn_hw_sky_visible = 1;
     }
@@ -7464,7 +7912,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, const byte *pvs
         unsigned short tw1 = SAT_FRT();
         if (__builtin_expect(tw1 >= tw0, 1))
         {
-            saturn_hw_prof_segs += (unsigned int)(tw1 - tw0);
+            hw_prof_segs_acc += (unsigned int)(tw1 - tw0);
         }
         else
         {
@@ -7476,7 +7924,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, const byte *pvs
                 int span = saturn_frt_rate + (int)tw1 - (int)tw0;
                 dt = (span > 0 && span <= saturn_frt_rate) ? (unsigned int)span : (unsigned int)tw1;
             }
-            saturn_hw_prof_segs += dt;
+            hw_prof_segs_acc += dt;
         }
     }
     if (__builtin_expect(!handled_baked, 0))
@@ -7735,6 +8183,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         fixed_t frac_y = hw_viewy - (hw_cam_y << FRACBITS);
         cam_cz_origin = FixedMul(frac_x, hw_viewcos) + FixedMul(frac_y, hw_viewsin);
         cam_cx_origin = FixedMul(frac_x, hw_viewsin) - FixedMul(frac_y, hw_viewcos);
+        HW_FixedMulPair(-frac_x, hw_viewcos, -frac_y, hw_viewsin, &hw_f_xcos, &hw_f_ysin);
+        HW_FixedMulPair(-frac_x, hw_viewsin, -frac_y, hw_viewcos, &hw_f_xsin, &hw_f_ycos);
     }
 
     if (saturn_vdp2_plane_active)
@@ -7864,8 +8314,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_seg_last_sidedef = NULL;
     hw_seg_last_backsec = NULL;
     hw_last_flat_sec = NULL;
-    saturn_hw_prof_bsp = 0;
-    saturn_hw_prof_segs = 0;
+    hw_prof_segs_acc = 0;
     saturn_hw_prof_flats = 0;
     saturn_hw_prof_bg = 0;
     saturn_hw_seg_count = 0;
@@ -7961,6 +8410,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         tb0 = SAT_FRT();
     } while (__builtin_expect(saturn_vbl_count != vb0, 0));
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
+    saturn_hw_prof_segs = hw_prof_segs_acc;
     saturn_hw_prof_bsp = Saturn_ProfSpan(tb0, vb0);
 
     static int saturn_hw_sky_was_visible = 0;
