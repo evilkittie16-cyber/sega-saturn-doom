@@ -24,8 +24,11 @@ doom.wad
 *.bin
 !Compiler/COMMON/IP.BIN
 !Projects/DOOM-Saturn/cd/TEXTURES.BIN
+!Projects/DOOM-Saturn/cd/0.bin
 *.iso
+!Projects/DOOM-Saturn/game.iso
 *.cue
+!Projects/DOOM-Saturn/game.cue
 *.raw
 *.map
 *.pyc
