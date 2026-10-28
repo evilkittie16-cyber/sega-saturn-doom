@@ -505,15 +505,16 @@ typedef struct {
     uint32_t         node_pvs_vis[HW_NODE_PVS_WORDS];
     int16_t          ytop[HW_MAX_SCREEN_W];
     int16_t          ybot[HW_MAX_SCREEN_W];
-    int16_t          ytop_min_w[HW_SOLID_WORDS];
-    int16_t          ybot_max_w[HW_SOLID_WORDS];
     int16_t          sec_yt_attach[HW_MAX_AP_SECTORS];
     int16_t          sec_yb_attach[HW_MAX_AP_SECTORS];
+    int16_t          ytop_min_w[HW_SOLID_WORDS];
+    int16_t          ybot_max_w[HW_SOLID_WORDS];
     hw_portal_span_t portal_spans[HW_MAX_PORTAL_SPANS];
     const byte      *last_pvs_row;
     int              last_pvs_numnodes;
     int              portal_span_count;
     int              aperture_active;
+    uint32_t         dirty_words;
     int16_t          cur_sub_yt_attach;
     int16_t          cur_sub_yb_attach;
 } hw_aperture_state_t;
@@ -589,6 +590,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
     int p_count = ap->portal_span_count;
     uint32_t touched_words = 0;
     const int vw = saturn_view_w;
+    const int vh = saturn_view_h;
 
     if (p_count > 0)
     {
@@ -609,6 +611,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
             if (sx >= ex)
                 continue;
 
+            int check_yt = (new_yt > 0);
+            int check_yb = (new_yb < vh);
+            if (!check_yt && !check_yb)
+                continue;
+
             int w0 = sx >> 5;
             int w1 = (ex - 1) >> 5;
             touched_words |= (hw_span_mask_lut[w1 + 1] ^ hw_span_mask_lut[w0]);
@@ -617,8 +624,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
             {
                 int yt = ytop[x];
                 int yb = ybot[x];
-                if (yt_att <= yt + 2 && new_yt > yt) { yt = new_yt; ytop[x] = (int16_t)yt; }
-                if (yb_att >= yb - 2 && new_yb < yb) { yb = new_yb; ybot[x] = (int16_t)yb; }
+                if (check_yt && yt_att <= yt + 2 && new_yt > yt) { yt = new_yt; ytop[x] = (int16_t)yt; }
+                if (check_yb && yb_att >= yb - 2 && new_yb < yb) { yb = new_yb; ybot[x] = (int16_t)yb; }
                 if (yt >= yb)
                 {
                     int w = x >> 5;
@@ -678,7 +685,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
 
     if (touched_words != 0)
     {
-        const int vh = saturn_view_h;
+        ap->dirty_words |= touched_words;
         const int16_t * __restrict ytop = ap->ytop;
         const int16_t * __restrict ybot = ap->ybot;
         int n_words = (vw + 31) >> 5;
@@ -698,14 +705,28 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
             if (x_end > vw) x_end = vw;
             int min_yt = vh;
             int max_yb = 0;
-            for (int x = x_start; x < x_end; x++)
+            if (sm == 0)
             {
-                if (sm & hw_bit_lut[x & 31])
-                    continue;
-                int yt = ytop[x];
-                int yb = ybot[x];
-                if (yt < min_yt) min_yt = yt;
-                if (yb > max_yb) max_yb = yb;
+                for (int x = x_start; x < x_end; x++)
+                {
+                    int yt = ytop[x];
+                    int yb = ybot[x];
+                    if (yt < min_yt) min_yt = yt;
+                    if (yb > max_yb) max_yb = yb;
+                }
+            }
+            else
+            {
+                uint32_t bit = 1u;
+                for (int x = x_start; x < x_end; x++, bit <<= 1)
+                {
+                    if (sm & bit)
+                        continue;
+                    int yt = ytop[x];
+                    int yb = ybot[x];
+                    if (yt < min_yt) min_yt = yt;
+                    if (yb > max_yb) max_yb = yb;
+                }
             }
             if (min_yt > max_yb)
             {
@@ -834,6 +855,7 @@ HW_ALWAYS_INLINE int32_t HW_MulsW_PairAdd(int a, int b, int c, int d, int32_t e)
 #define HW_FAST_SKY_ADDR   ((uint8_t *)SATURN_WRAM_L_SKY_ADDR)
 static unsigned int hw_last_sky_angle = 0xFFFFFFFFu;
 static int          hw_last_sky_cy    = -1;
+static int          hw_last_sky_max_y = 0;
 static int          hw_sky_dirty      = 1;
 
 static void HW_Divlut_Init(void)
@@ -1966,6 +1988,7 @@ void Saturn_HW_RenderInit(void)
     hw_slave_level_dirty = 1;
     HW_APERTURE->last_pvs_row = NULL;
     HW_APERTURE->last_pvs_numnodes = 0;
+    HW_APERTURE->dirty_words = 0xFFFFFFFFu;
 
     /* Precompute 1-sided convex pillar corner floor clamps */
     saturn_vertex_floor_clamp = NULL;
@@ -2068,6 +2091,7 @@ void Saturn_HW_ForceSkyRepaint(void)
 {
     hw_last_sky_angle = 0xFFFFFFFFu;
     hw_last_sky_cy    = -1;
+    hw_last_sky_max_y = 0;
     hw_sky_dirty      = 1;
 }
 
@@ -2095,16 +2119,25 @@ static HW_HOT_O2 void HW_FillBackground(void)
             return;
     }
 
-    /* When camera has not rotated or changed pitch/height, I_VideoBuffer rows 0..95
+#ifndef SATURN_WIN32
+    int max_sky_y = (hw_is_sky || saturn_view_latch > 0) ? HW_VIEW_H : 108;
+    if (max_sky_y > HW_VIEW_H) max_sky_y = HW_VIEW_H;
+#else
+    int max_sky_y = HW_VIEW_H;
+#endif
+
+    /* When camera has not rotated or changed pitch/height, I_VideoBuffer rows 0..max_sky_y
      * already contain the exact sky raster from the previous frame.
      * Note: saturn_vdp2_copy_back() in i_video.c owns decrementing saturn_hw_sky_latch
      * (2 -> 1 -> 0) across two frames so both double-buffered VDP2 NBG0 pages receive
      * the updated I_VideoBuffer sky. */
-    if (!hw_sky_dirty && hw_viewangle == hw_last_sky_angle && HW_VIEW_CY == hw_last_sky_cy)
+    if (!hw_sky_dirty && hw_viewangle == hw_last_sky_angle &&
+        HW_VIEW_CY == hw_last_sky_cy && max_sky_y <= hw_last_sky_max_y)
         return;
 
     hw_last_sky_angle   = hw_viewangle;
     hw_last_sky_cy      = HW_VIEW_CY;
+    hw_last_sky_max_y   = max_sky_y;
     hw_sky_dirty        = 0;
     saturn_hw_sky_latch = 2;
 
@@ -2164,7 +2197,6 @@ static HW_HOT_O2 void HW_FillBackground(void)
     /* 16-byte aligned line buffer so 32-byte unrolled copies map cleanly to SH-2 16-byte L1 cache lines */
     HW_ALIGN16 uint32_t cached_sky_row[HW_MAX_SCREEN_W / 4];
 
-    int max_sky_y = HW_VIEW_H;
     for (y = 0; y < max_sky_y; y++)
     {
         int texrow = y + row_ofs;
@@ -6732,7 +6764,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitVisibleBakedSeg(
         return;
 
     int dist = (__builtin_expect(seg->baked_light < 240, 1))
-        ? (((p0_use->cz + p1_use->cz) >> 1) >> FRACBITS)
+        ? (int)(((uint32_t)p0_use->cz + (uint32_t)p1_use->cz) >> 17)
         : 0;
     int k_shade = HW_FastShade(seg->baked_light, dist);
 
@@ -7199,50 +7231,48 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, const sec
     fixed_t dy0 = ((fixed_t)fb->min_y << FRACBITS) - vy;
     fixed_t dy1 = ((fixed_t)fb->max_y << FRACBITS) - vy;
 
-    fixed_t x0c = FixedMul(dx0, cs), x1c = FixedMul(dx1, cs);
-    fixed_t y0s = FixedMul(dy0, sn), y1s = FixedMul(dy1, sn);
-    fixed_t x0s = FixedMul(dx0, sn), x1s = FixedMul(dx1, sn);
-    fixed_t y0c = FixedMul(dy0, cs), y1c = FixedMul(dy1, cs);
+    fixed_t x0c, x1c, y0s, y1s;
+    HW_FixedMulPair(dx0, cs, dx1, cs, &x0c, &x1c);
+    HW_FixedMulPair(dy0, sn, dy1, sn, &y0s, &y1s);
 
-    fixed_t cz[4], cx[4];
-    cz[0] = x0c + y0s; cx[0] = x0s - y0c;
-    cz[1] = x1c + y0s; cx[1] = x1s - y0c;
-    cz[2] = x1c + y1s; cx[2] = x1s - y1c;
-    cz[3] = x0c + y1s; cx[3] = x0s - y1c;
-
-    const int vw = saturn_view_w;
-    const int cx_mid = saturn_view_cx;
-    int sx = vw, ex = 0;
-    fixed_t min_cz = 0x7FFFFFFF;
-    fixed_t max_cz = 0;
-    int any_behind = 0;
-
-    for (int k = 0; k < 4; k++)
-    {
-        if (cz[k] > max_cz) max_cz = cz[k];
-        if (cz[k] < HW_NEAR_Z)
-        {
-            any_behind = 1;
-            if (HW_NEAR_Z < min_cz) min_cz = HW_NEAR_Z;
-        }
-        else
-        {
-            if (cz[k] < min_cz) min_cz = cz[k];
-            int px = HW_ProjX(cx[k], HW_FastDiv(cz[k]), cx_mid);
-            if (px < sx) sx = px;
-            if (px > ex) ex = px;
-        }
-    }
-
+    fixed_t max_cz = (x0c > x1c ? x0c : x1c) + (y0s > y1s ? y0s : y1s);
     if (max_cz < HW_NEAR_Z)
         return 3;
-    if (any_behind)
+
+    fixed_t min_cz = (x0c < x1c ? x0c : x1c) + (y0s < y1s ? y0s : y1s);
+    const int vw = saturn_view_w;
+    int sx, ex;
+    int any_behind = 0;
+
+    if (min_cz < HW_NEAR_Z)
     {
+        any_behind = 1;
+        min_cz = HW_NEAR_Z;
         sx = 0;
         ex = vw;
     }
     else
     {
+        fixed_t x0s, x1s, y0c, y1c;
+        HW_FixedMulPair(dx0, sn, dx1, sn, &x0s, &x1s);
+        HW_FixedMulPair(dy0, cs, dy1, cs, &y0c, &y1c);
+
+        fixed_t cz[4], cx[4];
+        cz[0] = x0c + y0s; cx[0] = x0s - y0c;
+        cz[1] = x1c + y0s; cx[1] = x1s - y0c;
+        cz[2] = x1c + y1s; cx[2] = x1s - y1c;
+        cz[3] = x0c + y1s; cx[3] = x0s - y1c;
+
+        int px0, px1, px2, px3;
+        HW_ProjXPair(cx[0], HW_FastDiv(cz[0]), cx[1], HW_FastDiv(cz[1]), saturn_view_cx, &px0, &px1);
+        HW_ProjXPair(cx[2], HW_FastDiv(cz[2]), cx[3], HW_FastDiv(cz[3]), saturn_view_cx, &px2, &px3);
+        int min01 = (px0 < px1) ? px0 : px1;
+        int min23 = (px2 < px3) ? px2 : px3;
+        int max01 = (px0 > px1) ? px0 : px1;
+        int max23 = (px2 > px3) ? px2 : px3;
+        sx = (min01 < min23) ? min01 : min23;
+        ex = (max01 > max23) ? max01 : max23;
+
         sx -= 2;
         ex += 2;
         if (sx < 0) sx = 0;
@@ -7264,11 +7294,12 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, const sec
     int allow_ceil  = 1;
     int secnum = subsectors[subnum].sector;
     int valid_sec = ((unsigned)secnum < HW_MAX_AP_SECTORS);
+    int yf_min = 0, yf_max = HW_VIEW_H;
+    int yc_min = 0, yc_max = HW_VIEW_H;
 
     if (sec->floorheight < vz)
     {
         int dzf = HW_DZQ(sec->floorheight, vz);
-        int yf_min, yf_max;
         HW_ProjYPair(HW_VIEW_CY, dzf, s_min, dzf, s_max, &yf_min, &yf_max);
         if (!any_behind && sec != hw_psec)
         {
@@ -7295,7 +7326,6 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, const sec
     if ((int16_t)sec->ceilingpic != -1 && sec->ceilingheight > vz)
     {
         int dzc = HW_DZQ(sec->ceilingheight, vz);
-        int yc_min, yc_max;
         HW_ProjYPair(HW_VIEW_CY, dzc, s_max, dzc, s_min, &yc_min, &yc_max);
         if (!any_behind && sec != hw_psec)
         {
@@ -7322,10 +7352,12 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, const sec
 
     if (!sec->thinglist && (int16_t)sec->ceilingpic != -1)
     {
-        int dzt = HW_DZQ(sec->ceilingheight, vz);
-        int dzb = HW_DZQ(sec->floorheight, vz);
-        int sub_y_min, sub_y_max;
-        HW_ProjYPair(HW_VIEW_CY, dzt, (dzt >= 0) ? s_max : s_min, dzb, (dzb <= 0) ? s_max : s_min, &sub_y_min, &sub_y_max);
+        int sub_y_min = (sec->ceilingheight > vz)
+            ? yc_min
+            : HW_ProjY(HW_DZQ(sec->ceilingheight, vz), (sec->ceilingheight >= vz) ? s_max : s_min, HW_VIEW_CY);
+        int sub_y_max = (sec->floorheight < vz)
+            ? yf_max
+            : HW_ProjY(HW_DZQ(sec->floorheight, vz), (sec->floorheight <= vz) ? s_max : s_min, HW_VIEW_CY);
         if (sub_y_min - 2 >= ybot_max || sub_y_max + 2 <= ytop_min)
             return -1;
     }
@@ -7762,24 +7794,45 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_def_flat_count = 0;
     hw_frame_flat_jobs = 0;
     {
+        static int16_t last_ap_vh = -1;
         hw_aperture_state_t *ap = HW_APERTURE;
         const int vw = saturn_view_w;
         const int16_t vh = (int16_t)saturn_view_h;
-        for (int i = 0; i < vw; i++)
+        const uint32_t vh_pair = ((uint32_t)(uint16_t)vh << 16) | (uint16_t)vh;
+        uint32_t dirty = ap->dirty_words;
+        if (__builtin_expect(vh != last_ap_vh, 0))
         {
-            ap->ytop[i] = 0;
-            ap->ybot[i] = vh;
+            dirty = 0xFFFFFFFFu;
+            last_ap_vh = vh;
         }
-        for (int i = 0; i < HW_SOLID_WORDS; i++)
+        if (dirty != 0)
         {
-            ap->ytop_min_w[i] = 0;
-            ap->ybot_max_w[i] = vh;
+            ap->dirty_words = 0;
+            int n_words = (vw + 31) >> 5;
+            for (int w = 0; w < n_words; w++)
+            {
+                if (!(dirty & hw_bit_lut[w]))
+                    continue;
+                ap->ytop_min_w[w] = 0;
+                ap->ybot_max_w[w] = vh;
+                int x_start = w << 5;
+                aliased_uint32_t *yt32 = (aliased_uint32_t *)&ap->ytop[x_start];
+                aliased_uint32_t *yb32 = (aliased_uint32_t *)&ap->ybot[x_start];
+                for (int k = 0; k < 16; k++)
+                {
+                    yt32[k] = 0;
+                    yb32[k] = vh_pair;
+                }
+            }
         }
         int n_ap_sec = (numsectors < HW_MAX_AP_SECTORS) ? numsectors : HW_MAX_AP_SECTORS;
-        for (int i = 0; i < n_ap_sec; i++)
+        int n_ap_pairs = (n_ap_sec + 1) >> 1;
+        aliased_uint32_t *syt32 = (aliased_uint32_t *)ap->sec_yt_attach;
+        aliased_uint32_t *syb32 = (aliased_uint32_t *)ap->sec_yb_attach;
+        for (int i = 0; i < n_ap_pairs; i++)
         {
-            ap->sec_yt_attach[i] = vh;
-            ap->sec_yb_attach[i] = 0;
+            syt32[i] = vh_pair;
+            syb32[i] = 0;
         }
         ap->portal_span_count = 0;
         ap->aperture_active = 0;

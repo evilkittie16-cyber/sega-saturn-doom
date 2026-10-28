@@ -188,37 +188,10 @@ CMDBUF_INLINE uint32_t *copy_quads_32(uint32_t *dst, const uint32_t *src, int co
 
 CMDBUF_INLINE uint32_t *deliver_range_32(uint32_t *dst, const uint32_t * const limit, const uint32_t *src, uint32_t count)
 {
-    const uint32_t * const src_end = src + (count << 3);
-    while (src < src_end)
-    {
-        if (src[7] != 0u)
-        {
-            src += 8;
-            continue;
-        }
-        if (dst >= limit)
-            break;
-#ifdef SATURN_WIN32
-        memcpy(dst, src, 32);
-        dst += 8;
-        src += 8;
-#else
-        __asm__ volatile (
-            "mov.l  @%0+, r0 \n\t"  "mov.l  @%0+, r1 \n\t"
-            "mov.l  @%0+, r2 \n\t"  "mov.l  @%0+, r3 \n\t"
-            "mov.l  @%0+, r4 \n\t"  "mov.l  @%0+, r5 \n\t"
-            "mov.l  @%0+, r6 \n\t"  "mov.l  @%0+, r7 \n\t"
-            "mov.l  r0, @%1       \n\t" "mov.l  r1, @(4, %1)  \n\t"
-            "mov.l  r2, @(8, %1)  \n\t" "mov.l  r3, @(12, %1) \n\t"
-            "mov.l  r4, @(16, %1) \n\t" "mov.l  r5, @(20, %1) \n\t"
-            "mov.l  r6, @(24, %1) \n\t" "mov.l  r7, @(28, %1) \n\t"
-            "add    #32, %1       \n\t"
-            : "+r" (src), "+r" (dst)
-            :: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "memory"
-        );
-#endif
-    }
-    return dst;
+    uint32_t max_q = (dst < limit) ? (uint32_t)((limit - dst) >> 3) : 0u;
+    if (count > max_q)
+        count = max_q;
+    return copy_quads_32(dst, src, (int)count);
 }
 
 CMDBUF_INLINE uint32_t cmdbuf_inv_dx(int dx, const unsigned int *oclut)
@@ -267,9 +240,11 @@ CMDBUF_INLINE uint32_t cmdbuf_inv_dx(int dx, const unsigned int *oclut)
 #define CMD_YD(c32) ((int)(int16_t)((c32)[6] & 0xFFFFu))
 #endif
 
-static CMDBUF_NOINLINE void cmdbuf_trim_wall_y(
-    uint32_t *c32, int xL, int xR, int yLt, int yRt, int yLb, int yRb)
+CMDBUF_NOINLINE void Saturn_CmdBuf_TrimWallY(uint32_t *c32)
 {
+    int xL  = CMD_XA(c32), xR  = CMD_XB(c32);
+    int yLt = CMD_YA(c32), yRt = CMD_YB(c32);
+    int yLb = CMD_YD(c32), yRb = CMD_YC(c32);
     uint32_t w2 = c32[2];
     int rows = (int)(w2 & 0xFFu);
     int stride = (int)((w2 >> 8) & 0x3Fu);
@@ -378,7 +353,7 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_CullOccluded(void)
             int yLb = CMD_YD(c32), yRb = CMD_YC(c32);
             if (__builtin_expect((yLt < -3 && yRt < -3) || (yLb > CMDBUF_VH + 3 && yRb > CMDBUF_VH + 3), 0))
             {
-                cmdbuf_trim_wall_y(c32, CMD_XA(c32), CMD_XB(c32), yLt, yRt, yLb, yRb);
+                Saturn_CmdBuf_TrimWallY(c32);
             }
         }
     }

@@ -97,6 +97,7 @@ extern int saturn_visit_count;
 
 void Saturn_CmdBuf_Init(void);
 void Saturn_CmdBuf_Reset(void);
+void Saturn_CmdBuf_TrimWallY(uint32_t *c32);
 void Saturn_CmdBuf_CullOccluded(void);
 unsigned int Saturn_CmdBuf_ComputeDDA(void);
 void Saturn_CmdBuf_Deliver(void);
