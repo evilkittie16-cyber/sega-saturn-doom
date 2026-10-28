@@ -371,26 +371,10 @@ void D_DoomMain(void)
      * 320 COLUMNS wide (full-width render since 2026-09-05; NBG0 zoom
      * 1.0 displays it 1:1). */
     {
-        int i, f;
         int fb_w = DOOM_SCREENWIDTH;
 
-        for (i = 0; i < fb_w * DOOM_FBHEIGHT; i++)
-            I_VideoBuffer[i] = (byte)((i / fb_w) * 256
-                                       / DOOM_FBHEIGHT);
-        for (f = 0; f < 45; f++)
-            I_FinishUpdate();
-        /* Wipe the gradient: rows the game never redraws (above the 3D
-         * view, the status-bar strip when ST_Drawer is off) would
-         * otherwise keep showing smoke-test indices recolored by
-         * PLAYPAL for the rest of the session. */
         D_memset(I_VideoBuffer, 0, fb_w * DOOM_FBHEIGHT);
         I_FinishUpdate();
-        /* r86: I_FinishUpdate stamped frame_done_vbl ~= 46 — the last
-         * commit the boot ever makes until the demo starts. With the
-         * stamp left standing, verdict trigger 2 (frame_done != 0 +
-         * stall > 1200) false-fires ~20 s into any slow boot. The
-         * stamp's job (qualifying the stall as post-first-frame) is
-         * done; zero it so the pre-demo boot is commit-free again. */
         {
             extern volatile unsigned int saturn_frame_done_vbl;
 
@@ -721,8 +705,24 @@ void D_DoomMain(void)
         int act       = 0;
         int demo_num  = 0;
 
-#if defined(SATURN_UI_MENU) && SATURN_UI_MENU == 1
-        act = Saturn_Menu_Run(&saturn_episode, &saturn_skill, &demo_num);
+        saturn_map = SATURN_BOOT_MAP;
+#if !defined(SATURN_UI_MENU) || SATURN_UI_MENU != 0
+        {
+            int skip_menu = 0;
+#ifdef SATURN_WIN32
+            extern int g_win32_test_mode;
+            FILE *f_cmd = fopen("agent_cmd.txt", "r");
+            if (f_cmd)
+            {
+                fclose(f_cmd);
+                skip_menu = 1;
+            }
+            if (g_win32_test_mode)
+                skip_menu = 1;
+#endif
+            if (!skip_menu)
+                act = Saturn_Menu_Run(&saturn_episode, &saturn_skill, &demo_num);
+        }
 #endif
         /* UI-OFF BISECT: fall straight through with the defaults
          * (episode 1, skill 2) — the r104-era boot path. */
@@ -850,18 +850,9 @@ void D_DoomMain(void)
             {
                 extern int Saturn_Inter_Run(int episode, int map,
                                             int secretexit);
-                extern void Saturn_StageTextHi(int x, int y,
-                                               const char *s);
-                char srow[2];
-
-                srow[0] = 'C'; srow[1] = 0;
-                Saturn_StageTextHi(188, 186, srow);
 
                 next = Saturn_Inter_Run(saturn_episode, saturn_map,
                                         saturn_secret_exit);
-
-                srow[0] = 'F'; srow[1] = 0;
-                Saturn_StageTextHi(268, 186, srow);
             }
 
             Z_FreeTags(mainzone);   /* free the finished level */
@@ -876,14 +867,7 @@ void D_DoomMain(void)
                 ST_InitEveryLevel();    /* zero the stbar face/tryopen */
             }
             Saturn_G_InitNew(saturn_skill, saturn_episode, saturn_map);
-            {
-                extern void Saturn_StageTextHi(int x, int y,
-                                               const char *s);
-                char srow[2];
-
-                srow[0] = 'N'; srow[1] = 0;
-                Saturn_StageTextHi(288, 186, srow);
-            }
+            saturn_game_started = 1;
         }
 
         saturn_game_started = 0;
@@ -1081,15 +1065,6 @@ void D_DoomLoop(void)
          * here loses the exit on any two-tic catch-up frame. Hand
          * control back to D_DoomMain's level chain (intermission ->
          * next map). */
-        /* Freeze-forensics: R = a loop top was reached. Painted on the
-         * clean y=186 band every iteration. */
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char rrow[2];
-
-            rrow[0] = 'R'; rrow[1] = 0;
-            Saturn_StageTextHi(28, 186, rrow);
-        }
         if (saturn_level_done)
         {
             gameaction = ga_nothing;
@@ -1119,118 +1094,6 @@ void D_DoomLoop(void)
         saturn_master_beat++;   /* round-50: main-loop heartbeat */
         saturn_iter_count++;    /* r56: census row H */
         saturn_sim_site = 0x1;  /* r56: loop top */
-        /* r58: paint the ISR-latched verdicts from the MAIN thread. The
-         * ISR only latches now (its 2x64KB stage fills were the heavy
-         * interrupt-path work — r56 froze with the master wedged in the
-         * SCU IRQ-entry glue); while the latch holds, every iteration
-         * repaints fill + rows + SCU IST/IMASK here. */
-        {
-            extern volatile unsigned int saturn_isr_dirty;
-            extern void saturn_isr_paint(void);
-            if (saturn_isr_dirty)
-                saturn_isr_paint();
-        }
-        /* r104 DSP-eval: the X/V cart-verify rows, painted EVERY
-         * iteration on the MAIN thread. r102 put them in the ISR's
-         * once-per-64-vbl census, but each frame's copy_back erases
-         * the glyphs, so they were on screen 1 frame in 64 — r103
-         * steady-state captures never showed them, and a real-HW
-         * photo would almost always miss them too (the eval dies
-         * blind). Painted here, immediately after the previous
-         * frame's copy_back (I_FinishUpdate), they persist exactly
-         * like the S/V/L/T/E/A/H rows. Respects the one-shot freeze
-         * verdict's stand-down. Zero-padded fixed width per r83.
-         *   X = 2 KB chunks whose full readback verify FAILED
-         *       (each CPU-repaired; healthy = 0000)
-         *   V = KB fully verified so far (climbs to the fill total
-         *       ~511 KB, then holds) */
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            extern volatile unsigned int saturn_dsp_verify_kb;
-            extern volatile unsigned int saturn_dsp_verify_bad;
-            extern volatile unsigned int saturn_rv_done;
-            static char xrow[12];
-
-            if (saturn_rv_done == 0u)
-            {
-                /* r104: StageTextHi (PLAYPAL[4] white, no CRAM write —
-                 * the r101 lesson) — black glyphs vanish on the dark
-                 * maps; a real-HW photo must read these on ANY scene. */
-                /* 2026-09-06 SW1COMP face probe (replaces the dormant
-                 * DSP-verify X row — engine demoted r96, row read 0000
-                 * every boot): P = switch-face counters from
-                 * saturn_segs.c — P(built 3) ok(1) paint(3):
-                 *   built = walls built this frame carrying SW1COMP as
-                 *           the lower texture (master BSP walk)
-                 *   ok    = preload Saturn_TexData handed back pixels
-                 *   paint = master-half AC_BOTTOMTEXTURE paint columns */
-                {
-                    extern int saturn_sw1_built;
-                    extern int saturn_sw1_ok;
-                    extern int saturn_sw1_paint;
-
-                    xrow[0] = 'P';
-                    Saturn_Udec0(xrow + 1,
-                                 (unsigned)(saturn_sw1_built & 0x7Fu), 3);
-                    xrow[4] = (char)('0' + (saturn_sw1_ok ? 1 : 0));
-                    Saturn_Udec0(xrow + 5,
-                                 (unsigned)(saturn_sw1_paint & 0xFFu), 3);
-                    xrow[8] = '\0';
-                }
-                Saturn_StageTextHi(8, 148, xrow);
-                /* r104's "V = DSP-verify" row is RETIRED here (engine
-                 * demoted r96, read ~0000 every boot). The cell now
-                 * carries the OCRAM probe verdict + A/B metric
-                 * (2026-09-06):
-                 *   O#c A#B# R###
-                 *     c  = CCR byte before the probe write (hex)
-                 *     A/B = the two 2KB data-array word verifies (1=ok)
-                 *     R  = render-window vbl count (saturn_prof_render)
-                 * Painted HERE because (8,168) is the last proven-
-                 * readable row above the status bar; the original
-                 * (0,178) site sat 8-10 px under this row and 8 px
-                 * above the bar counters — with ~20 px glyphs all
-                 * three interleaved into one union block (seen in the
-                 * 21:49 Kronos captures: "R W I D E B Y E"). */
-                {
-                    extern volatile int saturn_prof_render;
-
-                    xrow[0] = 'O';
-#if defined(SATURN_OCRAM_PROBE)
-                    {
-                        extern volatile int saturn_oc_ok;
-                        extern volatile int saturn_oc_ccr0;
-
-                        Saturn_Udec0(xrow + 1,
-                                     (unsigned)saturn_oc_ccr0 & 0xFu, 1);
-                        xrow[2] = (char)('0' + (saturn_oc_ok ? 1 : 0));
-                    }
-#else
-                    xrow[1] = '-';
-                    xrow[2] = '-';
-#endif
-                    xrow[3] = 'R';
-                    Saturn_Udec0(xrow + 4,
-                                 (unsigned)saturn_prof_render & 0xFFFu, 3);
-                    xrow[7] = '\0';
-                }
-#ifndef SATURN_VDP1_WALL
-                /* VDP1 wall prototype (2026-09-06) owns this row: its
-                 * V1 telemetry paints at (8,168) and would union with
-                 * the O row here (both x=8, rows 10 px apart). */
-                Saturn_StageTextHi(8, 168, xrow);
-#endif
-                /* v5.13's W = staging-tripwire row (saturn_stage_trip)
-                 * is RETIRED from the screen: it painted at (8,208),
-                 * which the 2026-09-06 full-screen layout gave to the
-                 * status bar (fb rows 192-223) — its white glyphs
-                 * stomped the AMMO/HEALTH/FRAG label row every frame.
-                 * The tripwire itself still works in i_wad.c (each
-                 * mismatch permanently demotes the stage views); only
-                 * the on-screen counter is gone. Healthy was 0000
-                 * every boot. */
-            }
-        }
 #ifdef SATURN_SPRCLIP_DIAG
         /* Round-33b sprite-clip probe: republish the seg_draw_sprites
          * capture rows HERE (after the flip) — StageTextHi writes the
@@ -1761,26 +1624,7 @@ void D_Display(void)
      * D_Display returns (printed by D_DoomLoop). Each BootMsg commits
      * immediately (slSynch), so on a freeze the last marker on screen
      * names the phase that was entered and never finished. */
-    {
-        static int dbg_marks = 0;
-        /* Freeze-forensics: L = entering the render, H = render+HUD
-         * returned (y=186 band; I_FinishUpdate owns D/E/B below). */
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char lrow[2];
-
-            lrow[0] = 'L'; lrow[1] = 0;
-            Saturn_StageTextHi(48, 186, lrow);
-        }
-        Saturn_G_Display();
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char hrow[2];
-
-            hrow[0] = 'H'; hrow[1] = 0;
-            Saturn_StageTextHi(68, 186, hrow);
-        }
-    }
+    Saturn_G_Display();
     v1 = saturn_vbl_count;
     saturn_prof_render_frt = Saturn_ProfSpan(rf0, v0);
     saturn_pf_acc[1] += saturn_prof_render_frt;
@@ -1793,13 +1637,6 @@ void D_Display(void)
             ff0 = SAT_FRT();
         } while (__builtin_expect(saturn_vbl_count != fv0, 0));
 
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char irow[2];
-
-            irow[0] = 'I'; irow[1] = 0;
-            Saturn_StageTextHi(88, 186, irow);
-        }
         I_FinishUpdate();
         saturn_prof_finish_frt = Saturn_ProfSpan(ff0, fv0);
     }

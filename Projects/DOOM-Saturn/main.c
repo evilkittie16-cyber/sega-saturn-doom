@@ -241,12 +241,7 @@ static void boot_report(void)
 
 void    jo_main(void)
 {
-    int frame;
-
-    /* Stage 1 — DARK BLUE: jo_core_init painted the NBG1 bitmap with
-     * this color. If the screen shows anything else, the program isn't
-     * even reaching jo_main (bad boot / wrong ISO), not a code bug. */
-    jo_core_init(JO_COLOR_DarkBlue);
+    jo_core_init(JO_COLOR_Black);
     /* BOOT-WEDGE GATE (2026-09-09, made PERMANENT): SGL's VBlank-OUT
      * ISR (0x6051040, GBR=0x060FFC00) runs a gated SCU-DMA section
      * every vblank. Its spin at 0x60510EA waits for bit 2 of the
@@ -268,98 +263,13 @@ void    jo_main(void)
      * through, so the WRAM cell is coherent for it.
      * ZERO BSS: one byte RMW, __bend unchanged. */
     *(volatile unsigned char *)0x060FFC1Bu |= 0x02u;
-    /* The VBlank tick MUST be registered before the first StageColor
-     * hold — Saturn_StageColor now waits on boot_vbl_count to give each
-     * stage marker a photographable hold (~10 vblanks). */
     jo_core_add_vblank_callback(boot_vbl_tick);
-    /* OLIVE (8,8,0): jo_core_init returned. This color also covers the
-     * CD SPIN-UP WAIT: a real drive needs ~1-2 s before the first GFS
-     * access succeeds (Kronos' instant "drive" never exposed this —
-     * the 2026-09-03 real-HW bring-up hung on dark blue exactly here).
-     * Held on OLIVE = the VBlank chain is dead (boot_vbl_count frozen),
-     * because the wait below is the only vbl-gated loop in this window. */
-    Saturn_StageColor(JO_COLOR_SATURN_RGB(8, 8, 0));
-    while (boot_vbl_count < 120u) { }   /* ~2 s: real CD spin-up */
-    /* HALF BLUE (0,16,24): spin-up wait done — first CD access (the
-     * font) is next. Held here = GFS/CD-block hang on the first read. */
-    Saturn_StageColor(JO_COLOR_SATURN_RGB(0, 16, 24));
 
-    /* Stage 2/3 — font then cart probe. If the font failed we paint
-     * RED and LEAVE it; otherwise bright BLUE = font + cart OK. */
     Saturn_BootFontInit();
-    /* MAGENTA (24,0,24): font load RETURNED — hang before this color
-     * points at the first CD/GFS access, never at the cart. */
-    Saturn_StageColor(JO_COLOR_SATURN_RGB(24, 0, 24));
     (void)Saturn_CartInit();
-    if (!saturn_boot_font)
-        Saturn_StageColor(JO_COLOR_Red);
-    else
-        Saturn_StageColor(Saturn_CartPresent() ? JO_COLOR_Blue : JO_COLOR_Gray);
-
-    /* CART-ID BLINK (2026-09-03 real-HW bring-up): the report screen's
-     * CART-ID line is VDP1 text — invisible on the user's TV, and the
-     * Saroo's cart-slot answer decides the whole WAD strategy (RAM cart
-     * = instant hot-lump copies; no cart = all-CD streaming where the
-     * flat fixup loop takes minutes). Encode the raw CS2 ID byte as
-     * COUNTABLE BLINKS: high nibble = N GREEN blinks, low nibble = N
-     * YELLOW blinks, one double-length cyan separator between them.
-     * Count from the boot video (each blink ~1/3 s, each StageColor
-     * holds ~10 vblanks). Example: ID 5C = 5 green, 12 yellow. */
-    {
-        unsigned char id = saturn_cart_id_seen;
-        int n;
-
-        for (n = 0; n < (id >> 4); n++)
-        {
-            Saturn_StageColor(JO_COLOR_Green);
-            Saturn_StageColor(JO_COLOR_Black);
-        }
-        Saturn_StageColor(JO_COLOR_Cyan);
-        Saturn_StageColor(JO_COLOR_Cyan);
-        for (n = 0; n < (id & 15); n++)
-        {
-            Saturn_StageColor(JO_COLOR_Yellow);
-            Saturn_StageColor(JO_COLOR_Black);
-        }
-    }
-
-    /* Stage 3.5 — SCU DSP capability probe (saturn_dsp.c): load + run
-     * a tiny DSP program that DMA-round-trips 64 words through WRAM-H.
-     * ORANGE = all four capabilities work (load/start/both DMA dirs);
-     * DARK RED = the DSP plan is dead on this emulator/hardware. The
-     * color holds for the report frame (~1.5 s) so a capture can't
-     * miss it; result also cached for D_DoomMain. */
     saturn_dsp_ok = Saturn_DspProbe();
-    /* Tri-state display (2026-09-07): -1 = probe skipped (SATURN_DSP_OFF)
-     * must not read as the ORANGE "all capabilities work" verdict. */
-    Saturn_StageColor(saturn_dsp_ok == 1 ? JO_COLOR_SATURN_RGB(31, 16, 0)
-                                         : JO_COLOR_DarkRed);
 
-    /* ===== Instrumented first report frame =====
-     * Each primitive gets a marker so a hang names itself:
-     *   DARK GREEN  entering boot_report()  (stuck here = font draw crash)
-     *   DARK YELLOW boot_report returned, waiting on VBlank interrupts
-     *               (stuck here = SGL VBlank-in interrupt chain dead)
-     *   CYAN        interrupts alive, testing slSynch()
-     *               (stuck here = slSynch never returns)
-     *   DARK CYAN   slSynch returned — from here everything is proven. */
-    Saturn_StageColor(JO_COLOR_DarkGreen);
-    boot_report();
-    Saturn_StageColor(JO_COLOR_DarkYellow);
-    while (boot_vbl_count < 60u) { }
-    Saturn_StageColor(JO_COLOR_Cyan);
-    Saturn_PumpFrame();
-    Saturn_StageColor(JO_COLOR_DarkCyan);
-
-    /* Hold the report ~0.25 s (15 frames — the VDP1 text is invisible
-     * on real hardware anyway; the stage colours carry the diagnosis). */
-    for (frame = 1; frame < 15; frame++)
-    {
-        boot_report();
-        Saturn_PumpFrame();
-    }
-
-    /* Real boot: WAD load -> Z zone -> MAP01/E1M1 -> main loop. Never
+    /* Real boot: WAD load -> Z zone -> Menu -> Level loop. Never
      * returns (D_DoomLoop is infinite). */
     D_DoomMain();
 

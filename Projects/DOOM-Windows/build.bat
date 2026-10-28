@@ -14,7 +14,7 @@ if errorlevel 1 (
 )
 cd /d "%~dp0"
 
-set CFLAGS=/nologo /Zi /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DMARS=1 /DSATURN=1 /DSATURN_WIN32=1 /DSATURN_VDP1_WALL=1 /DSATURN_V1W_FULL=1 /DSATURN_V1W_ALL /DSATURN_PVS=1 /DSATURN_LEAF_RENDERER=1 /I.\src /I.\src\jo /I..\DOOM-Saturn\doom\src /I..\DOOM-Saturn\doom\d32xr
+set CFLAGS=/nologo /Zi /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DMARS=1 /DSATURN=1 /DSATURN_WIN32=1 /DSATURN_UI_MENU=1 /DSATURN_VDP1_WALL=1 /DSATURN_V1W_FULL=1 /DSATURN_V1W_ALL /DSATURN_PVS=1 /DSATURN_LEAF_RENDERER=1 /I.\src /I.\src\jo /I..\DOOM-Saturn\doom\src /I..\DOOM-Saturn\doom\d32xr
 
 set SRCS=^
  src\win_main.c ^
@@ -38,6 +38,8 @@ set SRCS=^
  ..\DOOM-Saturn\doom\src\saturn_tex.c ^
  ..\DOOM-Saturn\doom\src\saturn_vgl.c ^
  ..\DOOM-Saturn\doom\src\saturn_hud.c ^
+ ..\DOOM-Saturn\doom\src\saturn_menu.c ^
+ ..\DOOM-Saturn\doom\src\saturn_inter.c ^
  ..\DOOM-Saturn\doom\src\st_stub.c ^
  ..\DOOM-Saturn\doom\src\s_sound.c ^
  ..\DOOM-Saturn\doom\src\d32xr_stubs.c ^

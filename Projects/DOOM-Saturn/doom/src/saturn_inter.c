@@ -78,7 +78,7 @@ static unsigned udiv32(unsigned a, unsigned b)
 /* map-dot coordinates (linuxdoom wi_stuff.c lnodes; episode 4 has no
  * row — vanilla's table is zero-filled there; we reuse episode 3's
  * row, matching its WIMAP2 background) */
-static const byte lnodes[3][9][2] = {
+static const short lnodes[3][9][2] = {
     { {185, 164}, {148, 143}, { 69, 122}, {209, 102},
       {116,  89}, {166,  55}, { 71,  56}, {135,  29},
       { 71,  24} },
@@ -241,9 +241,13 @@ static int inter_pump(int *prev_buttons)
 static void inter_wait_release(void)
 {
     int prev = ~0;
+    int guard = 0;
 
-    while (I_ReadControls() != 0)
+    while (I_ReadControls() != 0 && ++guard < 60)
+    {
         inter_pump(&prev);
+        I_WaitVBL(1);
+    }
 }
 
 /* ---- WI art cache (filled once per screen; PU_STATIC so the NEXT
@@ -252,7 +256,9 @@ static void inter_wait_release(void)
 static void *wi_bg;         /* WIMAP0/1/2, sliced big-patch cache */
 static int   wi_bg_epi = -1;
 static void *wi_lname;      /* this level's WILV<e><m> */
+static void *wi_next_lname; /* next level's WILV<e><next-1> */
 static void *wi_finished;   /* WIF */
+static void *wi_entering;   /* WIENTER */
 static void *wi_kills, *wi_items, *wi_secret;   /* WIOSTK/I/S */
 static void *wi_splat, *wi_yah;                 /* WISPLAT, WIURH0 */
 
@@ -269,23 +275,20 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
         {0, 90, 90, 90, 120, 90, 360, 240, 30, 170},
         {0, 90, 45, 90, 150, 90, 90, 165, 30, 135}
     };
+    extern void Saturn_Vdp1_Enter2D(void);
     player_t *pl = &players[consoleplayer];
     int       next = next_map(map, secretexit);
     int       pct_k, pct_i, pct_s, secs, par;
-    int       epi = (episode > 3) ? 2 : episode - 1;   /* lnodes row */
+    int       cnt_k = 0, cnt_i = 0, cnt_s = 0, cnt_t = 0, cnt_par = 0;
+    int       stats_done = 0;
+    int       stage = 0; /* 0 = stats, 1 = entering next map / victory */
+    int       stage_frame = 0;
+    int       epi = (episode > 3) ? 2 : (episode < 1 ? 0 : episode - 1);
     int       frame, prev = ~0;
     char      nm[9];
 
-    /* Freeze-forensics ladder (StageTextHi glyph table has no Q —
-     * see d_main.c): A = entered, V = WI art loaded + pad released,
-     * K = first frame committed. Painted on the y=186 band. */
-    {
-        extern void Saturn_StageTextHi(int x, int y, const char *s);
-        char arow[2];
-
-        arow[0] = 'A'; arow[1] = 0;
-        Saturn_StageTextHi(208, 186, arow);
-    }
+    /* Switch VDP1/VDP2 into full-screen 2D mode so 3D quads do not cover NBG0 */
+    Saturn_Vdp1_Enter2D();
 
     pct_k = totalkills > 0
           ? (int)udiv32((unsigned)(pl->killcount * 100),
@@ -311,32 +314,43 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
             if (wi_bg)
                 Z_Free(wi_bg);
             wi_bg     = Saturn_CachePatchBig(bgname[epi]);
+            if (!wi_bg)
+                wi_bg = Saturn_CachePatchBig("WIMAP0");
             wi_bg_epi = epi;
         }
         nm[0] = 'W'; nm[1] = 'I'; nm[2] = 'L'; nm[3] = 'V';
         nm[4] = (char)('0' + (episode - 1) % 10);
         nm[5] = (char)('0' + (map - 1) % 10);
-        nm[5 + 1] = 0;
-        wi_lname   = Saturn_CachePatch(nm);
+        nm[6] = 0;
+        wi_lname = Saturn_CachePatch(nm);
+
+        if (next > 0)
+        {
+            nm[0] = 'W'; nm[1] = 'I'; nm[2] = 'L'; nm[3] = 'V';
+            nm[4] = (char)('0' + (episode - 1) % 10);
+            nm[5] = (char)('0' + (next - 1) % 10);
+            nm[6] = 0;
+            wi_next_lname = Saturn_CachePatch(nm);
+        }
+        else
+        {
+            wi_next_lname = 0;
+        }
+
         wi_finished = Saturn_CachePatch("WIF");
-        wi_kills   = Saturn_CachePatch("WIOSTK");
-        wi_items   = Saturn_CachePatch("WIOSTI");
-        wi_secret  = Saturn_CachePatch("WIOSTS");
-        wi_splat   = Saturn_CachePatch("WISPLAT");
-        wi_yah     = Saturn_CachePatch("WIURH0");
+        wi_entering = Saturn_CachePatch("WIENTER");
+        wi_kills    = Saturn_CachePatch("WIOSTK");
+        wi_items    = Saturn_CachePatch("WIOSTI");
+        wi_secret   = Saturn_CachePatch("WIOSTS");
+        wi_splat    = Saturn_CachePatch("WISPLAT");
+        wi_yah      = Saturn_CachePatch("WIURH0");
     }
     inter_wait_release();
-    {
-        extern void Saturn_StageTextHi(int x, int y, const char *s);
-        char vrow[2];
 
-        vrow[0] = 'V'; vrow[1] = 0;
-        Saturn_StageTextHi(228, 186, vrow);
-    }
-
-    for (frame = 0;; frame++)
+    for (frame = 0;; frame++, stage_frame++)
     {
         int edges = inter_pump(&prev);
+        int press = (frame > 8) && (edges & (BT_START | BT_ATTACK | BT_USE));
 
         Saturn_ClearRect(0, 0, DOOM_SCREENWIDTH, DOOM_FBHEIGHT, 0);
 
@@ -346,74 +360,128 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
         if (wi_splat)
         {
             int i;
-
-            for (i = 0; i < map; i++)
+            int max_splat = (map <= 9) ? map : 9;
+            for (i = 0; i < max_splat; i++)
                 draw_wi(lnodes[epi][i][0], lnodes[epi][i][1], wi_splat);
         }
-        if (next > 0 && wi_yah)
-            draw_wi(lnodes[epi][next - 1][0], lnodes[epi][next - 1][1],
-                    wi_yah);
 
-        /* title: level name + FINISHED (vanilla WI_drawLF) */
-        if (wi_lname)
-            draw_wi((DOOM_SCREENWIDTH - wi_width(wi_lname)) / 2,
-                    WI_TITLEY, wi_lname);
-        if (wi_finished)
-            draw_wi((DOOM_SCREENWIDTH - wi_width(wi_finished)) / 2,
-                    WI_TITLEY + WI_LH - 6, wi_finished);
-
-        /* stats (vanilla WI_drawStats: labels at x=50, % right edge
-         * at 320-50, rows at y=50/68/86) */
-        if (wi_kills)
-            draw_wi(SP_STATSX, SP_STATSY, wi_kills);
-        wi_percent(DOOM_SCREENWIDTH - SP_STATSX, SP_STATSY, pct_k);
-        if (wi_items)
-            draw_wi(SP_STATSX, SP_STATSY + WI_LH, wi_items);
-        wi_percent(DOOM_SCREENWIDTH - SP_STATSX, SP_STATSY + WI_LH,
-                   pct_i);
-        if (wi_secret)
-            draw_wi(SP_STATSX, SP_STATSY + 2 * WI_LH, wi_secret);
-        wi_percent(DOOM_SCREENWIDTH - SP_STATSX, SP_STATSY + 2 * WI_LH,
-                   pct_s);
-
-        /* time + par (vanilla: TIME at (16,168) with the value right
-         * edge at 144; PAR at (176,168) with the value right edge at
-         * 304) */
+        if (stage == 0)
         {
-            const void *pt = Saturn_CachePatch("WITIME");
-
-            if (pt)
-                draw_wi(SP_TIMEX, SP_TIMEY, pt);
-            wi_time(DOOM_SCREENWIDTH / 2 - SP_TIMEX, SP_TIMEY, secs);
-            if (par > 0)
+            /* Animated stat count-up */
+            if (!stats_done)
             {
-                const void *pp = Saturn_CachePatch("WIPAR");
+                if (press)
+                {
+                    cnt_k = pct_k;
+                    cnt_i = pct_i;
+                    cnt_s = pct_s;
+                    cnt_t = secs;
+                    cnt_par = par;
+                    stats_done = 1;
+                    press = 0;
+                }
+                else
+                {
+                    if (cnt_k < pct_k) { cnt_k += 2; if (cnt_k > pct_k) cnt_k = pct_k; }
+                    else if (cnt_i < pct_i) { cnt_i += 2; if (cnt_i > pct_i) cnt_i = pct_i; }
+                    else if (cnt_s < pct_s) { cnt_s += 2; if (cnt_s > pct_s) cnt_s = pct_s; }
+                    else if (cnt_t < secs)  { cnt_t += 3; if (cnt_t > secs)  cnt_t = secs; }
+                    else if (cnt_par < par) { cnt_par += 3; if (cnt_par > par) cnt_par = par; }
+                    else stats_done = 1;
+                }
+            }
 
-                if (pp)
-                    draw_wi(DOOM_SCREENWIDTH / 2 + SP_TIMEX, SP_TIMEY,
-                            pp);
-                wi_time(DOOM_SCREENWIDTH - SP_TIMEX, SP_TIMEY, par);
+            if (next > 0 && wi_yah && ((frame >> 4) & 1))
+                draw_wi(lnodes[epi][next - 1][0], lnodes[epi][next - 1][1], wi_yah);
+
+            /* title: level name + FINISHED (vanilla WI_drawLF) */
+            if (wi_lname)
+                draw_wi((DOOM_SCREENWIDTH - wi_width(wi_lname)) / 2,
+                        WI_TITLEY, wi_lname);
+            if (wi_finished)
+                draw_wi((DOOM_SCREENWIDTH - wi_width(wi_finished)) / 2,
+                        WI_TITLEY + WI_LH - 6, wi_finished);
+
+            /* stats (vanilla WI_drawStats: labels at x=50, % right edge
+             * at 320-50, rows at y=50/68/86) */
+            if (wi_kills)
+                draw_wi(SP_STATSX, SP_STATSY, wi_kills);
+            wi_percent(DOOM_SCREENWIDTH - SP_STATSX, SP_STATSY, cnt_k);
+            if (wi_items)
+                draw_wi(SP_STATSX, SP_STATSY + WI_LH, wi_items);
+            wi_percent(DOOM_SCREENWIDTH - SP_STATSX, SP_STATSY + WI_LH, cnt_i);
+            if (wi_secret)
+                draw_wi(SP_STATSX, SP_STATSY + 2 * WI_LH, wi_secret);
+            wi_percent(DOOM_SCREENWIDTH - SP_STATSX, SP_STATSY + 2 * WI_LH, cnt_s);
+
+            /* time + par (vanilla: TIME at (16,168) with the value right
+             * edge at 144; PAR at (176,168) with the value right edge at
+             * 304) */
+            {
+                const void *pt = Saturn_CachePatch("WITIME");
+
+                if (pt)
+                    draw_wi(SP_TIMEX, SP_TIMEY, pt);
+                wi_time(DOOM_SCREENWIDTH / 2 - SP_TIMEX, SP_TIMEY, cnt_t);
+                if (par > 0)
+                {
+                    const void *pp = Saturn_CachePatch("WIPAR");
+
+                    if (pp)
+                        draw_wi(DOOM_SCREENWIDTH / 2 + SP_TIMEX, SP_TIMEY, pp);
+                    wi_time(DOOM_SCREENWIDTH - SP_TIMEX, SP_TIMEY, cnt_par);
+                }
+            }
+
+            if ((frame >> 4) & 1)
+                print_centered(184, "PRESS START");
+
+            I_FinishUpdate();
+
+            if (stats_done && press)
+            {
+                stage = 1;
+                stage_frame = 0;
             }
         }
-
-        if ((frame >> 5) & 1)
-            print_centered(184, "PRESS START");
-
-        I_FinishUpdate();
-
-        if (frame == 0)
+        else
         {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char krow[2];
+            /* Stage 1: Entering next level (or Episode Victory if next == 0) */
+            if (next > 0)
+            {
+                if (wi_entering)
+                    draw_wi((DOOM_SCREENWIDTH - wi_width(wi_entering)) / 2,
+                            WI_TITLEY, wi_entering);
+                if (wi_next_lname)
+                    draw_wi((DOOM_SCREENWIDTH - wi_width(wi_next_lname)) / 2,
+                            WI_TITLEY + WI_LH - 2, wi_next_lname);
+                if (wi_yah && ((stage_frame >> 4) & 1))
+                    draw_wi(lnodes[epi][next - 1][0], lnodes[epi][next - 1][1], wi_yah);
 
-            krow[0] = 'K'; krow[1] = 0;
-            Saturn_StageTextHi(248, 186, krow);
-        }
+                if (press || stage_frame >= 150)
+                {
+                    print_centered(184, "LOADING...");
+                    I_FinishUpdate();
+                    inter_wait_release();
+                    break;
+                }
+                if ((stage_frame >> 4) & 1)
+                    print_centered(184, "PRESS START");
+            }
+            else
+            {
+                print_centered(60, "EPISODE COMPLETED!");
+                print_centered(84, "CONGRATULATIONS!");
+                if ((stage_frame >> 4) & 1)
+                    print_centered(184, "PRESS START");
+                if (press)
+                {
+                    inter_wait_release();
+                    break;
+                }
+            }
 
-        if (frame > 30 && (edges & (BT_START | BT_ATTACK | BT_USE)))
-        {
-            inter_wait_release();
-            break;
+            I_FinishUpdate();
         }
     }
 

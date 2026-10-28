@@ -139,6 +139,9 @@ void *Saturn_CachePatchBig(const char *name)
         return 0;
     if (lump < wad->firstlump || lump >= wad->firstlump + wad->numlumps)
         return 0;                   /* not an IWAD lump: caller skips */
+#ifdef SATURN_WIN32
+    return W_CacheLumpNum(lump, PU_STATIC);
+#endif
     l = &wad->lumpinfo[lump - wad->firstlump];
     len = l->size;                  /* BIGLONG is the identity on Saturn */
     base = (unsigned)l->filepos;    /* cart offset (HOT) or |COLD_BIAS */
@@ -299,8 +302,7 @@ void Saturn_DrawPatch(int x, int y, const void *patch,
 
                 if (sy < clip_top || sy >= clip_bot)
                     continue;
-                if (px[k])
-                    fb[sy * DOOM_SCREENWIDTH + scx] = px[k];
+                fb[sy * DOOM_SCREENWIDTH + scx] = px[k] ? px[k] : 247;
             }
             post += 4 + len;
         }
@@ -364,8 +366,8 @@ void Saturn_DrawPatchScale(int x, int y, const void *patch,
                 for (k = 0; k < len; k++)
                 {
                     int sy = y + (((top + k) * 3) >> 2);
-                    if (sy >= clip_top && sy < clip_bot && px[k])
-                        fb[sy * DOOM_SCREENWIDTH + scx] = px[k];
+                    if (sy >= clip_top && sy < clip_bot)
+                        fb[sy * DOOM_SCREENWIDTH + scx] = px[k] ? px[k] : 247;
                 }
             }
             else
@@ -373,8 +375,8 @@ void Saturn_DrawPatchScale(int x, int y, const void *patch,
                 for (k = 0; k < len; k++)
                 {
                     int sy = y + ((top + k) * num) / den;
-                    if (sy >= clip_top && sy < clip_bot && px[k])
-                        fb[sy * DOOM_SCREENWIDTH + scx] = px[k];
+                    if (sy >= clip_top && sy < clip_bot)
+                        fb[sy * DOOM_SCREENWIDTH + scx] = px[k] ? px[k] : 247;
                 }
             }
             post += 4 + len;
@@ -479,6 +481,11 @@ void Saturn_Print(int x, int y, const char *s)
     {
         const void *glyph;
 
+        if (c == ' ')
+        {
+            x += 4;
+            continue;
+        }
         if (c >= 'a' && c <= 'z')   /* the font is uppercase-only */
             c -= 32;
         if (c < 33 || c > 95)       /* the font covers ! (33) .. _ (95) */
@@ -507,6 +514,11 @@ int Saturn_PrintWidth(const char *s)
     {
         const byte *glyph;
 
+        if (c == ' ')
+        {
+            width += 4;
+            continue;
+        }
         if (c >= 'a' && c <= 'z')   /* the font is uppercase-only */
             c -= 32;
         if (c < 33 || c > 95)

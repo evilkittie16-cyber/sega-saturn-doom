@@ -35,7 +35,7 @@
  * COLD-lump white speckle (cart-fill gated OUT by design). The full
  * render path + tics survive on real HW. Next rung: BISECT 0 = full
  * unmodified boot with the background cart-fill back IN. */
-#define SATURN_BISECT 4
+#define SATURN_BISECT 0
 
 /* ===== r92 CART RECORD SLOT RELOCATION (B3 verdict fix) =====
  * r91 B3 real-HW result: solid CYAN, no census, no park text = wedged

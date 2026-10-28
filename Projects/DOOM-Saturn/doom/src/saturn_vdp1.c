@@ -1846,6 +1846,7 @@ void Saturn_Vdp1Wall_Frame(void)
      * drawn this frame. */
     if (saturn_cmd_m_count > 0 || saturn_cmd_s_count > 0 || saturn_cmd_w_count > 0 || (v1q != NULL && v1q_count > 0))
     {
+        saturn_v1w_spr = 1;
         saturn_v1w_modr = (int)(V1_MODR & 0x1Fu);
 
         /* SGL-PIPELINE BUILD (2026-09-07): NO PTMR writes, NO TVMR
@@ -1949,6 +1950,14 @@ void Saturn_Vdp1Wall_Frame(void)
         v1_write_priority_regs();
 #endif
     }
+    else
+    {
+#ifdef SATURN_WIN32
+        *(uint32_t *)(V1_BASE + V1_USER0) = 0x80000000u;
+#else
+        V1_VRAM(V1_USER0 + 0x00u) = 0x8000u;
+#endif
+    }
 
     /* HUD row RETIRED (2026-09-08, operator request): the V1 register
        readback painted white glyphs across x=8..308 at y=168 — straight
@@ -1998,9 +2007,29 @@ void Saturn_Vdp1Wall_Frame(void)
 #endif /* HUD row retired 2026-09-08 */
 }
 
+void Saturn_Vdp1_Enter2D(void)
+{
+    extern int saturn_game_started;
+    extern int saturn_vdp2_plane_active;
+
+    saturn_game_started = 0;
+    saturn_vdp2_plane_active = 0;
+    saturn_v1w_spr = 0;
+    v1q_count = 0;
+    saturn_cmd_m_count = 0;
+    saturn_cmd_s_count = 0;
+    saturn_cmd_w_count = 0;
+#ifdef SATURN_WIN32
+    *(uint32_t *)(V1_BASE + V1_USER0) = 0x80000000u;
+#else
+    V1_VRAM(V1_USER0 + 0x00u) = 0x8000u;
+#endif
+}
+
 #else  /* !SATURN_VDP1_WALL */
 
 void Saturn_Vdp1Wall_Init(void) { }
+void Saturn_Vdp1_Enter2D(void) { }
 void Saturn_Vdp1Wall_Reset(void) { }
 void Saturn_Vdp1Wall_FlushCache(void) { }
 int  Saturn_Vdp1Wall_Add(int xa, int ya0, int ya1,

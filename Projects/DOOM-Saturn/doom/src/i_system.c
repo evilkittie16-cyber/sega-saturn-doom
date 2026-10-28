@@ -72,21 +72,7 @@ void Saturn_BootText(int x, int y, const char *str)
  * clear of the P/W rows at 140,168/188). */
 void Saturn_SetupTag(const char *str)
 {
-    extern void Saturn_StageTextHi(int x, int y, const char *s);
-    static char blank[17];
-    static int  blank_ready = 0;
-
-    Saturn_BootText(8, 24, str);
-    if (!blank_ready)
-    {
-        int i;
-        for (i = 0; i < 16; i++)
-            blank[i] = '~';          /* unmapped -> blank cell */
-        blank[16]   = '\0';
-        blank_ready = 1;
-    }
-    Saturn_StageTextHi(8, 48, blank);
-    Saturn_StageTextHi(8, 48, str);
+    (void)str;
 }
 
 /* ====== BOOT-FLIGHT RECORDER (2026-09-09, title-path SYSTEM-RESET
@@ -127,29 +113,6 @@ void Saturn_BootRec(int n)
  * record. No-op without a cart or without a recorded death. */
 void Saturn_BootRec_PaintPrev(void)
 {
-    extern unsigned int saturn_cart_base_addr;
-    extern void Saturn_StageTextHi(int x, int y, const char *s);
-    volatile unsigned int *rc;
-    unsigned int magic, n;
-    char buf[8];
-
-    if (saturn_cart_base_addr == 0u)
-        return;
-    rc = (volatile unsigned int *)
-        (saturn_cart_base_addr + SATURN_CART_REC_OFF);
-    magic = rc[44];
-    n = rc[45];
-    if (magic != 0x424F4F54u || n == 0u || n > 9u)
-        return;
-    buf[0] = 'P';
-    buf[1] = 'R';
-    buf[2] = 'E';
-    buf[3] = 'V';
-    buf[4] = '=';
-    buf[5] = (char)('0' + n);
-    buf[6] = 0;
-    buf[7] = 0;
-    Saturn_StageTextHi(8, 64, buf);
 }
 
 /* Commit the current frame (SGL). Used by the boot report in main.c
@@ -164,177 +127,28 @@ void Saturn_PumpFrame(void)
     slSynch();
 }
 
-/* i_video.c: VDP2 direct display — once i_video.c has taken NBG0 over
- * (and the first I_FinishUpdate hides NBG1), stage colors must land in
- * the NBG0 bitmap pages or they would paint a layer nobody displays.
- * The hook paints CRAM[1] + a solid index-1 fill of both pages —
- * i.e. the same solid color, through the live display path. Before
- * the takeover it is a no-op and NBG1 keeps showing boot markers. */
 extern void saturn_vdp2_stage_fill(jo_color color);
 
-/* Paint the NBG1 background bitmap a solid color — the one display
- * channel that is guaranteed visible in this build (it is what
- * jo_core_init's back_color paints and what Jo's own JO_DEBUG error
- * screen paints red). The boot sequence uses it as a stage marker:
- * the last color on screen names the stage the program reached,
- * independent of whether the VDP1 font/sprite path works.
- *
- * 2026-09-04: once the NBG0 direct-display takeover has run, the
- * NBG1 clear is skipped — NBG1 is hidden and page A IS the NBG0
- * framebuffer, so the call only scribbled raw 16bpp stage-color
- * words across the live pages (the cyan staircase artifact) and
- * re-enabled NBG1 against slScrAutoDisp(NBG0ON). Stage colors still
- * land through saturn_vdp2_stage_fill below. */
-/* 2026-09-08 (operator request): every boot stage screen now carries its
- * own NAME as text, so a frozen colour names its stage on the screen
- * itself (main.c's ledger maps the name to the boot site). Unmatched
- * colours (raw hex callers, DSP macros) paint their hex value instead.
- * Painted with the r97 high-contrast glyph channel (px=2, white) at the
- * top-right, which is visible over any stage fill and collides with no
- * census row. Glyph set has no J/Q/X/Z — names avoid those letters. */
 void Saturn_StageNamePaint(unsigned short color)
 {
-    static const struct { unsigned short c; const char *n; } names[] = {
-        { JO_COLOR_White,                   "WHITE"   },
-        { JO_COLOR_Black,                   "BLACK"   },
-        { JO_COLOR_Red,                     "RED"     },
-        { JO_COLOR_Green,                   "GREEN"   },
-        { JO_COLOR_Yellow,                  "YELLOW"  },
-        { JO_COLOR_Blue,                    "BLUE"    },
-        { JO_COLOR_Purple,                  "PURPLE"  },
-        { JO_COLOR_Cyan,                    "CYAN"    },
-        { JO_COLOR_Gray,                    "GRAY"    },
-        { JO_COLOR_DarkGreen,               "DKGRN"   },
-        { JO_COLOR_DarkYellow,              "DKYEL"   },
-        { JO_COLOR_DarkCyan,                "DKCYAN"  },
-        { JO_COLOR_MediumGreen,             "MDGRN"   },
-        { JO_COLOR_MediumBlue,              "MDBLU"   },
-        { JO_COLOR_MediumPurple,            "MDPUR"   },
-        { JO_COLOR_MediumWhite,             "MDWHT"   },
-        { JO_COLOR_SemiGreen,               "SMGRN"   },
-        { JO_COLOR_SemiYellow,              "SMYEL"   },
-        { JO_COLOR_SemiCyan,                "SMCYN"   },
-        { JO_COLOR_SATURN_RGB(8, 8, 0),     "OLIVE"   },
-        { JO_COLOR_SATURN_RGB(0, 16, 24),   "HALFBLU" },
-        { JO_COLOR_SATURN_RGB(24, 0, 24),   "MAGENTA" },
-        { JO_COLOR_SATURN_RGB(0, 31, 12),   "TEAL"    },
-        { JO_COLOR_SATURN_RGB(31, 0, 18),   "PINK"    },
-        { JO_COLOR_SATURN_RGB(10, 0, 31),   "VIOLET"  },
-        { JO_COLOR_SATURN_RGB(10, 31, 0),   "CHRTREUS" },
-        { JO_COLOR_SATURN_RGB(31, 14, 6),   "SALMON"  },
-        { JO_COLOR_SATURN_RGB(4, 12, 4),    "PINE"    },
-        { JO_COLOR_SATURN_RGB(12, 12, 12),  "SMOKE"   },
-        { JO_COLOR_SATURN_RGB(0, 31, 10),   "SMGRN2"  },
-        { 0x8318u,                          "MEDYEL"  },
-        { 0x8300u,                          "MEDGRN"  },
-        { 0xE000u,                          "MEDBLU"  },
-        { 0x7C1Fu,                          "MAGNTA2" },
-        { 0x001Fu,                          "REDBAIL" },
-    };
-    unsigned int i;
-    extern void Saturn_StageTextIdx(int x, int y, const char *s,
-                                    unsigned char px);
-
-    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-        if (names[i].c == color)
-        {
-            /* px=2 white for dark fills; the px=0 copy below shows over
-             * light fills (index 0 = the dark back colour there) */
-            Saturn_StageTextIdx(156, 4, names[i].n, 2);
-            Saturn_StageTextIdx(156, 24, names[i].n, 0);
-            return;
-        }
-    /* hex fallback: "C=XXXX" (digits and A-F are all in the glyph set) */
-    {
-        char buf[8];
-        int  k;
-        buf[0] = 'C';
-        buf[1] = '=';
-        for (k = 0; k < 4; k++)
-        {
-            unsigned int nib = (color >> (12 - 4 * k)) & 0xFu;
-            buf[2 + k] = (char)(nib < 10 ? ('0' + nib) : ('A' + nib - 10));
-        }
-        buf[6] = 0;
-        buf[7] = 0;
-        Saturn_StageTextIdx(156, 4, buf, 2);
-    }
+    (void)color;
 }
 
 void Saturn_StageColor(jo_color color)
 {
-
-    /* PHOTO-HOLD (2026-09-03 real-HW bring-up): the Saroo boots so fast
-     * that the whole stage ladder scrolls past in milliseconds — a TV
-     * photo can't catch the order, and the frozen colour alone doesn't
-     * name the stage. Hold each marker ~10 vblanks so one filmed boot
-     * reads as an ordered sequence. Zero SATURN_STAGE_HOLD_VBLS to
-     * restore instant switching. main.c's boot_vbl_count ticks from the
-     * first registered vblank callback (before any StageColor call).
-     *
-     * r95 HOLD-TRAP FIX: the hold used to spin FOREVER on
-     * boot_vbl_count — so a vblank chain that dies mid-boot freezes
-     * the screen at the colour being held and FRAMES THE WRONG CALL
-     * (the r95 real-HW photo froze on the VIOLET marker fronting
-     * R_ClearTextures, a loop that cannot hang). The wait is now
-     * bounded: if the counter does not move within ~1.6 s of
-     * spinning, the hold gives up, saturn_hold_timeout latches, and
-     * the ladder CONTINUES — a dead vblank chain now shows as the
-     * colours slowly advancing (~2 s apart), never as a frozen
-     * ladder marker. */
-#define SATURN_STAGE_HOLD_VBLS 10
-    {
-        extern volatile unsigned int boot_vbl_count;
-        extern int                   saturn_vdp2_nbg0_live(void);
-        unsigned int v0    = boot_vbl_count;
-        unsigned int spins = 0;
-
-        if (!saturn_vdp2_nbg0_live())
-            jo_vdp2_clear_bitmap_nbg1(color);
-        saturn_vdp2_stage_fill(color);
-        /* stage-name stamps RETIRED 2026-09-08: painting FB pages inside
-         * the early holds moved the wedge EARLIER with each build (teal
-         * -> white -> pre-boot black). Boot screens go back to bare
-         * colour; the operator's text-on-screen request is served by the
-         * census rows instead once the wedge is found. */
-        while ((unsigned int)(boot_vbl_count - v0) <
-               (unsigned int)SATURN_STAGE_HOLD_VBLS)
-        {
-            if (++spins > 15000000u)
-            {
-                saturn_hold_timeout = 1;
-                break;
-            }
-        }
-    }
-#undef SATURN_STAGE_HOLD_VBLS
+    (void)color;
 }
 
-/* Same two paints as Saturn_StageColor but with NO 10-vblank hold —
- * the freeze-bracket form for mid-frame use: the next I_FinishUpdate
- * overwrites NBG0 on a healthy frame, and a hard-frozen console keeps
- * showing the LAST color painted. */
 void Saturn_PaintNow(jo_color color)
 {
-    extern int saturn_vdp2_nbg0_live(void);
-
-    if (!saturn_vdp2_nbg0_live())
-        jo_vdp2_clear_bitmap_nbg1(color);
-    saturn_vdp2_stage_fill(color);
+    (void)color;
 }
 
 /* Progress message during the synchronous boot phases (WAD load,
- * level setup). The message stays on screen while the caller grinds
- * through seconds of work. */
+ * level setup). */
 void Saturn_BootMsg(const char *msg)
 {
-    extern int saturn_game_started;
-    extern int saturn_vdp2_nbg0_live(void);
-
-    if (saturn_game_started || saturn_vdp2_nbg0_live())
-        return;
-    Saturn_BootText(8, 8, msg);
-    slSynch();
+    (void)msg;
 }
 
 unsigned int I_GetTicks(void)

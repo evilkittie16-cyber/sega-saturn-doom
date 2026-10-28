@@ -167,9 +167,22 @@ volatile int saturn_load_count = 0;
 
 void saturn_vdp2_stage_fill(jo_color color) { (void)color; }
 int Saturn_Demo_FeedTic(int real_pad) { (void)real_pad; return 0; }
-int Saturn_Inter_Run(void) { return 0; }
-void Saturn_Pause_Draw(void) { }
+int Saturn_Demo_Available(void) { return 0; }
+int Saturn_Demo_Exists(int num) { (void)num; return 0; }
+int Saturn_Demo_Open(int num) { (void)num; return 0; }
+void Saturn_Demo_Begin(void) { }
+void Saturn_Demo_Close(void) { }
 void Saturn_RenderInvalidateLevel(void) { }
+extern void Win32_PumpEvents(void);
+void I_WaitVBL(int count) {
+    extern volatile unsigned int saturn_vbl_count;
+    if (count < 1) count = 1;
+    for (int i = 0; i < count; i++) {
+        Win32_PumpEvents();
+        Sleep(16);
+        saturn_vbl_count++;
+    }
+}
 int I_GetTime(void) { extern volatile unsigned int saturn_vbl_count; return (int)(saturn_vbl_count / 2); }
 void *I_PointStableLump(int lump) { return W_POINTLUMPNUM(lump); }
 
@@ -279,7 +292,7 @@ void saturn_slave_init(void) { }
 void saturn_slave_frame_tick(void) { }
 
 /* SGL & VDP1 display stubs */
-int saturn_quiet_hud = 0;
+int saturn_quiet_hud = 1;
 void Saturn_Cram_ShadedBanks(void) { }
 void slPriority(int a, int b) { (void)a; (void)b; }
 void slSpriteColMode(int m) { (void)m; }
@@ -323,14 +336,6 @@ void Saturn_Udec0(char *out, unsigned int v, int width)
 void Saturn_Uhex(char *out, unsigned int v)
 {
     sprintf(out, "%X", v);
-}
-
-int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
-{
-    *out_episode = 1;
-    *out_skill = 2;
-    *out_demo = 0;
-    return 0; /* Directly proceed to gameplay */
 }
 
 /* Error reporting */

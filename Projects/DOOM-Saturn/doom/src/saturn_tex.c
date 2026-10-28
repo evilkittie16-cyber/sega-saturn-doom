@@ -154,6 +154,7 @@ static unsigned char saturn_cm_badmap[32];
 
 static byte         *hw_base;
 static unsigned int  hw_used;
+static unsigned int  hw_used_boot;
 static unsigned int  hw_size;
 static unsigned int  hram_used;
 static int           hram_ok;
@@ -162,11 +163,25 @@ static int           hram_ok;
 extern void *jo_malloc_with_behaviour(unsigned int n, const int behaviour);
 #endif
 
+#ifdef SATURN_WIN32
+static byte s_win32_hram[4 * 1024 * 1024];
+static unsigned int s_win32_hram_used = 0;
+static unsigned int s_win32_hram_used_boot = 0;
+#endif
+
 static void *hram_alloc(int size)
 {
 #ifdef SATURN_WIN32
+    int adv;
+    void *p;
     if (size <= 0) return NULL;
-    return malloc((size_t)((size + 7) & ~7));
+    adv = (size + 7) & ~7;
+    if (s_win32_hram_used + (unsigned int)adv <= sizeof(s_win32_hram)) {
+        p = &s_win32_hram[s_win32_hram_used];
+        s_win32_hram_used += (unsigned int)adv;
+        return p;
+    }
+    return NULL;
 #else
     void *p;
     int   adv;
@@ -438,6 +453,10 @@ void Saturn_R_InitData(void)
     D_memset(sprite_botz, 0, numsprites);
     D_memset(sprite_gguard, 0, numsprites);
 
+    hw_used_boot = hw_used;
+#ifdef SATURN_WIN32
+    s_win32_hram_used_boot = s_win32_hram_used;
+#endif
     tex_active = (numtextures > 0);
 }
 
@@ -827,26 +846,22 @@ void Saturn_CacheZoneReset(void)
 {
     extern memzone_t *mainzone;
     if (!mainzone) return;
-    byte *z0 = (byte *)mainzone;
-    byte *z1 = z0 + mainzone->size;
-
+#ifdef SATURN_WIN32
+    s_win32_hram_used = s_win32_hram_used_boot;
+#else
+    hw_used = hw_used_boot;
+#endif
+    hram_used = 0;
     if (tex_cache)
-        for (int i = 0; i < numtextures; i++)
-            if (tex_cache[i] >= z0 && tex_cache[i] < z1) tex_cache[i] = NULL;
-            
+        D_memset(tex_cache, 0, numtextures * sizeof(byte *));
     if (flat_cache)
-        for (int i = 0; i < numflats; i++)
-            if (flat_cache[i] >= z0 && flat_cache[i] < z1) flat_cache[i] = NULL;
-            
+        D_memset(flat_cache, 0, numflats * sizeof(byte *));
     if (patch_cache)
-        for (int i = 0; i < num_pnames; i++)
-            if (patch_cache[i] >= z0 && patch_cache[i] < z1) patch_cache[i] = NULL;
-            
+        D_memset(patch_cache, 0, num_pnames * sizeof(byte *));
     if (sprite_cache)
-        for (int i = 0; i < numsprites; i++) {
-            if (sprite_cache[i] >= z0 && sprite_cache[i] < z1) sprite_cache[i] = NULL;
-            if (sprite_raw[i] >= z0 && sprite_raw[i] < z1) sprite_raw[i] = NULL;
-        }
+        D_memset(sprite_cache, 0, numsprites * sizeof(byte *));
+    if (sprite_raw)
+        D_memset(sprite_raw, 0, numsprites * sizeof(byte *));
 }
 
 extern int Saturn_Leaf_BlobRead(void *buf, unsigned cap, const char *fname);

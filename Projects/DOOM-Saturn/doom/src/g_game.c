@@ -173,25 +173,22 @@ void Saturn_G_Ticker(void)
      * P_Ticker so the frozen state is seen this same tic (P_Ticker
      * returns 0 while gamepaused — p_tick.c:359). */
     {
+        extern void Saturn_Pause_Init(void);
+        extern void Saturn_Pause_Tick(int edges);
         player_t *p = &players[consoleplayer];
         int       edges = p->ticbuttons & ~p->oldticbuttons;
 
-        if (edges & BT_PAUSE)
-            gamepaused ^= 1;
-        else if (gamepaused && (edges & BT_USE))
+        if (!gamepaused)
         {
-            /* B on the pause plaque: quit to title (also the escape
-             * hatch from death — G_DoReborn is stubbed). */
-            saturn_quit_to_title = 1;
-            gamepaused = 0;
+            if (edges & BT_PAUSE)
+            {
+                gamepaused = 1;
+                Saturn_Pause_Init();
+            }
         }
-        else if (gamepaused && (edges & BT_ATTACK))
-            gamepaused = 0;         /* A: resume */
-        else if (gamepaused && (edges & BT_SPEED))
+        else
         {
-            /* C on the pause plaque: toggle Wall Strip Subdivision */
-            extern void Saturn_ToggleWallSubdivision(void);
-            Saturn_ToggleWallSubdivision();
+            Saturn_Pause_Tick(edges);
         }
     }
 
@@ -220,17 +217,6 @@ void Saturn_G_Ticker(void)
         saturn_secret_exit = (gameaction == ga_secretexit);
         saturn_level_done  = 1;
         gameaction         = ga_nothing;
-        /* Freeze-forensics: T = the exit latch ran. The letters live
-         * on the clean y=186 band (between the V and W probe rows);
-         * execution order reads left to right. T persists until the
-         * next copy_back. */
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char trow[2];
-
-            trow[0] = 'T'; trow[1] = 0;
-            Saturn_StageTextHi(8, 186, trow);
-        }
     }
 }
 
@@ -242,16 +228,17 @@ void Saturn_G_Display(void)
     extern void Saturn_HW_RenderPlayerView(int displayplayer);
     extern void Saturn_PSprite_Draw(void);
     extern void Saturn_HUD_Draw(void);
+    extern int  saturn_game_started;
 
     if (gamepaused)
     {
         extern void Saturn_Pause_Draw(void);
 
-        Saturn_HW_RenderPlayerView(0);
         Saturn_HUD_Draw();
         Saturn_Pause_Draw();
         return;
     }
+    saturn_game_started = 1;
     Saturn_HW_RenderPlayerView(0);
     {
         extern volatile unsigned int saturn_hw_prof_hud;

@@ -135,7 +135,7 @@ volatile unsigned int saturn_vbl_count = 0;
  * cause — and with the r83 false-fire detectors fixed, the eyes are
  * needed again: the r83 cyan wedge is invisible precisely because
  * nothing repaints over the stage fills. */
-volatile unsigned int saturn_instrument_armed = 1;
+volatile unsigned int saturn_instrument_armed = 0;
 
 /* =====================================================================
  * VDP2 8bpp DIRECT DISPLAY (2026-09-02, performance).
@@ -222,8 +222,9 @@ void saturn_vdp2_stage_fill(jo_color color)
 {
     unsigned int            page;
     volatile unsigned short *cram = (volatile unsigned short *)SATURN_FB_CRAM;
+    extern int              saturn_quiet_hud;
 
-    if (!saturn_fb_live)
+    if (!saturn_fb_live || saturn_quiet_hud)
         return;
     cram[1] = color;                     /* index 1 = this stage color */
     saturn_cram_stage_dirty = 1;         /* I_FinishUpdate restores */
@@ -325,7 +326,7 @@ static const char stage_glyph_chars[38] = "SLAVETHFRGCB= 0123456789:-?DIMNOPUWYK
  * stamp is silenced so only saturn_vdp1.c's V1 row stays on screen.
  * Cleared by I_Error (fatal rows must always show) and never set
  * before the first I_FinishUpdate (boot stages keep their rows). */
-int saturn_quiet_hud;
+int saturn_quiet_hud = 1;
 
 void Saturn_StageTextIdx(int x, int y, const char *s, unsigned char px)
 {
@@ -937,6 +938,9 @@ static void saturn_vdp2_copy_back(void)
 static void saturn_vblank_callback(void)
 {
     saturn_vbl_count++;
+    *(volatile unsigned int *)
+        ((unsigned int)&saturn_vbl_count + 0x20000000u)
+        = saturn_vbl_count;
 
     /* Continuous 60Hz SMPC peripheral cashier polling.
      * SGL normally only calls slSmpcCashSend() during _BlankIn when _SynchCount == 0.
@@ -963,15 +967,7 @@ static void saturn_vblank_callback(void)
      * convicted; if it still wedges pre-loop, the GSUB record (which
      * needs no ISR) names the step and the timers are exonerated. */
     if (!saturn_instrument_armed)
-    {
-        static int boot_id_done = 0;
-        if (!boot_id_done)
-        {
-            boot_id_done = 1;
-            Saturn_StageText(220, 168, "r105");
-        }
         return;
-    }
 
     /* r80/r98: DISC-ID BEACON — every vbl until the first frame
      * completes, at a VISIBLE cell. The old one-shot stamp at
@@ -4193,36 +4189,11 @@ void I_FinishUpdate(void)
                 saturn_blit_frt_last = last_;
                 saturn_pf_acc[4] += Saturn_ProfSpan(pf_f0, pf_v0);
             }
-        /* Probe cell 188: 'Y' = the vblank alignment wait EXITED.
-         * Cell left at 'E' = died inside the wait (or this stamp's
-         * erase). */
-        saturn_probe_stamp(188, 'Y');
-        /* Freeze-forensics: Y = the vblank alignment wait exited (the
-         * flip writes are next). Between E and B. */
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char yrow[2];
-
-            yrow[0] = 'Y'; yrow[1] = 0;
-            Saturn_StageTextHi(168, 186, yrow);
-        }
         saturn_frt_syn_syn = (int)Saturn_ProfSpan(tf, t0);
         saturn_master_site = 0xD;   /* r53: flip-write entered */
         slBitMapNbg0(COL_TYPE_256, BM_512x256,
                      (void *)(saturn_fb_front ? SATURN_FB_PAGE_A
                                               : SATURN_FB_PAGE_B));
-        /* Probe cell 188: 'W' = slBitMapNbg0 RETURNED. Cell left at
-         * 'Y' = died INSIDE the slBitMapNbg0 flip write. */
-        saturn_probe_stamp(188, 'W');
-        /* First frame: hide NBG1 (boot stage colors) â€” real frames flow
-         * from here on. Re-asserting the flags every frame is cheap and
-         * keeps SGL's display-enable shadow consistent with ours. Go
-         * through Jo's setter so Jo's own screen_flags shadow also
-         * drops NBG1ON (a later Jo call would otherwise re-add it).
-         * VDP1 wall prototype: keep the sprite layer ON when its Init
-         * ran — slScrAutoDisp REPLACES the whole enable set, so the
-         * plain NBG0 call silently killed the SPR bits every frame and
-         * the VDP1 layer never displayed (yss vdp1.yss verdict). */
         {
             extern int saturn_v1w_spr;
             extern int saturn_vdp2_plane_active;
@@ -4233,50 +4204,8 @@ void I_FinishUpdate(void)
                  | (saturn_vdp2_plane_active ? JO_RBG0_SCREEN : 0)));
         }
         saturn_fb_front ^= 1;
-        /* Probe cell 188: 'K' = jo_set_displayed_screens RETURNED
-         * (Z is not in the glyph table, so the old cell-268 stamp
-         * was invisible — K replaces it). Cell left at 'W' = died
-         * INSIDE jo_set_displayed_screens. */
-        saturn_probe_stamp(188, 'K');
-        /* r57: with the ISR dead, this commit just ERASED the verdict
-         * the cap-wait detector painted â€” repaint it onto the pages so
-         * the next flip (next frame) shows it again. The flip itself
-         * breaks immediately above, so frames keep flowing. */
-        {
-            extern volatile unsigned int saturn_vbl_dead;
-
-            if (saturn_vbl_dead)
-                saturn_vbl_dead_verdict();
-        }
-        /* Probe cell 188: 'B' = past the vbl_dead verdict (prof
-         * reads + B's ladder stamp are all that remain before
-         * I_FinishUpdate returns). */
-        saturn_probe_stamp(188, 'B');
-        /* Probe cell 188 after the B ladder paint: 'D' =
-         * I_FinishUpdate is returning. Freeze left at 'D' = died
-         * after return, before the chain's C (d_main paints C into
-         * this same cell) — loop-top R / level_done check /
-         * D_DoomLoop return / chain start. */
-        {
-            extern void Saturn_StageTextHi(int x, int y, const char *s);
-            char brow[2];
-
-            brow[0] = 'B';
-            brow[1] = 0;
-            Saturn_StageTextHi(148, 186, brow);
-        }
-        saturn_probe_stamp(188, 'D');
         saturn_prof_syn = (int)(saturn_vbl_count - t0);
         saturn_prof_syn_us = (unsigned short)(SAT_FRT() - tf);
-    }
-    /* Freeze-forensics: B = I_FinishUpdate returned (flip + vblank
-     * alignment done). */
-    {
-        extern void Saturn_StageTextHi(int x, int y, const char *s);
-        char brow[2];
-
-        brow[0] = 'B'; brow[1] = 0;
-        Saturn_StageTextHi(148, 186, brow);
     }
 #else
     {

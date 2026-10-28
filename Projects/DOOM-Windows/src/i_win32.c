@@ -534,9 +534,6 @@ static int s_pending_quit = 0;
 
 static void PollAgentCommands(void)
 {
-    extern int saturn_game_started;
-    if (!saturn_game_started) return;
-
     FILE *f = fopen("agent_cmd.txt", "r");
     if (!f) return;
 
@@ -601,6 +598,24 @@ static void PollAgentCommands(void)
             extern int saturn_wall_subdivision;
             saturn_wall_subdivision = atoi(cmd + 11);
             printf("[Agent Interface] Wall strip subdivision set to %d\n", saturn_wall_subdivision);
+        } else if (strncmp(cmd, "COMPLETE_LEVEL", 14) == 0) {
+            extern int saturn_level_done;
+            extern int saturn_secret_exit;
+            saturn_secret_exit = 0;
+            saturn_level_done = 1;
+            gameaction = ga_completed;
+            printf("[Agent Interface] Level completion triggered.\n");
+        } else if (strncmp(cmd, "SECRET_EXIT", 11) == 0) {
+            extern int saturn_level_done;
+            extern int saturn_secret_exit;
+            saturn_secret_exit = 1;
+            saturn_level_done = 1;
+            gameaction = ga_secretexit;
+            printf("[Agent Interface] Secret exit triggered.\n");
+        } else if (strncmp(cmd, "PRESS ", 6) == 0) {
+            extern int s_injected_buttons;
+            s_injected_buttons |= (int)strtol(cmd + 6, NULL, 0);
+            printf("[Agent Interface] Injected buttons 0x%X\n", s_injected_buttons);
         } else if (strncmp(cmd, "QUIT", 4) == 0) {
             if (s_pending_screenshot > 0 || saturn_warp_map > 0 || s_pending_player_warp) {
                 s_pending_quit = 1;
@@ -658,9 +673,13 @@ void I_FinishUpdate(void)
     extern int saturn_view_h;
     extern int saturn_wall_subdivision;
     extern int saturn_show_fps;
+    extern int saturn_game_started;
+    extern boolean gamepaused;
 
     /* 3. Sync and Render Canonical DOS DOOM into Pane 2 */
-    if (s_dos_ready && pDOS_SetCamera && pDOS_RenderFrame && players && players[0].mo) {
+    if (!saturn_game_started || gamepaused) {
+        memcpy(s_dos_fb, s_saturn_fb, PANE_W * PANE_H * sizeof(uint32_t));
+    } else if (s_dos_ready && pDOS_SetCamera && pDOS_RenderFrame && players && players[0].mo) {
         int cx = players[0].mo->x;
         int cy = players[0].mo->y;
         int cz = players[0].viewz;
@@ -1175,11 +1194,20 @@ static int KeyHeld(int vk)
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
+int s_injected_buttons = 0;
+
 int I_ReadControls(void)
 {
     int buttons = 0;
     extern int gametic;
     int is_test = g_win32_test_mode;
+
+    Win32_PumpEvents();
+
+    if (s_injected_buttons) {
+        buttons |= s_injected_buttons;
+        s_injected_buttons = 0;
+    }
 
     if (is_test == 1) {
         if (gametic > 10 && gametic <= 40) buttons |= BT_MOVEUP;
@@ -1210,7 +1238,7 @@ int I_ReadControls(void)
     if (KeyHeld(VK_OEM_PERIOD)) buttons |= BT_STRAFERIGHT;
 
     /* Actions */
-    if (KeyHeld(VK_SPACE))                          buttons |= BT_USE;
+    if (KeyHeld(VK_SPACE) || KeyHeld(VK_BACK))      buttons |= BT_USE;
     if (KeyHeld(VK_CONTROL) || KeyHeld(VK_LBUTTON)) buttons |= BT_ATTACK;
     if (KeyHeld(VK_SHIFT))                          buttons |= BT_SPEED;
     if (KeyHeld(VK_TAB))                            buttons |= BT_AUTOMAP;

@@ -680,7 +680,7 @@ doom/src/saturn_slave.o: doom/src/saturn_slave.c
 # wedge hunt moved to the SCUDSP DMA rig (title_repro.c staged vehicle);
 # the menu stays ON (=1) permanently for ship builds.
 doom/src/d_main.o: doom/src/d_main.c
-	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_UI_MENU=0 -DSATURN_VDP1_WALL=1 $(DIVLUT_DEFS) -o $@
+	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_UI_MENU=1 -DSATURN_VDP1_WALL=1 $(DIVLUT_DEFS) -o $@
 
 # SCU DSP RETIRED (2026-09-07, WEDGE SUSPECT): the engine is off by
 # policy (saturn_dsp.c v5.9b) but the boot probe + the cart engine's
