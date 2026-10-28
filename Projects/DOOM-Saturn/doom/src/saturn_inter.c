@@ -485,5 +485,12 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
         }
     }
 
+    if (wi_bg)
+    {
+        Z_Free(wi_bg);
+        wi_bg = 0;
+        wi_bg_epi = -1;
+    }
+
     return next;
 }

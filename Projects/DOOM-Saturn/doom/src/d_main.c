@@ -736,8 +736,7 @@ void D_DoomMain(void)
 
         saturn_quit_to_title = 0;
         gameaction = ga_nothing;
-        if (saturn_game_started)
-            Z_FreeTags(mainzone);   /* free the previous level */
+        Z_FreeTags(mainzone);   /* free menu patches / previous level */
 
         if (act == 1)
         {
@@ -839,14 +838,12 @@ void D_DoomMain(void)
                 break;              /* quit-to-title (or demo end) */
             saturn_level_done = 0;
 
-            /* Intermission: stats for the finished level, then the
-             * next map (0 = episode over, back to the title). The
-             * stage letters (StageTextHi, the freeze-forensics
-             * protocol) name the last step reached on a wedged
-             * screen: C = before the intermission, F = it returned,
-             * N = next-level init returned. (No 'Q' — the stage
-             * glyph table has no Q; it painted as a blank cell and
-             * cost a round of forensics.) */
+            /* Free the finished level BEFORE the intermission screen so
+             * WIMAP0 and WI* patches allocate from the bottom of an empty
+             * zone instead of fragmenting above the finished level's
+             * PU_LEVEL blocks. */
+            Z_FreeTags(mainzone);
+
             {
                 extern int Saturn_Inter_Run(int episode, int map,
                                             int secretexit);
@@ -855,7 +852,8 @@ void D_DoomMain(void)
                                         saturn_secret_exit);
             }
 
-            Z_FreeTags(mainzone);   /* free the finished level */
+            /* Free all intermission patches before loading the next level */
+            Z_FreeTags(mainzone);
 
             if (next == 0)
                 break;              /* episode finished -> title menu */

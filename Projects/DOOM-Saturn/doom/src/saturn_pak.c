@@ -297,11 +297,12 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
         }
     }
 
-    /* 5. Stream MTEX composited textures into PU_STATIC staging, copy to WRAM-L/Cart, and free */
+    /* 5. Stream MTEX composited textures into high-end PU_STATIC staging, copy to WRAM-L/Cart, and free */
     if (sec_tex && sec_tex->byte_size > 0)
     {
+        extern void *Z_MallocHigh(int size, int tag);
         unsigned alloc_sz = (sec_tex->byte_size + 2047) & ~2047;
-        byte *blob = (byte *)Z_Malloc(alloc_sz, PU_STATIC);
+        byte *blob = (byte *)Z_MallocHigh(alloc_sz, PU_STATIC);
         if (blob)
         {
             if (pak_read_stream(gfs, sec_tex->sec_offset, &cur_sec, blob, sec_tex->byte_size))

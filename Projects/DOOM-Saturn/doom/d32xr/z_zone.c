@@ -227,6 +227,86 @@ backtostart:
 	return (void *) ((byte *)base + sizeof(memblock_t));
 }
 
+/* Allocate from the HIGH (back) end of a free block so temporary staging
+ * buffers (like MTEX in Saturn_Pak_LevelLoad) do not split the free zone
+ * when PU_LEVEL allocations happen while the staging buffer is alive. */
+void *Z_MallocHigh (int size, int tag)
+{
+	int			extra;
+	int			scaniter;
+	memblock_t	*start, *rover, *new, *base;
+
+	size += sizeof(memblock_t);
+	size = (size + 3) & ~3;
+
+	if (size < 0 || size > mainzone->size)
+		I_Error("ZMALLOC-BADSIZE");
+
+	start = base = mainzone->rover;
+	scaniter = 0;
+	while (base->tag || base->size < size)
+	{
+		if (++scaniter > 100000)
+			I_Error("ZMALLOC-SCAN-LOOP");
+
+		if (base->tag)
+			rover = base;
+		else
+			rover = base->next;
+
+		if (!rover)
+			goto backtostart_hi;
+
+		if (rover->tag)
+		{
+			base = rover->next;
+			if (!base)
+			{
+backtostart_hi:
+				base = &mainzone->blocklist;
+			}
+			if (base == start)
+			{
+				I_Error("Z_Malloc: failed on %i", size);
+				return NULL;
+			}
+			continue;
+		}
+	}
+
+	extra = base->size - size;
+	if (extra > MINFRAGMENT)
+	{
+		new = (memblock_t *)((byte *)base + extra);
+		new->size = size;
+		new->tag = tag;
+		new->id = ZONEID;
+#ifndef MARS
+		new->lockframe = -1;
+#endif
+		new->prev = base;
+		new->next = base->next;
+		if (new->next)
+			new->next->prev = new;
+		base->next = new;
+		base->size = extra;
+		base->tag = 0;
+		mainzone->rover = base;
+		return (void *)((byte *)new + sizeof(memblock_t));
+	}
+
+	base->tag = tag;
+	base->id = ZONEID;
+#ifndef MARS
+	base->lockframe = -1;
+#endif
+	mainzone->rover = base->next;
+	if (!mainzone->rover)
+		mainzone->rover = &mainzone->blocklist;
+
+	return (void *)((byte *)base + sizeof(memblock_t));
+}
+
 
 /*
 ========================
@@ -246,6 +326,9 @@ void Z_FreeTags (memzone_t *mainzone)
 	 * previous level's overflow (the E1M2 "Z_Malloc: failed on 6059"
 	 * red screen). Null the zone-resident entries after freeing. */
 	extern void	Saturn_CacheZoneReset (void);
+	extern void	Saturn_Vgl_ResetLevelPatches (void);
+
+	Saturn_Vgl_ResetLevelPatches ();
 
 	for (block = &mainzone->blocklist ; block ; block = next)
 	{
@@ -256,6 +339,7 @@ void Z_FreeTags (memzone_t *mainzone)
 			Z_Free2 (mainzone, (byte *)block+sizeof(memblock_t));
 	}
 
+	mainzone->rover = &mainzone->blocklist;
 	Saturn_CacheZoneReset ();
 }
 

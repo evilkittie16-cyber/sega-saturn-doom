@@ -178,6 +178,10 @@ void Saturn_HUD_Init(void)
             I_VideoBuffer = saved_fb;
         }
     }
+    {
+        extern void Saturn_Vgl_MarkBootDone(void);
+        Saturn_Vgl_MarkBootDone();
+    }
 }
 
 /* Tall red digits drawn at 3/4 scale — the rerelease bar's numbers are
@@ -382,18 +386,10 @@ static void hud_face(int health)
     {
         /* straight face, rotating every ~2 s (120 frames) */
         int idx = (hud_face_frame / 120) % 3;
-        static int last_c = -1, last_idx = -1;
-        static const void *cached_straight = NULL;
 
-        if (c != last_c || idx != last_idx || !cached_straight)
-        {
-            last_c = c;
-            last_idx = idx;
-            name[0]='S';name[1]='T';name[2]='F';name[3]='S';name[4]='T';
-            name[5]=(char)('0'+c);name[6]=(char)('0'+idx);name[7]=0;
-            cached_straight = Saturn_CachePatch(name);
-        }
-        glyph = cached_straight;
+        name[0]='S';name[1]='T';name[2]='F';name[3]='S';name[4]='T';
+        name[5]=(char)('0'+c);name[6]=(char)('0'+idx);name[7]=0;
+        glyph = Saturn_CachePatch(name);
     }
 
     if (glyph)

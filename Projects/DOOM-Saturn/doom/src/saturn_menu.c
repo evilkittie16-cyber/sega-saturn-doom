@@ -115,6 +115,14 @@ static void draw_title_bg(void)
         Saturn_DrawPatchFS(0, 0, s_title_patch);
 }
 
+static void menu_free_big_patches(void)
+{
+    if (s_title_patch)  { Z_Free(s_title_patch);  s_title_patch  = 0; }
+    if (s_help1_patch)  { Z_Free(s_help1_patch);  s_help1_patch  = 0; }
+    if (s_help2_patch)  { Z_Free(s_help2_patch);  s_help2_patch  = 0; }
+    if (s_credit_patch) { Z_Free(s_credit_patch); s_credit_patch = 0; }
+}
+
 int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
 {
     static const char *const main_items[4] = {
@@ -189,6 +197,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             saturn_map   = saturn_warp_map;
             saturn_warp_episode = 0;
             saturn_warp_map     = 0;
+            menu_free_big_patches();
             return 0;
         }
 
@@ -326,6 +335,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
                 print_centered(190, "LOADING...");
                 I_FinishUpdate();
                 menu_wait_release();
+                menu_free_big_patches();
                 return 0;
             }
             else if (edges & BT_USE)
@@ -405,6 +415,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
                 print_centered(164, "LOADING...");
                 I_FinishUpdate();
                 menu_wait_release();
+                menu_free_big_patches();
                 return 0;
             }
             else if (opt_cursor == 2 && (edges & (BT_MOVELEFT | BT_MOVERIGHT | BT_STRAFELEFT | BT_STRAFERIGHT | BT_START | BT_ATTACK | BT_SPEED)))

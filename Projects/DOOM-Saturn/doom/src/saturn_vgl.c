@@ -44,11 +44,38 @@ static int sat_rd32(const byte *p)
  * cache (hu_glyph below) — it used to flood 63 of 128 slots through
  * Saturn_CachePatch. Shrinking here also pays the BSS bill that
  * keeps __bend under the 0x060C0000 ceiling. */
-#define SAT_PATCH_CACHE 96
+#define SAT_PATCH_CACHE 160
 
 static char         sat_pc_name[SAT_PATCH_CACHE][9];
 static const void  *sat_pc_ptr[SAT_PATCH_CACHE];
 static int          sat_pc_n = 0;
+static int          sat_pc_boot_n = 0;
+
+static void hu_load(void);
+static int  hu_loaded;
+
+void Saturn_Vgl_MarkBootDone(void)
+{
+    if (!hu_loaded)
+        hu_load();
+    sat_pc_boot_n = sat_pc_n;
+}
+
+void Saturn_Vgl_ResetLevelPatches(void)
+{
+    int i;
+
+    for (i = sat_pc_boot_n; i < sat_pc_n; i++)
+    {
+        if (sat_pc_ptr[i])
+        {
+            Z_Free((void *)sat_pc_ptr[i]);
+            sat_pc_ptr[i] = 0;
+        }
+        sat_pc_name[i][0] = 0;
+    }
+    sat_pc_n = sat_pc_boot_n;
+}
 
 static void sat_name_copy(char *dst, const char *src)
 {

@@ -929,8 +929,9 @@ void Saturn_BakedTextures_Init(const char *lumpname)
     fsize = Saturn_Leaf_BlobRead(NULL, 0, fname);
     if (fsize < 16) return;
 
+    extern void *Z_MallocHigh(int size, int tag);
     unsigned alloc_sz = (unsigned)((fsize + 2047) & ~2047);
-    byte *temp_blob = (byte *)Z_Malloc(alloc_sz, PU_STATIC);
+    byte *temp_blob = (byte *)Z_MallocHigh(alloc_sz, PU_STATIC);
     if (!temp_blob) return;
 
     if (Saturn_Leaf_BlobRead(temp_blob, alloc_sz, fname) == fsize) {
@@ -988,15 +989,13 @@ void Saturn_BakedSprites_Init(const char *lumpname)
     if (fsize < 16) return;
 
     unsigned alloc_sz = (unsigned)((fsize + 2047) & ~2047);
-    byte *temp_blob = (byte *)Z_Malloc(alloc_sz, PU_STATIC);
-    if (!temp_blob) return;
+    byte *perm_blob = (byte *)Z_Malloc(alloc_sz, PU_LEVEL);
+    if (!perm_blob) return;
 
-    if (Saturn_Leaf_BlobRead(temp_blob, alloc_sz, fname) == fsize) {
-        byte *perm_blob = (byte *)Z_Malloc(fsize, PU_LEVEL);
-        if (perm_blob) {
-            D_memcpy(perm_blob, temp_blob, fsize);
-            Saturn_BakedSprites_Parse(perm_blob, (unsigned)fsize);
-        }
+    if (Saturn_Leaf_BlobRead(perm_blob, alloc_sz, fname) == fsize) {
+        if (!Saturn_BakedSprites_Parse(perm_blob, (unsigned)fsize))
+            Z_Free(perm_blob);
+    } else {
+        Z_Free(perm_blob);
     }
-    Z_Free(temp_blob);
 }
