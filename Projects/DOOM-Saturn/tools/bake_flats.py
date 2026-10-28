@@ -14,20 +14,20 @@ from fractions import Fraction
 WAD_PATH = os.environ.get("DOOM_WAD", None)
 if not WAD_PATH or not os.path.exists(WAD_PATH):
     for candidate in [
-        "cd/DOOM.WAD",
         "cd/DOOM1.WAD",
-        "Projects/DOOM-Saturn/cd/DOOM.WAD",
+        "cd/DOOM.WAD",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cd", "DOOM1.WAD"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cd", "DOOM.WAD"),
         "Projects/DOOM-Saturn/cd/DOOM1.WAD",
-        "../DOOM-Saturn/cd/DOOM.WAD",
+        "Projects/DOOM-Saturn/cd/DOOM.WAD",
         "../DOOM-Saturn/cd/DOOM1.WAD",
+        "../DOOM-Saturn/cd/DOOM.WAD",
         "../../DOOM.WAD",
         "../../DOOM1.WAD",
         "../DOOM.WAD",
         "../DOOM1.WAD",
         "DOOM.WAD",
         "DOOM1.WAD",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cd", "DOOM.WAD"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cd", "DOOM1.WAD"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "DOOM.WAD"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "DOOM1.WAD")
     ]:
@@ -810,7 +810,7 @@ def main():
             write_flt_file(bm, out_file)
             out_stage = os.path.join(stage_dir, f"{m}.FLT")
             write_flt_file(bm, out_stage)
-            if os.path.exists(win_cd_dir):
+            if os.path.exists(os.path.join(win_cd_dir, os.path.basename(WAD_PATH))):
                 out_win = os.path.join(win_cd_dir, f"{m}.FLT")
                 write_flt_file(bm, out_win)
 

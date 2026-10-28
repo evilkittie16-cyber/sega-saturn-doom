@@ -157,6 +157,7 @@ static unsigned int  hw_used;
 static unsigned int  hw_used_boot;
 static unsigned int  hw_size;
 static unsigned int  hram_used;
+static unsigned int  hram_used_boot;
 static int           hram_ok;
 
 #ifndef SATURN_WIN32
@@ -454,6 +455,7 @@ void Saturn_R_InitData(void)
     D_memset(sprite_gguard, 0, numsprites);
 
     hw_used_boot = hw_used;
+    hram_used_boot = hram_used;
 #ifdef SATURN_WIN32
     s_win32_hram_used_boot = s_win32_hram_used;
 #endif
@@ -885,7 +887,7 @@ void Saturn_CacheZoneReset(void)
 #else
     hw_used = hw_used_boot;
 #endif
-    hram_used = 0;
+    hram_used = hram_used_boot;
     if (tex_cache)
         D_memset(tex_cache, 0, numtextures * sizeof(byte *));
     if (flat_cache)
@@ -906,9 +908,9 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
     if (blob[0] != 'M' || blob[1] != 'T' || blob[2] != 'E' || blob[3] != 'X' || (((unsigned)blob[4] << 8) | blob[5]) != 1) return 0;
     
     unsigned count = ((unsigned)blob[6] << 8) | blob[7];
-    hram_used = 0;
+    hram_used = hram_used_boot;
     uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
-    if (ge > SATURN_HRAM_BASE) hram_used = ge - SATURN_HRAM_BASE;
+    if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
     if (tex_cache) D_memset(tex_cache, 0, numtextures * sizeof(byte *));
 
     for (unsigned i = 0; i < count; i++)

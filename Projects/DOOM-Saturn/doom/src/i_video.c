@@ -769,9 +769,9 @@ static void saturn_vdp2_copy_back(void)
     {
         if (saturn_game_started)
         {
-            if (sky_active)
+            if (sky_active || saturn_view_latch > 0)
             {
-                int max_sky = saturn_hw_is_sky ? st_y : 108;
+                int max_sky = (saturn_hw_is_sky || saturn_view_latch > 0) ? st_y : 108;
                 if (max_sky > st_y) max_sky = st_y;
                 const unsigned char *s = src;
                 volatile unsigned char *d = dst + SATURN_BORDER_X;

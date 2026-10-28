@@ -1955,6 +1955,9 @@ void Saturn_HW_RenderInit(void)
     Saturn_Vdp1_LockPreloadedFlats();
     saturn_hw_sky_latch = 0;
     saturn_hw_sky_prime = 0;
+    saturn_view_latch   = 2;
+    if (I_VideoBuffer)
+        D_memset(I_VideoBuffer, 0xF7, 320 * 168);
 
     if (!hw_vcache)
         hw_vcache = (saturn_vcache_t *)SATURN_WRAM_L_PILLARS_ADDR;

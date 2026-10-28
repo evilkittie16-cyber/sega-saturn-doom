@@ -118,10 +118,15 @@ static void draw_title_bg(void)
 
 static void menu_free_big_patches(void)
 {
+    extern int saturn_view_latch;
+    extern void Saturn_HW_ForceSkyRepaint(void);
     if (s_title_patch)  { Z_Free(s_title_patch);  s_title_patch  = 0; }
     if (s_help1_patch)  { Z_Free(s_help1_patch);  s_help1_patch  = 0; }
     if (s_help2_patch)  { Z_Free(s_help2_patch);  s_help2_patch  = 0; }
     if (s_credit_patch) { Z_Free(s_credit_patch); s_credit_patch = 0; }
+    Saturn_ClearRect(0, 0, DOOM_SCREENWIDTH, 168, 0xF7);
+    saturn_view_latch = 2;
+    Saturn_HW_ForceSkyRepaint();
 }
 
 int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)

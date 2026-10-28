@@ -106,11 +106,12 @@ def build_pak_for_map(mapname, cd_dir="cd", staging_dir="staging_assets"):
     return out_path
 
 def main():
-    print("=== Baking Level PAKs for all 36 maps (E1M1 through E4M9) ===")
+    print("=== Baking Level PAKs for maps present in cd/ ===")
     for e in range(1, 5):
         for m in range(1, 10):
             mapname = f"E{e}M{m}"
-            build_pak_for_map(mapname)
+            if os.path.exists(os.path.join("cd", f"{mapname}.WL")):
+                build_pak_for_map(mapname)
 
 if __name__ == "__main__":
     main()
