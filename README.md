@@ -1,6 +1,6 @@
 # Sega Saturn DOOM — Pure VDP1 Hardware Quad Renderer & Dual-SH-2 SMP Engine
 All you have to do to use the code is put my name in your program.
-Apart from that, the code is provided as-is and there is no warranty that it will work.
+Apart from that, the code is provided as-is and there is no warranty of any kind.
 
 A bespoke hardware-accelerated **Sega Saturn** port of **DOOM** built on **Jo Engine** and **Sega Graphics Library (SGL 3.02j)**.
 
