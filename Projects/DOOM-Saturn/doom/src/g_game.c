@@ -226,7 +226,6 @@ void Saturn_G_Display(void)
      * Replaces CPU software raycasting with VDP1 distorted quads,
      * hardware DIVU pipelining, and VDP2 background planes. */
     extern void Saturn_HW_RenderPlayerView(int displayplayer);
-    extern void Saturn_PSprite_Draw(void);
     extern void Saturn_HUD_Draw(void);
     extern int  saturn_game_started;
 

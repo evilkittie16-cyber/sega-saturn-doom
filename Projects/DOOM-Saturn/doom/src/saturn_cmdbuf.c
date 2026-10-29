@@ -25,6 +25,7 @@ volatile uint16_t saturn_cmd_m_count = 0;
 volatile uint16_t saturn_cmd_s_count = 0;
 volatile uint16_t saturn_cmd_w_count = 0;
 int saturn_visit_count = 0;
+uint8_t saturn_cmd_m_needs_ytrim = 0;
 
 uint32_t saturn_vdp1_bus_cmd_bytes = 0;
 uint32_t saturn_vdp1_bus_tex_bytes = 0;
@@ -88,6 +89,7 @@ void Saturn_CmdBuf_Reset(void)
     saturn_cmd_s_count = 0;
     saturn_cmd_w_count = 0;
     saturn_visit_count = 0;
+    saturn_cmd_m_needs_ytrim = 0;
 }
 
 #ifdef __GNUC__
@@ -165,21 +167,23 @@ CMDBUF_INLINE uint32_t *copy_quads_32(uint32_t *dst, const uint32_t *src, int co
     }
     return dst;
 #else
-    while (count-- > 0)
+    if (count > 0)
     {
         __asm__ volatile (
-            "mov.l  @%0+, r0 \n\t"  "mov.l  @%0+, r1 \n\t"
-            "mov.l  @%0+, r2 \n\t"  "mov.l  @%0+, r3 \n\t"
-            "mov.l  @%0+, r4 \n\t"  "mov.l  @%0+, r5 \n\t"
-            "mov.l  @%0+, r6 \n\t"  "mov.l  @%0+, r7 \n\t"
-            
-            "mov.l  r0, @%1       \n\t" "mov.l  r1, @(4, %1)  \n\t"
-            "mov.l  r2, @(8, %1)  \n\t" "mov.l  r3, @(12, %1) \n\t"
-            "mov.l  r4, @(16, %1) \n\t" "mov.l  r5, @(20, %1) \n\t"
-            "mov.l  r6, @(24, %1) \n\t" "mov.l  r7, @(28, %1) \n\t"
-            "add    #32, %1       \n\t" 
-            : "+r" (src), "+r" (dst)
-            :: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "memory"
+            "1:                   \n\t"
+            "mov.l  @%0+, r0      \n\t"  "mov.l  @%0+, r1      \n\t"
+            "mov.l  @%0+, r2      \n\t"  "mov.l  @%0+, r3      \n\t"
+            "mov.l  @%0+, r4      \n\t"  "mov.l  @%0+, r5      \n\t"
+            "mov.l  @%0+, r6      \n\t"  "mov.l  @%0+, r7      \n\t"
+            "mov.l  r0, @%1       \n\t"  "mov.l  r1, @(4, %1)  \n\t"
+            "mov.l  r2, @(8, %1)  \n\t"  "mov.l  r3, @(12, %1) \n\t"
+            "mov.l  r4, @(16, %1) \n\t"  "mov.l  r5, @(20, %1) \n\t"
+            "mov.l  r6, @(24, %1) \n\t"  "mov.l  r7, @(28, %1) \n\t"
+            "dt     %2            \n\t"
+            "bf/s   1b            \n\t"
+            "add    #32, %1       \n\t"
+            : "+r" (src), "+r" (dst), "+r" (count)
+            :: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "t", "memory"
         );
     }
     return dst;
@@ -257,7 +261,7 @@ CMDBUF_NOINLINE void Saturn_CmdBuf_TrimWallY(uint32_t *c32)
     const unsigned int *oclut = (const unsigned int *)SATURN_WRAM_L_DIVLUT_ADDR;
     int modified = 0;
 
-    if (yLt < -3 && yRt < -3)
+    if (yLt < -8 && yRt < -8)
     {
         int k_a = (int)((((uint32_t)(-1 - yLt) * (uint32_t)rows) * cmdbuf_inv_dx(dya, oclut)) >> 16);
         int k_b = (int)((((uint32_t)(-1 - yRt) * (uint32_t)rows) * cmdbuf_inv_dx(dyb, oclut)) >> 16);
@@ -266,8 +270,8 @@ CMDBUF_NOINLINE void Saturn_CmdBuf_TrimWallY(uint32_t *c32)
         if (k > 0)
         {
             uint32_t inv_r = cmdbuf_inv_dx(rows, oclut);
-            yLt += (int)((((uint32_t)k * (uint32_t)dya) * inv_r) >> 16);
-            yRt += (int)((((uint32_t)k * (uint32_t)dyb) * inv_r) >> 16);
+            yLt += (int)((((uint32_t)k * (uint32_t)dya) * inv_r + 32768u) >> 16);
+            yRt += (int)((((uint32_t)k * (uint32_t)dyb) * inv_r + 32768u) >> 16);
             srca += k * stride;
             rows -= k;
             dya = yLb - yLt;
@@ -276,7 +280,7 @@ CMDBUF_NOINLINE void Saturn_CmdBuf_TrimWallY(uint32_t *c32)
         }
     }
 
-    if (yLb > CMDBUF_VH + 3 && yRb > CMDBUF_VH + 3 && rows > 4 && dya > 6 && dyb > 6)
+    if (yLb > CMDBUF_VH + 8 && yRb > CMDBUF_VH + 8 && rows > 4 && dya > 6 && dyb > 6)
     {
         int k_a = (int)((((uint32_t)(yLb - (CMDBUF_VH + 1)) * (uint32_t)rows) * cmdbuf_inv_dx(dya, oclut)) >> 16);
         int k_b = (int)((((uint32_t)(yRb - (CMDBUF_VH + 1)) * (uint32_t)rows) * cmdbuf_inv_dx(dyb, oclut)) >> 16);
@@ -285,8 +289,8 @@ CMDBUF_NOINLINE void Saturn_CmdBuf_TrimWallY(uint32_t *c32)
         if (k > 0)
         {
             uint32_t inv_r = cmdbuf_inv_dx(rows, oclut);
-            yLb -= (int)((((uint32_t)k * (uint32_t)dya) * inv_r) >> 16);
-            yRb -= (int)((((uint32_t)k * (uint32_t)dyb) * inv_r) >> 16);
+            yLb -= (int)((((uint32_t)k * (uint32_t)dya) * inv_r + 32768u) >> 16);
+            yRb -= (int)((((uint32_t)k * (uint32_t)dyb) * inv_r + 32768u) >> 16);
             rows -= k;
             modified = 1;
         }
@@ -336,28 +340,6 @@ static inline uint32_t cmdbuf_quad_dda(const uint32_t *c32)
 
 CMDBUF_HOT_O2 void Saturn_CmdBuf_CullOccluded(void)
 {
-    extern int saturn_view_w;
-    extern int saturn_view_h;
-    uint32_t m_count = saturn_cmd_m_count;
-    if (m_count > 0 && saturn_view_w <= CMDBUF_VW && saturn_view_h <= CMDBUF_VH)
-    {
-        /* Trim extreme off-screen vertical wall coordinates while saturn_cmd_m is warm in L1 */
-        uint32_t *c32 = (uint32_t *)saturn_cmd_m;
-        uint32_t *m_end = c32 + (m_count << 3);
-        for (; c32 != m_end; c32 += 8)
-        {
-            uint32_t ctrl = c32[0] >> 16;
-            if ((ctrl & 0x802Fu) != 0x0002u)
-                continue;
-            int yLt = CMD_YA(c32), yRt = CMD_YB(c32);
-            int yLb = CMD_YD(c32), yRb = CMD_YC(c32);
-            if (__builtin_expect((yLt < -3 && yRt < -3) || (yLb > CMDBUF_VH + 3 && yRb > CMDBUF_VH + 3), 0))
-            {
-                Saturn_CmdBuf_TrimWallY(c32);
-            }
-        }
-    }
-
 #ifndef SATURN_WIN32
     if (saturn_visit_count > 0 || saturn_cmd_s_count > 0)
     {
@@ -367,6 +349,29 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_CullOccluded(void)
         ((void (*)(void))((uintptr_t)_hw_purge_cache | SATURN_WRAM_H_UNCACHED))();
     }
 #endif
+
+    extern int saturn_view_w;
+    extern int saturn_view_h;
+    uint32_t m_count = saturn_cmd_m_count;
+    if (__builtin_expect(saturn_cmd_m_needs_ytrim != 0, 0) &&
+        m_count > 0 && saturn_view_w <= CMDBUF_VW && saturn_view_h <= CMDBUF_VH)
+    {
+        /* Trim extreme off-screen vertical wall coordinates */
+        uint32_t *c32 = (uint32_t *)saturn_cmd_m;
+        uint32_t *m_end = c32 + (m_count << 3);
+        for (; c32 != m_end; c32 += 8)
+        {
+            uint32_t ctrl = c32[0] >> 16;
+            if ((ctrl & 0x802Fu) != 0x0002u)
+                continue;
+            int yLt = CMD_YA(c32), yRt = CMD_YB(c32);
+            int yLb = CMD_YD(c32), yRb = CMD_YC(c32);
+            if (__builtin_expect((yLt < -8 && yRt < -8) || (yLb > CMDBUF_VH + 8 && yRb > CMDBUF_VH + 8), 0))
+            {
+                Saturn_CmdBuf_TrimWallY(c32);
+            }
+        }
+    }
 }
 
 unsigned int Saturn_CmdBuf_ComputeDDA(void)
@@ -436,13 +441,29 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
      * exact back-to-front topological order. Never re-sort subsectors by bbox
      * centers, which breaks BSP plane partitioning for concave/large sectors! */
     const uint32_t * const vram_limit = (const uint32_t *)(SATURN_VDP1_VRAM + 0xFFE0u);
-    for (int i = saturn_visit_count - 1; i >= 0; i--)
+    if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= 2040u, 1))
     {
-        const sub_range_t *r = &ranges[i];
-        if (r->s_count > 0)
-            vram32 = deliver_range_32(vram32, vram_limit, cmd_s_base + ((uint32_t)r->s_start << 3), r->s_count);
-        if (r->m_count > 0)
-            vram32 = deliver_range_32(vram32, vram_limit, cmd_m + ((uint32_t)r->m_start << 3), r->m_count);
+        for (int i = saturn_visit_count - 1; i >= 0; i--)
+        {
+            const sub_range_t *r = &ranges[i];
+            int sc = r->s_count;
+            if (sc > 0)
+                vram32 = copy_quads_32(vram32, cmd_s_base + ((uint32_t)r->s_start << 3), sc);
+            int mc = r->m_count;
+            if (mc > 0)
+                vram32 = copy_quads_32(vram32, cmd_m + ((uint32_t)r->m_start << 3), mc);
+        }
+    }
+    else
+    {
+        for (int i = saturn_visit_count - 1; i >= 0; i--)
+        {
+            const sub_range_t *r = &ranges[i];
+            if (r->s_count > 0)
+                vram32 = deliver_range_32(vram32, vram_limit, cmd_s_base + ((uint32_t)r->s_start << 3), r->s_count);
+            if (r->m_count > 0)
+                vram32 = deliver_range_32(vram32, vram_limit, cmd_m + ((uint32_t)r->m_start << 3), r->m_count);
+        }
     }
 
     /* 3. Deliver weapon / psprite quads last (on top of all 3D geometry) */

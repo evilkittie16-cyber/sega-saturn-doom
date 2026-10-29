@@ -23,6 +23,7 @@
 #define SEG_FLAG_MID      0x08
 #define SEG_PEG_BOTTOM         0x10  /* Bottom-anchored: v_bot = th + rowoff, v_top = v_bot - wall_h */
 #define SEG_PEG_LOWER_UNPEGGED 0x20  /* Lower unpegged: v_top = (front.ceil - back.floor) + rowoff */
+#define SEG_FLAG_PORTAL_DONE   0x80  /* Portal aperture already recorded by earlier seg on same line */
 
 /* Disc Header: 32 bytes (Big-endian) */
 typedef struct {
@@ -42,9 +43,21 @@ typedef struct {
     uint16_t pillar_start;
     uint16_t num_segs;
     uint16_t seg_start;
-    uint16_t num_dsp_batches;   /* SCU-DSP batch count (<= 32 pillars per batch, Trap 10) */
-    uint16_t max_batch_size;    /* Max pillars per batch (<= 32) */
-    uint32_t reserved;          /* Alignment padding to 16 bytes */
+    union {
+        uint16_t num_dsp_batches;   /* Disc: SCU-DSP batch count */
+        uint16_t portal_first;      /* Runtime: first unbaked portal seg index */
+    };
+    union {
+        uint16_t max_batch_size;    /* Disc: Max pillars per batch */
+        uint16_t portal_count;      /* Runtime: unbaked portal seg count */
+    };
+    union {
+        uint32_t reserved;          /* Alignment padding to 16 bytes */
+        struct {
+            int16_t  max_bsec0;     /* Runtime: highest backsector 0 if lower-only sky subsector (-1 if none) */
+            int16_t  max_bsec1;     /* Runtime: highest backsector 1 if lower-only sky subsector */
+        };
+    };
 } saturn_wl_subsector_t;
 
 /* 2D Floorplan Pillar: 4 bytes (int16 x, int16 z) */
@@ -70,22 +83,18 @@ typedef struct {
     uint16_t reserved;             /* Padding for 32-byte alignment */
 } __attribute__((aligned(4))) packed_seg_disc_t;
 
-/* Runtime In-Memory Format (Swizzled with live 32-bit pointers, 32 bytes = 2 cache lines) */
+/* Runtime In-Memory Format (16 bytes = 1 single SH-2 L1 cache line) */
 typedef struct {
-    uint16_t pillar_idx[2];        /* [0]=start pillar, [1]=end pillar */
-    uint8_t  baked_light;          /* Sector light + fake contrast */
-    uint8_t  flags;                /* SEG_FLAG_* */
-    uint16_t tex_64;               /* VDP1 texture index for 64-wide */
-    int16_t  mid_static_v_offset;  /* Pre-calculated vertical texture offset */
-    uint16_t u_start;              /* Texture U start */
-    uint16_t u_span;               /* Segment width */
-    uint16_t inv_u_span;           /* Precalculated 16.16 reciprocal (65536 / u_span) */
-    int16_t  back_sec_idx;         /* Back sector index for 2-sided portal, or -1 if 1-sided */
-    int16_t  pad0;                 /* Pad to 32 bytes (2 x 16-byte SH-2 cache lines) */
-    fixed_t  *dynamic_top_z_ptr;    /* Live pointer: &sectors[top_sec].ceilingheight */
-    fixed_t  *dynamic_bottom_z_ptr; /* Live pointer: &sectors[bot_sec].floorheight */
-    fixed_t  *mid_peg_height_ptr;   /* Live pointer: &sectors[peg_sec].floorheight or ceilingheight */
-} __attribute__((aligned(4))) baked_seg_t;
+    uint8_t  pillar_idx[2];        /* 2B: [0]=start pillar, [1]=end pillar */
+    uint8_t  baked_light;          /* 1B: Sector light + fake contrast */
+    uint8_t  flags;                /* 1B: SEG_FLAG_* */
+    uint16_t tex_64;               /* 2B: VDP1 texture index for 64-wide */
+    int16_t  mid_static_v_offset;  /* 2B: Pre-calculated vertical texture offset */
+    uint16_t u_start;              /* 2B: Texture U start */
+    uint16_t u_span;               /* 2B: Segment width */
+    uint16_t inv_u_span;           /* 2B: Precalculated 16.16 reciprocal (65536 / u_span) */
+    int16_t  back_sec_idx;         /* 2B: Back sector index for 2-sided portal, or -1 if 1-sided */
+} __attribute__((aligned(16))) baked_seg_t;
 
 /* Engine status flags */
 extern int saturn_baked_segs_active;   /* Legacy SEGS active */
@@ -113,5 +122,7 @@ extern const saturn_wl_pillar_t    *saturn_baked_wall_pillars;
 extern const uint8_t               *saturn_baked_wall_pillar_frac;
 extern baked_seg_t                 *saturn_baked_wall_segs;
 extern int                          saturn_baked_wall_num_subsectors;
+extern int                          saturn_baked_wall_num_pillars;
+extern int                          saturn_baked_wall_num_segs;
 
 #endif /* SATURN_BAKED_SEGS_H */

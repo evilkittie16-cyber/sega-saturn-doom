@@ -503,7 +503,8 @@ doom/src/saturn_vdp1.o: doom/src/saturn_vdp1.c
 doom/src/saturn_cmdbuf.o: doom/src/saturn_cmdbuf.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
 
-doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c
+SATURN_HW_DEPS = doom/src/saturn_hw_internal.h doom/src/saturn_hw_occl.c doom/src/saturn_hw_math.h doom/src/saturn_hw_sky.c doom/src/saturn_hw_sprites.c doom/src/saturn_hw_flats.c doom/src/saturn_hw_walls.c
+doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c $(SATURN_HW_DEPS)
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
 
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c

@@ -133,13 +133,10 @@ static inline unsigned short Saturn_ReadFRT(void)
 {
     volatile unsigned char *frt = (volatile unsigned char *)0xFFFFFE12u;
     unsigned short hi0 = frt[0];
-    __asm__ volatile("" ::: "memory");
     unsigned short lo = frt[1];
-    __asm__ volatile("" ::: "memory");
     unsigned short hi1 = frt[0];
     if (__builtin_expect(hi0 != hi1, 0))
     {
-        __asm__ volatile("" ::: "memory");
         lo = frt[1];
         hi0 = hi1;
     }

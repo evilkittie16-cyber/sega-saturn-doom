@@ -1864,19 +1864,17 @@ void Saturn_Vdp1Wall_Frame(void)
             do {
                 vc0 = saturn_vbl_count;
                 unsigned short hi = frt[0];
-                __asm__ volatile("" ::: "memory");
                 unsigned short lo = frt[1];
                 tc0 = (unsigned short)((hi << 8) | lo);
             } while (__builtin_expect(saturn_vbl_count != vc0, 0));
             unsigned guard = 12000u;
             /* SCU VBlank-IN fires at Scanline 224 (14.20 ms), while VDP1
              * FRAME_CHANGE (VBlank-OUT) is at Scanline 262 (16.67 ms — 2.47 ms later).
-             * Each 32-NOP inner loop iteration is ~96 SH-2 cycles (~3.35 us), so
-             * vbl_grace = 600u allows VDP1 up to ~2.01 ms into VBlank (Scanline 255)
-             * to finish rasterizing while still leaving > 0.45 ms before Scanline 262
-             * so Saturn_CmdBuf_Deliver() (~0.35 ms) always completes before VBlank-OUT
-             * without colliding with single-ported VDP1 VRAM fetches. */
-            unsigned vbl_grace = 600u;
+             * Each 32-NOP inner loop iteration is ~140 SH-2 cycles (~4.9 us), so
+             * vbl_grace = 48u (~0.23 ms) gives VDP1 a brief window if CEF is about
+             * to assert without burning through VBlank (Scanlines 224..262) when
+             * V1_EDSR has already been cleared at VBlank-IN/FRAME_CHANGE. */
+            unsigned vbl_grace = 48u;
 
             while (!(V1_EDSR & 2u) && --guard)
             {
@@ -1910,7 +1908,6 @@ void Saturn_Vdp1Wall_Frame(void)
             do {
                 vd0 = saturn_vbl_count;
                 unsigned short hi = frt[0];
-                __asm__ volatile("" ::: "memory");
                 unsigned short lo = frt[1];
                 td0 = (unsigned short)((hi << 8) | lo);
             } while (__builtin_expect(saturn_vbl_count != vd0, 0));

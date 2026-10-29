@@ -28,13 +28,16 @@ const saturn_wl_pillar_t            *saturn_baked_wall_pillars    = NULL;
 const uint8_t                       *saturn_baked_wall_pillar_frac = NULL;
 baked_seg_t                         *saturn_baked_wall_segs       = NULL;
 int                                  saturn_baked_wall_num_subsectors = 0;
-static int                           cur_wl_num_segs       = 0;
+int                                  saturn_baked_wall_num_pillars = 0;
+int                                  saturn_baked_wall_num_segs    = 0;
 
 #define cur_wl_subsectors     saturn_baked_wall_subsectors
 #define cur_wl_pillars        saturn_baked_wall_pillars
 #define cur_wl_pillar_frac    saturn_baked_wall_pillar_frac
 #define cur_swizzled_segs     saturn_baked_wall_segs
 #define cur_wl_num_subsectors saturn_baked_wall_num_subsectors
+#define cur_wl_num_pillars    saturn_baked_wall_num_pillars
+#define cur_wl_num_segs       saturn_baked_wall_num_segs
 
 #ifdef SATURN_WIN32
 #include <stdlib.h> /* For _byteswap macros */
@@ -132,6 +135,7 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
     cur_wl_pillar_frac    = NULL;
     cur_swizzled_segs     = NULL;
     cur_wl_num_subsectors = 0;
+    cur_wl_num_pillars    = 0;
     cur_wl_num_segs       = 0;
 
     saturn_wall_parse_dbg = 1;
@@ -235,33 +239,33 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
     num_segs = (hdr->total_size - hdr->ofs_segs) / sizeof(packed_seg_disc_t);
     cur_wl_num_segs = (int)num_segs;
 
-    /* Swizzled segs reside directly in fast WRAM-L right after the disc blob */
-    dst_segs = (baked_seg_t *)(((uint32_t)data + hdr->total_size + 15) & ~15);
+    /* Swizzle 32-byte disc segs in-place into 16-byte runtime segs at ofs_segs */
+    dst_segs = (baked_seg_t *)((byte *)data + hdr->ofs_segs);
     cur_swizzled_segs = dst_segs;
 
     /* Seam fix: 1/16-unit pillar fractions live between pillars and segs */
     {
         uint32_t of = hdr->reserved[0];
-        uint8_t *zend = (uint8_t *)(dst_segs + num_segs);
+        uint32_t pil_end = (of > hdr->ofs_pillars && of < hdr->ofs_segs) ? of : hdr->ofs_segs;
+        cur_wl_num_pillars = (int)((pil_end - hdr->ofs_pillars) / sizeof(saturn_wl_pillar_t));
+        uint8_t *zend = (uint8_t *)(((uintptr_t)(dst_segs + num_segs) + 15u) & ~(uintptr_t)15u);
         if (of > hdr->ofs_pillars && of < hdr->ofs_segs)
             cur_wl_pillar_frac = (const uint8_t *)data + of;
         else
         {
             uint32_t np = (hdr->ofs_segs - hdr->ofs_pillars) / sizeof(saturn_wl_pillar_t);
-            
-            /* CRITICAL FIX: Bounds check BEFORE memset to prevent memory overwrite */
-            if ((uint32_t)((zend + np) - (uint8_t *)data) > WRAM_L_SEG_CAP)
+            uint8_t *fend = (uint8_t *)(((uintptr_t)data + hdr->total_size + 15u) & ~(uintptr_t)15u);
+            if ((uint32_t)((fend + np) - (uint8_t *)data) > WRAM_L_SEG_CAP)
             {
                 saturn_wall_parse_dbg = -5;
                 cur_swizzled_segs = NULL;
                 return 0;
             }
-            
-            memset(zend, 0, np);
-            cur_wl_pillar_frac = zend;
-            zend += np;
+            memset(fend, 0, np);
+            cur_wl_pillar_frac = fend;
+            zend = fend + np;
         }
-        
+
         if ((uint32_t)(zend - (uint8_t *)data) > WRAM_L_SEG_CAP)
         {
             saturn_wall_parse_dbg = -5;
@@ -271,107 +275,57 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
         saturn_wram_l_geom_end = zend;   /* texture tier starts above this */
     }
 
-    /* Swizzle 16-bit disc sector indices to live 32-bit RAM pointers (Trap 1 Resolution) */
+    /* Swizzle 32-byte disc segs into compact 16-byte single-cache-line runtime segs */
     for (i = 0; i < num_segs; i++)
     {
-        dst_segs[i].pillar_idx[0] = disc_segs[i].pillar_idx[0];
-        dst_segs[i].pillar_idx[1] = disc_segs[i].pillar_idx[4]; /* Endpoint 1 (swizzled from disc p4) */
-
-        dst_segs[i].baked_light = disc_segs[i].baked_light;
-        dst_segs[i].flags       = disc_segs[i].flags;
-
-        dst_segs[i].tex_64 = disc_segs[i].tex_64;
-        dst_segs[i].pad0   = 0;
-
-        dst_segs[i].mid_static_v_offset = disc_segs[i].mid_static_v_offset;
-        dst_segs[i].u_start             = disc_segs[i].u_start;
-        uint32_t us = disc_segs[i].u_span;
-        dst_segs[i].u_span              = (uint16_t)us;
-        
-        /* PERFORMANCE FIX: Fast lookup/shift to avoid slow SH-2 division stall */
-        dst_segs[i].inv_u_span = (us == 64) ? 1024 : 
-                                 (us == 32) ? 2048 : 
-                                 (us == 16) ? 4096 : 
-                                 (us == 8)  ? 8192 : 
-                                 (us > 0)   ? (uint16_t)(65536u / us) : 0;
-                                 
-        dst_segs[i].back_sec_idx        = -1;
+        const packed_seg_disc_t ds = disc_segs[i];
+        baked_seg_t *dst = &dst_segs[i];
+        uint8_t flags = ds.flags;
+        int16_t bsec_idx = -1;
 
         if (sectors && numsectors > 0)
         {
-            if (disc_segs[i].flags & SEG_FLAG_UPPER)
+            if (flags & SEG_FLAG_UPPER)
             {
-                uint16_t tsec = disc_segs[i].top_sec;
-                uint16_t bsec = disc_segs[i].bot_sec;
+                uint16_t tsec = ds.top_sec;
+                uint16_t bsec = ds.bot_sec;
 
                 /* Standard DOOM sky-hack: suppress upper wall if both front and back have sky ceilings */
-                if (tsec < (uint16_t)numsectors && bsec < (uint16_t)numsectors &&
-                    (int8_t)sectors[tsec].ceilingpic == -1 &&
-                    (int8_t)sectors[bsec].ceilingpic == -1)
+                if (!(tsec < (uint16_t)numsectors && bsec < (uint16_t)numsectors &&
+                      (int8_t)sectors[tsec].ceilingpic == -1 &&
+                      (int8_t)sectors[bsec].ceilingpic == -1) &&
+                    bsec < (uint16_t)numsectors)
                 {
-                    dst_segs[i].dynamic_top_z_ptr    = NULL;
-                    dst_segs[i].dynamic_bottom_z_ptr = NULL;
-                    dst_segs[i].back_sec_idx         = -1;
-                    dst_segs[i].flags                = 0;
-                    continue;
+                    bsec_idx = (int16_t)bsec;
                 }
-
-                dst_segs[i].dynamic_top_z_ptr = (tsec < (uint16_t)numsectors)
-                    ? &sectors[tsec].ceilingheight
-                    : &sectors[0].ceilingheight;
-
-                dst_segs[i].dynamic_bottom_z_ptr = (bsec < (uint16_t)numsectors)
-                    ? &sectors[bsec].ceilingheight
-                    : &sectors[0].ceilingheight;
-
-                dst_segs[i].back_sec_idx = (bsec < (uint16_t)numsectors) ? (int16_t)bsec : -1;
             }
-            else if (disc_segs[i].flags & SEG_FLAG_LOWER)
+            else if (flags & SEG_FLAG_LOWER)
             {
-                dst_segs[i].dynamic_top_z_ptr = (disc_segs[i].top_sec < (uint16_t)numsectors)
-                    ? &sectors[disc_segs[i].top_sec].floorheight
-                    : &sectors[0].floorheight;
-
-                dst_segs[i].dynamic_bottom_z_ptr = (disc_segs[i].bot_sec < (uint16_t)numsectors)
-                    ? &sectors[disc_segs[i].bot_sec].floorheight
-                    : &sectors[0].floorheight;
-
-                dst_segs[i].back_sec_idx = (disc_segs[i].top_sec < (uint16_t)numsectors) ? (int16_t)disc_segs[i].top_sec : -1;
-            }
-            else
-            {
-                dst_segs[i].dynamic_top_z_ptr = (disc_segs[i].top_sec < (uint16_t)numsectors)
-                    ? &sectors[disc_segs[i].top_sec].ceilingheight
-                    : &sectors[0].ceilingheight;
-
-                dst_segs[i].dynamic_bottom_z_ptr = (disc_segs[i].bot_sec < (uint16_t)numsectors)
-                    ? &sectors[disc_segs[i].bot_sec].floorheight
-                    : &sectors[0].floorheight;
-
-                dst_segs[i].back_sec_idx = (disc_segs[i].flags & SEG_FLAG_MID)
-                    ? ((disc_segs[i].bot_sec < (uint16_t)numsectors) ? (int16_t)disc_segs[i].bot_sec : -1)
-                    : -1;
-            }
-
-            if (disc_segs[i].peg_sec < (uint16_t)numsectors)
-            {
-                dst_segs[i].mid_peg_height_ptr = (disc_segs[i].flags & SEG_PEG_LOWER_UNPEGGED)
-                    ? &sectors[disc_segs[i].peg_sec].ceilingheight
-                    : ((disc_segs[i].flags & SEG_PEG_BOTTOM)
-                        ? &sectors[disc_segs[i].peg_sec].floorheight
-                        : &sectors[disc_segs[i].peg_sec].ceilingheight);
-            }
-            else
-            {
-                dst_segs[i].mid_peg_height_ptr = &sectors[0].ceilingheight;
+                uint16_t tsec = ds.top_sec;
+                if (tsec < (uint16_t)numsectors)
+                    bsec_idx = (int16_t)tsec;
             }
         }
         else
         {
-            dst_segs[i].dynamic_top_z_ptr    = NULL;
-            dst_segs[i].dynamic_bottom_z_ptr = NULL;
-            dst_segs[i].mid_peg_height_ptr   = NULL;
+            flags = 0;
         }
+
+        uint32_t us = ds.u_span;
+        dst->pillar_idx[0]       = (uint8_t)ds.pillar_idx[0];
+        dst->pillar_idx[1]       = (uint8_t)ds.pillar_idx[4]; /* Endpoint 1 (swizzled from disc p4) */
+        dst->baked_light         = ds.baked_light;
+        dst->flags               = flags;
+        dst->tex_64              = ds.tex_64;
+        dst->mid_static_v_offset = ds.mid_static_v_offset;
+        dst->u_start             = ds.u_start;
+        dst->u_span              = (uint16_t)us;
+        dst->inv_u_span          = (us == 64) ? 1024 :
+                                   (us == 32) ? 2048 :
+                                   (us == 16) ? 4096 :
+                                   (us == 8)  ? 8192 :
+                                   (us > 0)   ? (uint16_t)(65536u / us) : 0;
+        dst->back_sec_idx        = bsec_idx;
     }
 
     saturn_baked_walls_active = 1;

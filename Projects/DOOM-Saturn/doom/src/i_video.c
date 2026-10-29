@@ -3996,6 +3996,7 @@ void I_FinishUpdate(void)
      * (z row), step 2 = flip NBG0 to it + hide NBG1, committed at the
      * vblank slSynch waits for (y row). */
     unsigned int v_pre_vdp1 = 0;
+    int          pre_vdp1_in_vbl = 0;
     {
         unsigned short tf;
         do {
@@ -4124,6 +4125,7 @@ void I_FinishUpdate(void)
                 pf_f0 = SAT_FRT();
             } while (__builtin_expect(saturn_vbl_count != pf_v0, 0));
             v_pre_vdp1 = pf_v0;
+            pre_vdp1_in_vbl = ((*(volatile unsigned short *)0x25F80004u) & 0x0008u) != 0;
             Saturn_Vdp1Wall_Frame();
             saturn_pf_acc[2] += Saturn_ProfSpan(pf_f0, pf_v0);
             /* (The 2026-09-06 CANARY row is retired: the VDP1 quad
@@ -4164,7 +4166,7 @@ void I_FinishUpdate(void)
                  * instead of waiting a redundant 16.67 ms VBlank! */
                 static unsigned int last_flip_vbl = 0xFFFFFFFFu;
                 int in_new_vblank = (v0 != last_flip_vbl) &&
-                                    (v0 != v_pre_vdp1 ||
+                                    (v0 != v_pre_vdp1 || pre_vdp1_in_vbl ||
                                      ((*(volatile unsigned short *)0x25F80004u) & 0x0008u) != 0);
                 if (!in_new_vblank)
                 {

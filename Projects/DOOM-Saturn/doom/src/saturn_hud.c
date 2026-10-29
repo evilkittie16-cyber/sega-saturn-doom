@@ -1028,6 +1028,7 @@ void Saturn_HUD_Draw(void)
         extern unsigned int saturn_hw_flat_lod_saved_quads;
         extern unsigned int saturn_hw_dda_steps;
         extern unsigned int Saturn_CmdBuf_ComputeDDA(void);
+#ifdef SATURN_WIN32
         if (perf_refreshed || saturn_hw_dda_steps == 0)
             Saturn_CmdBuf_ComputeDDA();
 
@@ -1067,12 +1068,20 @@ void Saturn_HUD_Draw(void)
         g_saturn_hud_diag.vdp1_copr = pf_copr;
         g_saturn_hud_diag.vdp1_dda_k = dda_k;
 
-#ifdef SATURN_WIN32
         if (saturn_show_fps && fps_val > 0)
 #else
         if (saturn_show_fps && fps_val > 0 && (stbar_dirty || perf_refreshed || (face_dirty && ST_BAR_Y >= 192)))
 #endif
         {
+#ifndef SATURN_WIN32
+            if (perf_refreshed || saturn_hw_dda_steps == 0)
+                Saturn_CmdBuf_ComputeDDA();
+            int bsp_ms = (int)(((saturn_hw_prof_bsp + half_ms) * cached_inv_per_ms) >> 20);
+            int seg_ms = (int)(((saturn_hw_prof_segs + half_ms) * cached_inv_per_ms) >> 20);
+            int slv_ms = (int)(((saturn_hw_prof_slave_wait + half_ms) * cached_inv_per_ms) >> 20);
+            int vdp_ms = pf_ms[2];
+            int dda_k  = (int)((((saturn_hw_dda_steps + 500u) >> 3) * 8389u) >> 20);
+#endif
             char buf[48];
             int  n = 0;
 

@@ -94,6 +94,7 @@ extern volatile uint16_t saturn_cmd_m_count;
 extern volatile uint16_t saturn_cmd_s_count;
 extern volatile uint16_t saturn_cmd_w_count;
 extern int saturn_visit_count;
+extern uint8_t saturn_cmd_m_needs_ytrim;
 
 void Saturn_CmdBuf_Init(void);
 void Saturn_CmdBuf_Reset(void);
