@@ -1764,7 +1764,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         int srca_mono = ctx->srca_mono;
         int srca_64   = ctx->srca_64;
         int th        = ctx->th;
-        if (((ctx->wall_h <= 16 && dx <= 16) || (dx <= 6 && p0->cz > (512 << FRACBITS))) &&
+        if (((ctx->wall_h <= 16 && dx <= 16 && u_span <= 16) || (dx <= 6 && p0->cz > (512 << FRACBITS))) &&
             (unsigned)u_start < (unsigned)tw)
         {
             mono_base_srca = srca + (int)(((unsigned)u_start >> 4) * (unsigned)(th << 1));
