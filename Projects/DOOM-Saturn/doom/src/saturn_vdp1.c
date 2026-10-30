@@ -1867,20 +1867,17 @@ void Saturn_Vdp1Wall_Frame(void)
                 unsigned short lo = frt[1];
                 tc0 = (unsigned short)((hi << 8) | lo);
             } while (__builtin_expect(saturn_vbl_count != vc0, 0));
-            unsigned guard = 12000u;
-            /* SCU VBlank-IN fires at Scanline 224 (14.20 ms), while VDP1
-             * FRAME_CHANGE (VBlank-OUT) is at Scanline 262 (16.67 ms — 2.47 ms later).
-             * Each 32-NOP inner loop iteration is ~140 SH-2 cycles (~4.9 us), so
-             * vbl_grace = 48u (~0.23 ms) gives VDP1 a brief window if CEF is about
-             * to assert without burning through VBlank (Scanlines 224..262) when
-             * V1_EDSR has already been cleared at VBlank-IN/FRAME_CHANGE. */
-            unsigned vbl_grace = 48u;
+            /* Wait for VDP1 CEF (bit 1 of V1_EDSR) before overwriting the
+             * command table in VDP1 VRAM. VDP1 clears CEF only at Scanline 262
+             * (VBlank-OUT / FRAME_CHANGE) when auto-draw (PTMR=2) starts walking
+             * Slot 0, and sets CEF=1 as soon as the 0x8000 END command is reached.
+             * Never break out early at Scanline 224 (VBlank-IN) while CEF==0, or
+             * Saturn_CmdBuf_Deliver() will overwrite the tail of the command table
+             * (foreground flats and player weapon) while VDP1 is still drawing! */
+            unsigned guard = 25000u;
 
             while (!(V1_EDSR & 2u) && --guard)
             {
-                if ((saturn_vbl_count != vc0 || ((*(volatile unsigned short *)0x25F80004u) & 0x0008u)) &&
-                    --vbl_grace == 0u)
-                    break;
                 /* Yield B-bus to VDP1 so status polling never steals VDP1 rasterizer cycles */
                 for (int w = 0; w < 32; w++)
                     __asm__ volatile("nop");

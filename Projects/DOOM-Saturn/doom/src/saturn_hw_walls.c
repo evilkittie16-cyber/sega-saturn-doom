@@ -667,8 +667,8 @@ next_strip_lin:
         s_ya0 = s_yb0;
         s_ya1 = s_yb1;
         cmd_w2_cur += cmd_w2_step;
-        if (cmd_w2_cur >= cmd_w2_end)
-            cmd_w2_cur = cmd_w2_base;
+        while (cmd_w2_cur >= cmd_w2_end)
+            cmd_w2_cur -= (uint32_t)num_strips * cmd_w2_step;
     }
 
     unsigned int l_quads  = lin_flags >> 16;
@@ -770,7 +770,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
         int coal_strips = 0;
         uint32_t emit_cmd2 = cmd_w2_cur;
         if (__builtin_expect((persp_flags & 256u) != 0, 0) &&
-            ((s & 3) == 0) && !(persp_flags & 16u) &&
+            ((cur_strip_idx & 3) == 0) && !(persp_flags & 16u) &&
             (((s + 4) << 4) <= u_end) &&
             s_px0 >= 0 && s_cz0 >= (192 << FRACBITS))
         {
@@ -778,10 +778,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
             if (end_cz3 >= (192 << FRACBITS))
             {
                 coal_strips = 4;
-                int blk = (s >> 2) & ((tw >> 6) - 1);
+                int blk = cur_strip_idx >> 2;
                 int emit_srca = (int)ctx->srca_mono + ((int)ctx->cur_v << 2) + blk * (th << 2);
                 emit_cmd2 = ((uint32_t)emit_srca << 16) | (4u << 8) | ((uint32_t)ctx->rows & 0xFFu);
                 cmd_w2_cur += cmd_w2_step * 3u;
+                cur_strip_idx += 3;
                 cur_cx1 += step_cx1 * 3;
                 cur_cz1 += step_cz1 * 3;
                 s += 3;
@@ -815,8 +816,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
 
         if (s_px1 > s_px0)
         {
-            if (__builtin_expect(coal_strips == 4 && s_px1 - s_px0 <= 16, 0))
-                emit_cmd2 = cmd_w2_cur - cmd_w2_step;
             uint32_t strip_cmd1 = ctx->cmd_header1;
             if (__builtin_expect((persp_flags & 2u) != 0, 0))
             {
@@ -901,9 +900,12 @@ next_strip_persp:
         s_ya0 = s_yb0;
         s_ya1 = s_yb1;
         s_cz0 = s_cz1;
+        cur_strip_idx++;
+        if (cur_strip_idx >= num_strips)
+            cur_strip_idx -= num_strips;
         cmd_w2_cur += cmd_w2_step;
-        if (cmd_w2_cur >= cmd_w2_end)
-            cmd_w2_cur = cmd_w2_base;
+        while (cmd_w2_cur >= cmd_w2_end)
+            cmd_w2_cur -= (uint32_t)num_strips * cmd_w2_step;
     }
 
     unsigned int l_quads = persp_flags >> 16;
@@ -933,17 +935,14 @@ HW_ALWAYS_INLINE int HW_NeedPerspectiveStrips(int dx, int u_span, fixed_t cz0, f
     if (tw <= 16) return 0;
     /* Distant walls: both ends > 512 units have negligible affine distortion */
     if (cz0 > (512 << FRACBITS) && cz1 > (512 << FRACBITS)) return 0;
-    /* Narrow on screen: < 28 pixels has negligible affine sag */
-    if (dx < 28) return 0;
+    /* Narrow on screen: < 16 pixels has negligible affine sag */
+    if (dx < 16) return 0;
     /* Perpendicular walls: < 12.5% depth change across the wall has minimal affine warping */
     fixed_t min_z = (cz0 < cz1) ? cz0 : cz1;
     fixed_t max_z = (cz0 > cz1) ? cz0 : cz1;
     if ((max_z - min_z) < (min_z >> 3)) return 0;
-    /* Don't subdivide if average strip is < 8 screen pixels wide */
-    if ((dx << 4) < (u_span * 8)) return 0;
-    /* Medium-to-far walls (min_z > 256): require >= 25% depth change */
-    if (min_z > (256 << FRACBITS) && (max_z - min_z) < (min_z >> 2))
-        return 0;
+    /* Don't subdivide if average strip is < 4 screen pixels wide */
+    if ((dx << 4) < (u_span * 4)) return 0;
     return 1;
 }
 
@@ -1277,12 +1276,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMultiBandBakedWall(hw_wall_emit_ctx_t *
         int dz_bot = dz_top - (band_h << FRACBITS);
 
         int bot_overlap = (rem_h <= band_h)
-            ? ((seg->flags & SEG_FLAG_UPPER) ? ((wall_h <= 16) ? 0 : 2) : ((wall_h <= 16) ? 0 : 1))
+            ? ((seg->flags & SEG_FLAG_UPPER) ? ((wall_h <= 16) ? 0 : 2) : 1)
             : 0;
 
-        HW_ProjYPair(HW_VIEW_CY, dz_bot, s_A, dz_bot, s_B, &ya1, &yb1);
-        ya1 += bot_overlap;
-        yb1 += bot_overlap;
+        int raw_ya1, raw_yb1;
+        HW_ProjYPair(HW_VIEW_CY, dz_bot, s_A, dz_bot, s_B, &raw_ya1, &raw_yb1);
+        ya1 = raw_ya1 + bot_overlap;
+        yb1 = raw_yb1 + bot_overlap;
 
         if (ctx->should_subdivide)
         {
@@ -1365,8 +1365,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMultiBandBakedWall(hw_wall_emit_ctx_t *
         top_overlap = 0;
         rem_h -= band_h;
         cur_v = (th > 0 && cur_v + band_h < th) ? (cur_v + band_h) : 0;
-        ya0 = ya1;
-        yb0 = yb1;
+        ya0 = raw_ya1;
+        yb0 = raw_yb1;
     }
 }
 static HW_NOINLINE HW_COLD_OS void HW_ClipPortalScales(
@@ -1598,12 +1598,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
     if (__builtin_expect(zb > 127u, 0)) zb = 127u;
     int k_shade = (int)(wall_zlight_cmdcolr_LUT[s_ptr->baked_light >> 4][zb] & 0xFF00u);
 
-    int tw = ctx->tw;
     uint32_t pmod = (s_ptr->flags & SEG_FLAG_MID)
         ? (((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)
         : ((PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu);
-    if (mono_tw == 32 && tw >= 64)
-        pmod &= ~PMOD_HSS;
     uint32_t cmd_header1 = (pmod << 16) | (uint32_t)k_shade;
 
     int th    = ctx->th;
@@ -1654,7 +1651,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
                 prev[1] == cmd_header1 && prev[2] == w2)
             {
                 int merged_dx = s_xb - (int)(int16_t)(prev[3] >> 16);
-                if (((w2 & 0x3F00u) == 0x0400u) && ctx->tw == 32 && ctx->srca_64 != ctx->srca && merged_dx <= 48)
+                if (((w2 & 0x3F00u) == 0x0400u) && ctx->tw == 32 && ctx->srca_64 != ctx->srca &&
+                    merged_dx <= 48 &&
+                    (unsigned int)(q_ya0 - q_yb0 + 3) <= 6u)
                 {
                     int srca_64 = ctx->srca_64;
                     int cv = ctx->cur_v;
@@ -1772,12 +1771,13 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         }
         else if (tw == 32 && u_start == 0)
         {
-            if ((u_span == 32 || dx <= 28) && srca_mono != srca)
+            if ((u_span == 32 || (dx <= 28 && (unsigned int)(ctx->ya0 - ctx->yb0 + 3) <= 6u)) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono;
                 mono_tw = 32;
             }
-            else if (u_span == 64 && srca_64 != srca)
+            else if (u_span == 64 && srca_64 != srca &&
+                     (unsigned int)(ctx->ya0 - ctx->yb0 + 3) <= 6u)
             {
                 mono_base_srca = srca_64;
                 mono_tw = 64;
@@ -1978,11 +1978,13 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
         return;
 
     int top_overlap = 1;
-    int bot_overlap = 0;
+    int bot_overlap = 1;
     if (__builtin_expect(ctx->wall_h > 16, 1))
         bot_overlap = (seg_flags & SEG_FLAG_UPPER) ? 2 : 1;
     else if (seg_flags & SEG_FLAG_LOWER)
         top_overlap = 0;
+    else if (seg_flags & SEG_FLAG_UPPER)
+        bot_overlap = 0;
     ya0 -= top_overlap;
     yb0 -= top_overlap;
     ya1 += bot_overlap;
