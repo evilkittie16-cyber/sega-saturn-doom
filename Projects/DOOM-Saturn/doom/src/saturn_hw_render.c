@@ -682,3 +682,49 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     }
 #endif
 }
+
+static HW_NOINLINE HW_COLD_OS uint32_t HW_SliceFlatQuadV(
+    int y0, int y1, int y2, int y3, uint32_t quad_size)
+{
+    const int y_top = -2;
+    const int y_bot = HW_VIEW_H + 8;
+    const int vcy   = HW_VIEW_CY;
+    int m_top = (y0 < y_top) | ((y1 < y_top) << 1) | ((y2 < y_top) << 2) | ((y3 < y_top) << 3);
+    int m_bot = (y0 > y_bot) | ((y1 > y_bot) << 1) | ((y2 > y_bot) << 2) | ((y3 > y_bot) << 3);
+
+    int m_v = 0, d_clip = 0, d_in = 0, d_out = 0;
+    if ((m_top == 3 || m_top == 12) && m_bot == 0)
+    {
+        m_v = m_top;
+        d_clip = vcy - y_top;
+        int y_01 = (y0 + y1) >> 1;
+        int y_23 = (y2 + y3) >> 1;
+        d_out = vcy - ((m_v == 3) ? y_01 : y_23);
+        d_in  = vcy - ((m_v == 3) ? y_23 : y_01);
+    }
+    else if ((m_bot == 3 || m_bot == 12) && m_top == 0)
+    {
+        m_v = m_bot;
+        d_clip = y_bot - vcy;
+        int y_01 = (y0 + y1) >> 1;
+        int y_23 = (y2 + y3) >> 1;
+        d_out = ((m_v == 3) ? y_01 : y_23) - vcy;
+        d_in  = ((m_v == 3) ? y_23 : y_01) - vcy;
+    }
+
+    if (m_v != 0 && d_in > 0 && d_clip > d_in && d_out > d_clip)
+    {
+        unsigned int num = (unsigned int)(d_clip - d_in) * (unsigned int)d_out;
+        unsigned int den = (unsigned int)(d_out - d_in) * (unsigned int)d_clip;
+        fixed_t t_keep = HW_ClampedFrac(num, den);
+        int base_v0   = (int)((quad_size >> 16) & 0x7Fu);
+        int quad_rows = (int)(quad_size & 0xFFu);
+        int new_rows  = ((quad_rows * (t_keep >> 8)) + 128) >> 8;
+        if (new_rows < 1) new_rows = 1;
+        else if (new_rows > quad_rows) new_rows = quad_rows;
+        if (m_v == 12)
+            base_v0 += (quad_rows - new_rows);
+        quad_size = (quad_size & ~0x007F00FFu) | ((uint32_t)base_v0 << 16) | (uint32_t)new_rows;
+    }
+    return quad_size;
+}

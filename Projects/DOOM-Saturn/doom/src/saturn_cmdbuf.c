@@ -340,23 +340,13 @@ static inline uint32_t cmdbuf_quad_dda(const uint32_t *c32)
 
 CMDBUF_HOT_O2 void Saturn_CmdBuf_CullOccluded(void)
 {
-#ifndef SATURN_WIN32
-    if (saturn_visit_count > 0 || saturn_cmd_s_count > 0)
-    {
-        /* Flash-purge Master SH-2 L1 cache via uncached Area 1 trampoline (12 cycles)
-         * so Saturn_CmdBuf_Deliver reads fresh saturn_sub_ranges and saturn_cmd_s written by Slave. */
-        extern void _hw_purge_cache(void);
-        ((void (*)(void))((uintptr_t)_hw_purge_cache | SATURN_WRAM_H_UNCACHED))();
-    }
-#endif
-
     extern int saturn_view_w;
     extern int saturn_view_h;
     uint32_t m_count = saturn_cmd_m_count;
     if (__builtin_expect(saturn_cmd_m_needs_ytrim != 0, 0) &&
         m_count > 0 && saturn_view_w <= CMDBUF_VW && saturn_view_h <= CMDBUF_VH)
     {
-        /* Trim extreme off-screen vertical wall coordinates */
+        /* Trim extreme off-screen vertical wall coordinates before purging L1 cache */
         uint32_t *c32 = (uint32_t *)saturn_cmd_m;
         uint32_t *m_end = c32 + (m_count << 3);
         for (; c32 != m_end; c32 += 8)
@@ -372,6 +362,16 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_CullOccluded(void)
             }
         }
     }
+
+#ifndef SATURN_WIN32
+    if (saturn_visit_count > 0 || saturn_cmd_s_count > 0)
+    {
+        /* Flash-purge Master SH-2 L1 cache via uncached Area 1 trampoline (12 cycles)
+         * so Saturn_CmdBuf_Deliver reads fresh saturn_sub_ranges and saturn_cmd_s written by Slave. */
+        extern void _hw_purge_cache(void);
+        ((void (*)(void))((uintptr_t)_hw_purge_cache | SATURN_WRAM_H_UNCACHED))();
+    }
+#endif
 }
 
 unsigned int Saturn_CmdBuf_ComputeDDA(void)

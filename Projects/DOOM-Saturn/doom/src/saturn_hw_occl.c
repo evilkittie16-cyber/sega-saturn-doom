@@ -371,9 +371,10 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             const uint8_t *ybot = ap->ybot;
             yt_min = HW_VIEW_H;
             yb_max = 0;
-            for (int x = sx; x <= ex_m1; x++)
+            uint32_t m = sm >> b0;
+            for (int x = sx; x <= ex_m1; x++, m >>= 1)
             {
-                if (sm & hw_bit_lut[x & 31])
+                if (m & 1u)
                     continue;
                 int yt = ytop[x];
                 int yb = ybot[x];
@@ -424,13 +425,13 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             }
             else
             {
-                uint32_t sm0 = hw_solid_mask[w0];
+                uint32_t m = hw_solid_mask[w0] >> b0;
                 const uint8_t *ytop = ap->ytop;
                 const uint8_t *ybot = ap->ybot;
                 int x_end = (w0 << 5) + 31;
-                for (int x = sx; x <= x_end; x++)
+                for (int x = sx; x <= x_end; x++, m >>= 1)
                 {
-                    if (sm0 & hw_bit_lut[x & 31])
+                    if (m & 1u)
                         continue;
                     int yt = ytop[x];
                     int yb = ybot[x];
@@ -452,13 +453,13 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             }
             else
             {
-                uint32_t sm1 = hw_solid_mask[w1];
+                uint32_t m = hw_solid_mask[w1];
                 const uint8_t *ytop = ap->ytop;
                 const uint8_t *ybot = ap->ybot;
                 int x_start = w1 << 5;
-                for (int x = x_start; x <= ex_m1; x++)
+                for (int x = x_start; x <= ex_m1; x++, m >>= 1)
                 {
-                    if (sm1 & hw_bit_lut[x & 31])
+                    if (m & 1u)
                         continue;
                     int yt = ytop[x];
                     int yb = ybot[x];
@@ -778,8 +779,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
     if (w_mod && !touch_ret && !(w_and_flags & 8))
     {
         hw_ap_word_t *aw = &hw_ap_words[w];
-        int ok_yt = !do_yt || (yt_req > aw->yt_min);
-        int ok_yb = !do_yb || (yb_req < aw->yb_max);
+        int is_partial_clean = (w_and_flags & 4) && (x_s > x_w0 || x_e < x_w1);
+        int ok_yt = !do_yt || (yt_req > aw->yt_min) || (is_partial_clean && aw->yt_min == aw->yt_max);
+        int ok_yb = !do_yb || (yb_req < aw->yb_max) || (is_partial_clean && aw->yb_min == aw->yb_max);
         if (ok_yt && ok_yb)
         {
             if (do_yt && new_yt > aw->yt_max) aw->yt_max = (int16_t)new_yt;

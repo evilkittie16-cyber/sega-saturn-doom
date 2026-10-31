@@ -1554,7 +1554,6 @@ static HW_NOINLINE HW_COLD_OS int HW_ClipSegNearPlane(
     if (!HW_ClipWallNearPlane(&local_trans_pillars[seg->pillar_idx[0]],
                               &local_trans_pillars[seg->pillar_idx[1]], ctx))
         return 0;
-    saturn_cmd_m_needs_ytrim = 1;
     if (HW_APERTURE->aperture_active)
     {
         int ap_pack = HW_GetSpanAperture(ctx->seg_sx, ctx->seg_ex);
@@ -2003,7 +2002,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     if (ya0 >= ya1 && yb0 >= yb1)
         return;
 
-    if (__builtin_expect(((ya0 & yb0) < 0) || (ya1 > HW_VIEW_H && yb1 > HW_VIEW_H), 0))
+    if (__builtin_expect((ya0 < -8 && yb0 < -8) || (ya1 > HW_VIEW_H + 8 && yb1 > HW_VIEW_H + 8), 0))
         saturn_cmd_m_needs_ytrim = 1;
 
     ctx->seg         = seg;
@@ -2254,7 +2253,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_ProjectAndCullPillarPair(
             const hw_ap_word_t *aw = &hw_ap_words[w0];
             int16_t yt = aw->yt_min;
             int16_t yb = aw->yb_max;
-            if (__builtin_expect(yt < aw->yt_max || yb > aw->yb_min, 0))
+            if (__builtin_expect((aw->yt_max - yt) > 8 || (yb - aw->yb_min) > 8, 0))
             {
                 int ap_pack = HW_GetSpanAperture(seg_sx, seg_ex);
                 if (ap_pack < 0)
@@ -2773,7 +2772,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
                 const hw_ap_word_t *aw = &hw_ap_words[w0];
                 ytop_min = aw->yt_min;
                 ybot_max = aw->yb_max;
-                if (__builtin_expect(ytop_min < aw->yt_max || ybot_max > aw->yb_min, 0))
+                if (__builtin_expect((aw->yt_max - ytop_min) > 4 || (ybot_max - aw->yb_min) > 4, 0))
                 {
                     int ap_pack = HW_GetSpanAperture(ap_sx, ap_ex);
                     if (ap_pack < 0)

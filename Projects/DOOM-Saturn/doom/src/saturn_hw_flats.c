@@ -116,16 +116,20 @@ HW_ALWAYS_INLINE int HW_FlatQuadDy_PreClamped(int x0, int y0, int x1, int y1,
 HW_ALWAYS_INLINE int HW_FlatQuadDy(int x0, int y0, int x1, int y1,
                                    int x2, int y2, int x3, int y3)
 {
-    const int vh = HW_VIEW_H;
-    int cy0 = (y0 < 0) ? 0 : ((y0 > vh) ? vh : y0);
-    int cy1 = (y1 < 0) ? 0 : ((y1 > vh) ? vh : y1);
-    int cy2 = (y2 < 0) ? 0 : ((y2 > vh) ? vh : y2);
-    int cy3 = (y3 < 0) ? 0 : ((y3 > vh) ? vh : y3);
+    const int y_min = -64;
+    const int y_max = HW_VIEW_H + 64;
+    int cy0 = (y0 < y_min) ? y_min : ((y0 > y_max) ? y_max : y0);
+    int cy1 = (y1 < y_min) ? y_min : ((y1 > y_max) ? y_max : y1);
+    int cy2 = (y2 < y_min) ? y_min : ((y2 > y_max) ? y_max : y2);
+    int cy3 = (y3 < y_min) ? y_min : ((y3 > y_max) ? y_max : y3);
     int d03 = cy3 - cy0; if (d03 < 0) d03 = -d03;
     int d12 = cy2 - cy1; if (d12 < 0) d12 = -d12;
     return HW_FlatQuadDy_PreClamped(x0, y0, x1, y1, x2, y2, x3, y3,
                                     cy0, cy1, cy2, cy3, d03, d12);
 }
+
+static HW_NOINLINE HW_COLD_OS uint32_t HW_SliceFlatQuadV(
+    int y0, int y1, int y2, int y3, uint32_t quad_size);
 
 HW_ALWAYS_INLINE int HW_FlatTriDy(int y0, int y1, int y2)
 {
@@ -212,8 +216,11 @@ static HW_NOINLINE void HW_Worker_EmitFlatQuadDirect(vdp1_cmd_t *cmd_s_out, int 
         }
 
         uint32_t w1 = (pmod << 16) | colr;
-        int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
-        uint32_t w2 = HW_FlatSizeLOD((uint16_t)srca, 0x0840u, dy);
+        int is_tri = (x0 == x1 && y0 == y1) | (x1 == x2 && y1 == y2) |
+                     (x2 == x3 && y2 == y3) | (x3 == x0 && y3 == y0);
+        int dy = is_tri ? 24 : 32;
+        uint32_t qsize = ((uint32_t)shade & 0x007F00FFu) | 0x0800u;
+        uint32_t w2 = HW_FlatSizeLOD((uint16_t)srca, qsize, dy);
         *qcount_ptr = qcount + 1;
 
         /* Sequential burst writes coalesced by SH-2 uncached write-through buffer */
@@ -298,22 +305,28 @@ static __declspec(noinline) void HW_ClipQuadPlane(
     int c1 = *c1_p, p1 = *p1_p;
     int c2 = *c2_p, p2 = *p2_p;
     int c3 = *c3_p, p3 = *p3_p;
-    int clip_far = clip_p - dir * 64;
+    int clip_far = clip_p - dir * 24;
 
     switch (mask)
     {
         case 9:
-            c0 = HW_ClipCoord(c1, p1, c0, p0, clip_p); p0 = clip_p;
-            c3 = HW_ClipCoord(c2, p2, c3, p3, clip_p); p3 = clip_p;
+        {
+            int cp = (!swap_xy && dir < 0 && (p1 < vh - 6 || p2 < vh - 6)) ? clip_far : clip_p;
+            if ((p0 - cp) * dir < 0) { c0 = HW_ClipCoord(c1, p1, c0, p0, cp); p0 = cp; }
+            if ((p3 - cp) * dir < 0) { c3 = HW_ClipCoord(c2, p2, c3, p3, cp); p3 = cp; }
             break;
+        }
         case 3:
             c0 = HW_ClipCoord(c3, p3, c0, p0, clip_p); p0 = clip_p;
             c1 = HW_ClipCoord(c2, p2, c1, p1, clip_p); p1 = clip_p;
             break;
         case 6:
-            c1 = HW_ClipCoord(c0, p0, c1, p1, clip_p); p1 = clip_p;
-            c2 = HW_ClipCoord(c3, p3, c2, p2, clip_p); p2 = clip_p;
+        {
+            int cp = (!swap_xy && dir < 0 && (p0 < vh - 6 || p3 < vh - 6)) ? clip_far : clip_p;
+            if ((p1 - cp) * dir < 0) { c1 = HW_ClipCoord(c0, p0, c1, p1, cp); p1 = cp; }
+            if ((p2 - cp) * dir < 0) { c2 = HW_ClipCoord(c3, p3, c2, p2, cp); p2 = cp; }
             break;
+        }
         case 12:
             c2 = HW_ClipCoord(c1, p1, c2, p2, clip_p); p2 = clip_p;
             c3 = HW_ClipCoord(c0, p0, c3, p3, clip_p); p3 = clip_p;
@@ -426,7 +439,7 @@ static __declspec(noinline) int HW_ClipFlatQuadOffscreen(
     if (m_top != 0)
         HW_ClipQuadPlane(&x0, &y0, &x1, &y1, &x2, &y2, &x3, &y3, y_top, m_top, 1, 0, &ntris, tx, ty, vw, vh);
 
-    const int y_bot = vh + 12;
+    const int y_bot = vh + 8;
     int m_bot = (y0 > y_bot) | ((y1 > y_bot) << 1) | ((y2 > y_bot) << 2) | ((y3 > y_bot) << 3);
     if (m_bot == 15) return 0;
     if (m_bot != 0)
@@ -439,13 +452,13 @@ static __declspec(noinline) int HW_ClipFlatQuadOffscreen(
             return 0;
     }
 
-    const int x_left = -48;
+    const int x_left = -24;
     int m_left = (x0 < x_left) | ((x1 < x_left) << 1) | ((x2 < x_left) << 2) | ((x3 < x_left) << 3);
     if (m_left == 15 && ntris == 0) return 0;
     if (m_left != 0 && m_left != 15)
         HW_ClipQuadPlane(&y0, &x0, &y1, &x1, &y2, &x2, &y3, &x3, x_left, m_left, 1, 1, &ntris, tx, ty, vw, vh);
 
-    const int x_right = vw + 48;
+    const int x_right = vw + 24;
     int m_right = (x0 > x_right) | ((x1 > x_right) << 1) | ((x2 > x_right) << 2) | ((x3 > x_right) << 3);
     if (m_right == 15 && ntris == 0) return 0;
     if (m_right != 0 && m_right != 15)
@@ -491,9 +504,9 @@ HW_ALWAYS_INLINE void HW_Worker_EmitNormalizedQuad(vdp1_cmd_t *cmd_s_out, int *q
     if (srca <= 0) return;
 
     int ntris = 0, tx[6][3], ty[6][3];
-    int r_lim = vw + 48;
-    int b_lim = vh + 12;
-    if (((x0 + 48) | (x1 + 48) | (x2 + 48) | (x3 + 48) |
+    int r_lim = vw + 24;
+    int b_lim = vh + 8;
+    if (((x0 + 24) | (x1 + 24) | (x2 + 24) | (x3 + 24) |
          (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
          (y0 + 2) | (y1 + 2) | (y2 + 2) | (y3 + 2) |
          (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0)
@@ -631,7 +644,8 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
     int qcap = fctx->qcap;
     vdp1_cmd_t *cmd_s_out = fctx->cmd_s_out;
     uint16_t base_srca = (size_and_ceil & 0x80000000u) ? fctx->ceil_srca : fctx->floor_srca;
-    uint32_t quad_size = size_and_ceil & 0x7FFFFFFFu;
+    int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
+    uint32_t quad_size = HW_SliceFlatQuadV(y0, y1, y2, y3, size_and_ceil & 0x7FFFFFFFu);
     int ntris = 0, tx[6][3], ty[6][3];
 
     if (!HW_ClipFlatQuadOffscreen(&x0, &y0, &x1, &y1, &x2, &y2, &x3, &y3, vw, vh,
@@ -645,7 +659,8 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
         uint32_t p1 = ((uint32_t)x1 << 16) | (uint16_t)y1;
         uint32_t p2 = ((uint32_t)x2 << 16) | (uint16_t)y2;
         uint32_t p3 = ((uint32_t)x3 << 16) | (uint16_t)y3;
-        int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
+        if (((p0 == p1) | (p1 == p2) | (p2 == p3) | (p3 == p0)) && dy > 24)
+            dy = 24;
 
         vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
         aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
@@ -777,7 +792,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
         py_R[1] = (py_R[0] + py_R[2]) >> 1;
     }
 
-    int r_lim = vw + 16;
+    int r_lim = vw + 24;
     int b_lim = vh + 8;
 
     for (int s = 0; s < 2; s++)
@@ -812,9 +827,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)flat_cmdcolr_lut[zb] & 0xFF00u);
 
-        if (__builtin_expect(((x0 + 16) | (x1 + 16) | (x2 + 16) | (x3 + 16) |
+        if (__builtin_expect(((x0 + 24) | (x1 + 24) | (x2 + 24) | (x3 + 24) |
                               (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
-                              (y0 + 8) | (y1 + 8) | (y2 + 8) | (y3 + 8) |
+                              (y0 + 2) | (y1 + 2) | (y2 + 2) | (y3 + 2) |
                               (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0, 0))
         {
             fctx->clip_xy[0] = x0; fctx->clip_xy[1] = y0;
@@ -831,11 +846,10 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
             uint32_t p1 = ((uint32_t)x1 << 16) | (uint16_t)y1;
             uint32_t p2 = ((uint32_t)x2 << 16) | (uint16_t)y2;
             uint32_t p3 = ((uint32_t)x3 << 16) | (uint16_t)y3;
-            int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
 
             vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
-            uint32_t w2 = HW_FlatSizeLOD(base_srca, strip_size, dy);
+            uint32_t w2 = (((uint32_t)base_srca + (uint32_t)(v0 << 3)) << 16) | 0x0800u | (uint32_t)s_rows;
             c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
             c32[1] = w1;
             c32[2] = w2;
@@ -919,9 +933,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         int x2 = pv2->px, y2 = py2;
         int x3 = pv3->px, y3 = py3;
 
-        int r_lim = fctx->vw + 48;
-        int b_lim = vh + 12;
-        if (__builtin_expect(((x0 + 48) | (x1 + 48) | (x2 + 48) | (x3 + 48) |
+        int r_lim = fctx->vw + 24;
+        int b_lim = vh + 8;
+        if (__builtin_expect(((x0 + 24) | (x1 + 24) | (x2 + 24) | (x3 + 24) |
                               (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
                               (y0 + 2) | (y1 + 2) | (y2 + 2) | (y3 + 2) |
                               (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0, 0))
@@ -975,9 +989,10 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
     return local_q;
 }
 
-/* Takes 3 register arguments (r4=fctx, r5=q_ptr, r6=local_q), 0 stack arguments! */
+/* Takes 4 register arguments (r4=fctx, r5=q_ptr, r6=local_q, r7=verts), 0 stack arguments! */
 static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
-    const hw_flat_emit_ctx_t *fctx, const saturn_flat_quad_idx_t *q_ptr, int local_q)
+    const hw_flat_emit_ctx_t *fctx, const saturn_flat_quad_idx_t *q_ptr, int local_q,
+    const saturn_flat_vert_t *verts)
 {
     fixed_t raw_cx[4]  __attribute__((aligned(16)));
     fixed_t raw_cz[4]  __attribute__((aligned(16)));
@@ -987,10 +1002,11 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
     int s_cache[8];
 
     const saturn_proj_v_t *proj_v = fctx->proj_v;
-    const saturn_proj_v_t *pv0 = &proj_v[q_ptr->v[0]];
-    const saturn_proj_v_t *pv1 = &proj_v[q_ptr->v[1]];
-    const saturn_proj_v_t *pv2 = &proj_v[q_ptr->v[2]];
-    const saturn_proj_v_t *pv3 = &proj_v[q_ptr->v[3]];
+    int i0 = q_ptr->v[0], i1 = q_ptr->v[1], i2 = q_ptr->v[2], i3 = q_ptr->v[3];
+    const saturn_proj_v_t *pv0 = &proj_v[i0];
+    const saturn_proj_v_t *pv1 = &proj_v[i1];
+    const saturn_proj_v_t *pv2 = &proj_v[i2];
+    const saturn_proj_v_t *pv3 = &proj_v[i3];
 
     raw_cx[0] = pv0->cx; raw_cz[0] = pv0->cz;
     raw_cx[1] = pv1->cx; raw_cz[1] = pv1->cz;
@@ -1000,8 +1016,30 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
     if (!fctx->fully_inside && HW_OutsideFrustum(raw_cx, raw_cz, 4))
         return local_q;
 
+    int base_v0 = 0;
+    int quad_rows = 64;
+    if (!(fctx->fully_inside & HW_FLAT_USE_LOD1))
+    {
+        int wy0 = verts[i0].y, wy1 = verts[i1].y;
+        int wy2 = verts[i2].y, wy3 = verts[i3].y;
+        int y_bot = (wy0 + wy1) >> 1;
+        int y_top = (wy2 + wy3) >> 1;
+        int dy = y_top - y_bot;
+        if (wy2 >= wy1 && wy3 >= wy0 && (unsigned int)(dy - 1) < 64u)
+        {
+            int vn = (-y_top) & 63;
+            if (vn + dy <= 64)
+            {
+                base_v0 = vn;
+                quad_rows = dy;
+            }
+        }
+    }
+
     fixed_t cz_near = HW_NEAR_Z;
     int n_clip = 0;
+    int behind_mask = 0;
+    fixed_t t_out = 0, t_in = 0;
     for (int k = 0; k < 4; k++)
     {
         int next = (k + 1 == 4) ? 0 : k + 1;
@@ -1017,25 +1055,65 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
             {
                 fixed_t t = HW_ClampedFrac((unsigned int)(cza - cz_near), (unsigned int)(cza - czb));
                 if (t > FRACUNIT) t = FRACUNIT;
+                t_out = t;
 
                 clip_cx[n_clip] = (int32_t)((uint32_t)cxa + ((uint32_t)FixedMul(t, (cxb >> 1) - (cxa >> 1)) << 1));
                 clip_cz[n_clip] = cz_near;
                 n_clip++;
             }
         }
-        else if (czb >= cz_near)
+        else
         {
-            fixed_t t = HW_ClampedFrac((unsigned int)(cz_near - cza), (unsigned int)(czb - cza));
-            if (t > FRACUNIT) t = FRACUNIT;
+            behind_mask |= (1 << k);
+            if (czb >= cz_near)
+            {
+                fixed_t t = HW_ClampedFrac((unsigned int)(cz_near - cza), (unsigned int)(czb - cza));
+                if (t > FRACUNIT) t = FRACUNIT;
+                t_in = t;
 
-            clip_cx[n_clip] = (int32_t)((uint32_t)cxa + ((uint32_t)FixedMul(t, (cxb >> 1) - (cxa >> 1)) << 1));
-            clip_cz[n_clip] = cz_near;
-            n_clip++;
+                clip_cx[n_clip] = (int32_t)((uint32_t)cxa + ((uint32_t)FixedMul(t, (cxb >> 1) - (cxa >> 1)) << 1));
+                clip_cz[n_clip] = cz_near;
+                n_clip++;
+            }
         }
     }
 
     if (n_clip < 3 || n_clip > 8)
         return local_q;
+
+    if (n_clip == 4)
+    {
+        if (behind_mask == 3)
+        {
+            /* South edge (v0, v1) clipped by near plane: loop emitted (v1', v2, v3, v0').
+             * Rotate right by 1 slot to restore canonical (v0', v1', v2, v3) UV orientation,
+             * and slice quad_rows to the kept fraction so 64 rows aren't squished! */
+            fixed_t tx = clip_cx[3], tz = clip_cz[3];
+            clip_cx[3] = clip_cx[2]; clip_cz[3] = clip_cz[2];
+            clip_cx[2] = clip_cx[1]; clip_cz[2] = clip_cz[1];
+            clip_cx[1] = clip_cx[0]; clip_cz[1] = clip_cz[0];
+            clip_cx[0] = tx;         clip_cz[0] = tz;
+
+            fixed_t t_keep = (t_out + (FRACUNIT - t_in)) >> 1;
+            int new_rows = ((quad_rows * (t_keep >> 8)) + 128) >> 8;
+            if (new_rows < 1) new_rows = 1;
+            else if (new_rows > quad_rows) new_rows = quad_rows;
+            quad_rows = new_rows;
+        }
+        else if (behind_mask == 12)
+        {
+            /* North edge (v3, v2) clipped by near plane: loop emitted (v0, v1, v2', v3').
+             * Advance base_v0 and slice quad_rows to the kept South fraction! */
+            fixed_t t_keep = (t_out + (FRACUNIT - t_in)) >> 1;
+            int new_rows = ((quad_rows * (t_keep >> 8)) + 128) >> 8;
+            if (new_rows < 1) new_rows = 1;
+            else if (new_rows > quad_rows) new_rows = quad_rows;
+            base_v0 += (quad_rows - new_rows);
+            quad_rows = new_rows;
+        }
+    }
+
+    int size_pack = (base_v0 << 16) | quad_rows;
 
     int vw = fctx->vw, vh = fctx->vh;
     int vcx = fctx->vcx, vcy = fctx->vcy;
@@ -1094,7 +1172,7 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
         unsigned int zb = ((unsigned int)min_cz + (unsigned int)max_cz) >> 21;
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
         int qcount = local_q;
-        HW_Worker_EmitPolyQuads(cmd_s_out, &qcount, qcap, sx, sy_c, n_clip, fctx->ceil_srca, (int)flat_cmdcolr_lut[zb], vw, vh);
+        HW_Worker_EmitPolyQuads(cmd_s_out, &qcount, qcap, sx, sy_c, n_clip, fctx->ceil_srca, ((int)flat_cmdcolr_lut[zb] & 0xFF00) | size_pack, vw, vh);
         local_q = qcount;
     }
 
@@ -1103,7 +1181,7 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
         unsigned int zb = ((unsigned int)min_cz + (unsigned int)max_cz) >> 21;
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
         int qcount = local_q;
-        HW_Worker_EmitPolyQuads(cmd_s_out, &qcount, qcap, sx, sy_f, n_clip, fctx->floor_srca, (int)flat_cmdcolr_lut[zb], vw, vh);
+        HW_Worker_EmitPolyQuads(cmd_s_out, &qcount, qcap, sx, sy_f, n_clip, fctx->floor_srca, ((int)flat_cmdcolr_lut[zb] & 0xFF00) | size_pack, vw, vh);
         local_q = qcount;
     }
     return local_q;
@@ -1579,7 +1657,7 @@ vert_behind:
         if (!(v0_val | v1_val | v2_val | v3_val))
             continue;
 
-        local_q = HW_Worker_ClipNearQuad(fctx, q_ptr, local_q);
+        local_q = HW_Worker_ClipNearQuad(fctx, q_ptr, local_q, verts);
     }
 
     fctx->local_q = local_q;
