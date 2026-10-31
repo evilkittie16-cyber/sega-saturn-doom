@@ -1420,9 +1420,11 @@ void Saturn_Vdp1Wall_Reset(void)
         /* Never overwrite VDP1 texture VRAM while VDP1 is still rasterizing the previous frame */
         if (v1_have_frame)
         {
-            unsigned guard = 16000u;
+            unsigned guard = 2500u;
             while (!(V1_EDSR & 2u) && --guard)
             {
+                if (!(V1_EDSR & 3u))
+                    break;
                 for (int w = 0; w < 32; w++)
                     __asm__ volatile("nop");
             }
@@ -1874,10 +1876,12 @@ void Saturn_Vdp1Wall_Frame(void)
              * Never break out early at Scanline 224 (VBlank-IN) while CEF==0, or
              * Saturn_CmdBuf_Deliver() will overwrite the tail of the command table
              * (foreground flats and player weapon) while VDP1 is still drawing! */
-            unsigned guard = 25000u;
+            unsigned guard = 3500u;
 
             while (!(V1_EDSR & 2u) && --guard)
             {
+                if (saturn_vbl_count != vc0 && !(V1_EDSR & 3u))
+                    break;
                 /* Yield B-bus to VDP1 so status polling never steals VDP1 rasterizer cycles */
                 for (int w = 0; w < 32; w++)
                     __asm__ volatile("nop");

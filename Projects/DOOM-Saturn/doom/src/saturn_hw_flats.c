@@ -213,8 +213,6 @@ static HW_NOINLINE void HW_Worker_EmitFlatQuadDirect(vdp1_cmd_t *cmd_s_out, int 
 
         uint32_t w1 = (pmod << 16) | colr;
         int dy = HW_FlatQuadDy(x0, y0, x1, y1, x2, y2, x3, y3);
-        if ((dy & 0x3FFF) <= 24)
-            w1 &= ~(0x1000u << 16);
         uint32_t w2 = HW_FlatSizeLOD((uint16_t)srca, 0x0840u, dy);
         *qcount_ptr = qcount + 1;
 
@@ -493,11 +491,11 @@ HW_ALWAYS_INLINE void HW_Worker_EmitNormalizedQuad(vdp1_cmd_t *cmd_s_out, int *q
     if (srca <= 0) return;
 
     int ntris = 0, tx[6][3], ty[6][3];
-    int r_lim = vw + 32;
-    int b_lim = vh + 16;
-    if (((x0 + 32) | (x1 + 32) | (x2 + 32) | (x3 + 32) |
+    int r_lim = vw + 16;
+    int b_lim = vh + 8;
+    if (((x0 + 16) | (x1 + 16) | (x2 + 16) | (x3 + 16) |
          (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
-         (y0 + 16) | (y1 + 16) | (y2 + 16) | (y3 + 16) |
+         (y0 + 8) | (y1 + 8) | (y2 + 8) | (y3 + 8) |
          (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0)
     {
         if (!HW_ClipFlatQuadOffscreen(&x0, &y0, &x1, &y1, &x2, &y2, &x3, &y3, vw, vh,
@@ -653,7 +651,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
         aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
         uint32_t w2 = HW_FlatSizeLOD(base_srca, quad_size, dy);
         c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
-        c32[1] = ((dy & 0x3FFF) <= 24) ? (w1 & ~(0x1000u << 16)) : w1;
+        c32[1] = w1;
         c32[2] = w2;
         if (cw < 0)
         {
@@ -682,7 +680,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
             vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
             c32[0] = (cw_t < 0) ? 0x00320000u : 0x00220000u;
-            c32[1] = w1 & ~(0x1000u << 16);
+            c32[1] = w1;
             c32[2] = HW_FlatSizeLOD(base_srca, quad_size, dy);
             if (cw_t < 0)
             {
@@ -779,8 +777,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
         py_R[1] = (py_R[0] + py_R[2]) >> 1;
     }
 
-    int r_lim = vw + 32;
-    int b_lim = vh + 16;
+    int r_lim = vw + 16;
+    int b_lim = vh + 8;
 
     for (int s = 0; s < 2; s++)
     {
@@ -814,9 +812,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)flat_cmdcolr_lut[zb] & 0xFF00u);
 
-        if (__builtin_expect(((x0 + 32) | (x1 + 32) | (x2 + 32) | (x3 + 32) |
+        if (__builtin_expect(((x0 + 16) | (x1 + 16) | (x2 + 16) | (x3 + 16) |
                               (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
-                              (y0 + 16) | (y1 + 16) | (y2 + 16) | (y3 + 16) |
+                              (y0 + 8) | (y1 + 8) | (y2 + 8) | (y3 + 8) |
                               (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0, 0))
         {
             fctx->clip_xy[0] = x0; fctx->clip_xy[1] = y0;
@@ -839,7 +837,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
             uint32_t w2 = HW_FlatSizeLOD(base_srca, strip_size, dy);
             c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
-            c32[1] = ((dy & 0x3FFF) <= 24) ? (w1 & ~(0x1000u << 16)) : w1;
+            c32[1] = w1;
             c32[2] = w2;
             if (cw < 0)
             {
@@ -921,11 +919,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         int x2 = pv2->px, y2 = py2;
         int x3 = pv3->px, y3 = py3;
 
-        int r_lim = fctx->vw + 32;
-        int b_lim = vh + 16;
-        if (__builtin_expect(((x0 + 32) | (x1 + 32) | (x2 + 32) | (x3 + 32) |
+        int r_lim = fctx->vw + 16;
+        int b_lim = vh + 8;
+        if (__builtin_expect(((x0 + 16) | (x1 + 16) | (x2 + 16) | (x3 + 16) |
                               (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
-                              (y0 + 16) | (y1 + 16) | (y2 + 16) | (y3 + 16) |
+                              (y0 + 8) | (y1 + 8) | (y2 + 8) | (y3 + 8) |
                               (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0, 0))
         {
             fctx->clip_xy[0] = x0; fctx->clip_xy[1] = y0;
@@ -938,8 +936,6 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         uint16_t base_srca = (qpack & 0x80000000u) ? fctx->ceil_srca : fctx->floor_srca;
         int dy = HW_FlatQuadDy_PreClamped(x0, y0, x1, y1, x2, y2, x3, y3,
                                           cy0, cy1, cy2, cy3, d03, d12);
-        if (dy <= 24)
-            w1 &= ~(0x1000u << 16);
         uint32_t w2 = HW_FlatSizeLOD(base_srca, quad_size, dy);
 
         uint32_t w0, w3, w4, w5, w6;

@@ -326,7 +326,7 @@ static inline uint32_t cmdbuf_quad_dda(const uint32_t *c32)
     int dy_dc = yC - yD; if (dy_dc < 0) dy_dc = -dy_dc;
     int w_dc = (dx_dc > dy_dc ? dx_dc : dy_dc) + 1;
     int inner = (w_ab + w_dc) >> 1;
-    if (tw > inner) inner = tw;
+    if (!(c32[1] & 0x10000000u) && tw > inner) inner = tw;
     int dx_ad = xD - xA; if (dx_ad < 0) dx_ad = -dx_ad;
     int dy_ad = yD - yA; if (dy_ad < 0) dy_ad = -dy_ad;
     int dx_bc = xC - xB; if (dx_bc < 0) dx_bc = -dx_bc;
