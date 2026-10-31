@@ -261,6 +261,19 @@ typedef struct {
     int32_t            sky_col_bam[HW_MAX_SCREEN_W];        /*  1,408 B (0x5FE0..0x655F) */
 } hw_wram_l_scratch_t;
 
+/* Per-frame 16-byte sector fast table (indexed by secnum << 4, 1 SH-2 L1 cache line):
+ * Replaces non-power-of-two sector_t (36-byte multiply) + HW_DZQ(z, hw_viewz) +
+ * separate sec_yt_attach / sec_yb_attach arrays with a single L1 cache line! */
+typedef struct {
+    int32_t  dz_ceil;    /* sec->ceilingheight - hw_viewz */
+    int32_t  dz_floor;   /* sec->floorheight   - hw_viewz */
+    int16_t  yt_attach;  /* init to vh */
+    int16_t  yb_attach;  /* init to 0 */
+    uint8_t  is_sky;     /* (int16_t)sec->ceilingpic == -1 */
+    uint8_t  has_things; /* sec->thinglist != NULL */
+    uint16_t pad;
+} HW_ALIGN16 hw_sec_fast_t;
+
 typedef struct {
     /* Bytes 0..23: hot scalars at offset 0 for 1-cycle @(disp, rAp) access on SH-2 */
     uint8_t          cur_sub_ytop;
@@ -279,24 +292,27 @@ typedef struct {
     uint32_t         node_pvs_vis[HW_NODE_PVS_WORDS];
     uint8_t          ytop[HW_MAX_SCREEN_W];
     uint8_t          ybot[HW_MAX_SCREEN_W];
-    int16_t          sec_yt_attach[HW_MAX_AP_SECTORS];
-    int16_t          sec_yb_attach[HW_MAX_AP_SECTORS];
 } hw_aperture_state_t;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(hw_sub_flat_info_t) == 16,
                "hw_sub_flat_info_t must be 16 bytes (1 SH-2 cache line)");
+_Static_assert(sizeof(hw_sec_fast_t) == 16,
+               "hw_sec_fast_t must be 16 bytes (1 SH-2 cache line)");
 _Static_assert(sizeof(hw_wram_l_scratch_t) <= SATURN_WRAM_L_PILLARS_SIZE,
                "hw_wram_l_scratch_t must fit inside 32 KB SATURN_WRAM_L_PILLARS_ADDR region");
 #elif defined(_MSC_VER)
 static_assert(sizeof(hw_sub_flat_info_t) == 16,
               "hw_sub_flat_info_t must be 16 bytes (1 SH-2 cache line)");
+static_assert(sizeof(hw_sec_fast_t) == 16,
+              "hw_sec_fast_t must be 16 bytes (1 SH-2 cache line)");
 static_assert(sizeof(hw_wram_l_scratch_t) <= SATURN_WRAM_L_PILLARS_SIZE,
               "hw_wram_l_scratch_t must fit inside 32 KB SATURN_WRAM_L_PILLARS_ADDR region");
 #endif
 
 static HW_ALIGN16 hw_aperture_state_t hw_aperture_state;
 static HW_ALIGN16 hw_ap_word_t hw_ap_words[HW_SOLID_WORDS];
+static HW_ALIGN16 hw_sec_fast_t hw_sec_fast[HW_MAX_AP_SECTORS];
 #define HW_APERTURE       (&hw_aperture_state)
 #define HW_WRAM_L_SCRATCH ((hw_wram_l_scratch_t *)SATURN_WRAM_L_PILLARS_ADDR)
 #define HW_SUB_FLAT_INFO  (HW_WRAM_L_SCRATCH->sub_flat_info)

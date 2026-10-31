@@ -1012,6 +1012,15 @@ void Saturn_HUD_Draw(void)
 
         extern unsigned int saturn_hw_prof_bsp;
         extern unsigned int saturn_hw_prof_segs;
+        extern unsigned int saturn_hw_prof_ap;
+        extern unsigned int saturn_hw_prof_fsub;
+        extern unsigned int saturn_hw_prof_spr;
+        extern unsigned int saturn_hw_prof_occl;
+        extern unsigned int saturn_hw_prof_wseg;
+        extern unsigned int saturn_hw_prof_wquad;
+        extern unsigned int saturn_hw_prof_sportal;
+        extern unsigned int saturn_hw_prof_unb;
+        extern unsigned int saturn_hw_prof_mflat;
         extern unsigned int saturn_hw_wall_quads;
         extern unsigned int saturn_hw_flat_quads;
         extern unsigned int saturn_hw_prof_slave_wait;
@@ -1082,6 +1091,10 @@ void Saturn_HUD_Draw(void)
             }
             int bsp_ms = (int)(((saturn_hw_prof_bsp + half_ms) * cached_inv_per_ms) >> 20);
             int seg_ms = (int)(((saturn_hw_prof_segs + half_ms) * cached_inv_per_ms) >> 20);
+            int ap_ms  = (int)(((saturn_hw_prof_ap + half_ms) * cached_inv_per_ms) >> 20);
+            int oc_ms  = (int)(((saturn_hw_prof_occl + half_ms) * cached_inv_per_ms) >> 20);
+            int wq_ms  = (int)(((saturn_hw_prof_wquad + half_ms) * cached_inv_per_ms) >> 20);
+            int sp_ms  = (int)(((saturn_hw_prof_sportal + saturn_hw_prof_unb + half_ms) * cached_inv_per_ms) >> 20);
             int slv_ms = (int)(((saturn_hw_prof_slave_wait + half_ms) * cached_inv_per_ms) >> 20);
             int vdp_ms = pf_ms[2];
             int dda_k  = pf_dda_k;
@@ -1126,8 +1139,20 @@ void Saturn_HUD_Draw(void)
                 dn = hud_tiny_tag(dbg, dn, 'C', pf_ms[3]);
                 dbg[dn++] = ' ';
                 dn = hud_tiny_tag(dbg, dn, 'B', bsp_ms);
+#if !defined(SATURN_WIN32) && defined(HW_PROF_SUBTIMERS) && HW_PROF_SUBTIMERS
+                dbg[dn++] = '/';
+                dn = hud_tiny_num(dbg, dn, ap_ms);
+                dbg[dn++] = '/';
+                dn = hud_tiny_num(dbg, dn, oc_ms);
+#endif
                 dbg[dn++] = ' ';
                 dn = hud_tiny_tag(dbg, dn, 'G', seg_ms);
+#if !defined(SATURN_WIN32) && defined(HW_PROF_SUBTIMERS) && HW_PROF_SUBTIMERS
+                dbg[dn++] = '/';
+                dn = hud_tiny_num(dbg, dn, wq_ms);
+                dbg[dn++] = '/';
+                dn = hud_tiny_num(dbg, dn, sp_ms);
+#endif
                 dbg[dn++] = ' ';
                 dn = hud_tiny_tag(dbg, dn, 'S', pf_ms[4]);
                 dbg[dn++] = ' ';

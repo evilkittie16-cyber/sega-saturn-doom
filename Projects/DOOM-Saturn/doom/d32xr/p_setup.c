@@ -226,7 +226,7 @@ void P_LoadSubsectors (int lump)
 
 	numsubsectors = W_LumpLength (lump) / sizeof(mapsubsector_t);
 	count = numsubsectors+1;
-	if ((size_t)count * sizeof(subsector_t) <= 0x4000u)
+	if ((size_t)count * sizeof(subsector_t) <= 0x3000u)
 		subsectors = (subsector_t *)((uintptr_t)SATURN_WRAM_L_DIVLUT_ADDR + 0x2000u);
 	else
 		subsectors = Z_Malloc (count*sizeof(subsector_t),PU_LEVEL);

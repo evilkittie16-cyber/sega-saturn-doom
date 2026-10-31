@@ -23,25 +23,36 @@
 #include "saturn_hw_flats.c"
 #include "saturn_hw_walls.c"
 
+static unsigned int hw_prof_ap_acc = 0;
+static unsigned int hw_prof_fsub_acc = 0;
+static unsigned int hw_prof_spr_acc = 0;
+static unsigned int hw_prof_occl_acc = 0;
+
 /* Walk a subsector (takes 2 register arguments: r4=subnum, r5=fully_inside) */
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_inside)
 {
     if (hw_solid_count >= HW_VIEW_W || (unsigned)subnum >= (unsigned)numsubsectors)
         return;
 
-    subsector_t *sub = &subsectors[subnum];
-    int secnum = sub->sector;
-    if ((unsigned)secnum >= (unsigned)numsectors || saturn_visit_count >= CMDBUF_MAX_VISIT)
+    int secnum = subsectors[subnum].sector;
+    if ((unsigned)secnum >= HW_MAX_AP_SECTORS || saturn_visit_count >= CMDBUF_MAX_VISIT)
         return;
-    sector_t *sec = &sectors[secnum];
-    int flat_flags = HW_CheckSubsectorAperture(subnum, sec, (secnum << 8) | (fully_inside & 3));
+    hw_sec_fast_t *sf = &hw_sec_fast[secnum];
+#if HW_PROF_SUBTIMERS
+    unsigned short ts0 = SAT_FRT();
+#endif
+    int flat_flags = HW_CheckSubsectorAperture(subnum, sf, (secnum << 8) | (fully_inside & 3));
+#if HW_PROF_SUBTIMERS
+    unsigned short ts1 = SAT_FRT();
+    hw_prof_ap_acc += HW_ProfDelta(ts0, ts1);
+#endif
     if (flat_flags < 0)
     {
         saturn_hw_occl_culls++;
         return;
     }
 
-    if ((int16_t)sec->ceilingpic == -1)
+    if (sf->is_sky)
     {
         if (flat_flags & (int)HW_FLAT_ALLOW_CEIL)
             saturn_hw_sky_visible = 1;
@@ -57,6 +68,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
 
     if (flat_flags & (int)HW_FLAT_ALLOW_BOTH)
     {
+        sector_t *sec = &sectors[secnum];
 #ifndef SATURN_WIN32
         if (__builtin_expect(saturn_slave_enabled, 1))
         {
@@ -69,15 +81,27 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
             HW_RenderSubsectorBakedFlats(visit_idx, subnum, sec, flat_flags);
         }
     }
+#if HW_PROF_SUBTIMERS
+    hw_prof_fsub_acc += HW_ProfDelta(ts1, SAT_FRT());
+#endif
 
     /* 1. Render segs (front walls of this subsector) */
-    HW_RenderSubsectorBakedWalls(subnum, sec);
+    HW_RenderSubsectorBakedWalls(subnum, sf);
 
     /* 2. Render subsector sprites (lazy per-sector frustum-culled bucketing) */
-    if (__builtin_expect(HW_SubsectorHasThings(sec, (uint32_t)secnum, subnum), 0))
+#if HW_PROF_SUBTIMERS
+    unsigned short ts2 = SAT_FRT();
+#endif
+    if (__builtin_expect(sf->has_things != 0, 0))
     {
-        HW_RenderSubsectorSprites(sec, subnum);
+        sector_t *sec = &sectors[secnum];
+        if (HW_SubsectorHasThings(sec, (uint32_t)secnum, subnum))
+            HW_RenderSubsectorSprites(sec, subnum);
     }
+#if HW_PROF_SUBTIMERS
+    unsigned short ts3 = SAT_FRT();
+    hw_prof_spr_acc += HW_ProfDelta(ts2, ts3);
+#endif
 
 #ifndef SATURN_WIN32
     r32[0] = ((uint32_t)m_start << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
@@ -90,6 +114,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
     if (sub_solid_active || HW_APERTURE->portal_span_count > 0)
     {
         HW_CommitSubsectorOcclusion();
+#if HW_PROF_SUBTIMERS
+        hw_prof_occl_acc += HW_ProfDelta(ts3, SAT_FRT());
+#endif
     }
 }
 
@@ -416,14 +443,21 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             }
         }
         int n_ap_sec = (numsectors < HW_MAX_AP_SECTORS) ? numsectors : HW_MAX_AP_SECTORS;
-        int n_ap_pairs = (n_ap_sec + 1) >> 1;
-        aliased_uint32_t *syt32 = (aliased_uint32_t *)ap->sec_yt_attach;
-        aliased_uint32_t *syb32 = (aliased_uint32_t *)ap->sec_yb_attach;
-        for (int i = 0; i < n_ap_pairs; i++)
+        const fixed_t vz = hw_viewz;
+        const sector_t *s_in = sectors;
+        hw_sec_fast_t *s_out = hw_sec_fast;
+        for (int i = 0; i < n_ap_sec; i++, s_in++, s_out++)
         {
-            syt32[i] = vh_pair;
-            syb32[i] = 0;
+            s_out->dz_ceil    = s_in->ceilingheight - vz;
+            s_out->dz_floor   = s_in->floorheight - vz;
+            s_out->yt_attach  = vh;
+            s_out->yb_attach  = 0;
+            s_out->is_sky     = (uint8_t)((int16_t)s_in->ceilingpic == -1);
+            s_out->has_things = (uint8_t)(s_in->thinglist != NULL);
         }
+        hw_psec_fast = (hw_psec && (unsigned)(hw_psec - sectors) < HW_MAX_AP_SECTORS)
+                     ? &hw_sec_fast[hw_psec - sectors]
+                     : NULL;
         ap->portal_span_count = 0;
         ap->aperture_active = 0;
     }
@@ -441,6 +475,15 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         hw_render_frame = 1;
     hw_flat_sec_cache.sec = NULL;
     hw_prof_segs_acc = 0;
+    hw_prof_ap_acc = 0;
+    hw_prof_fsub_acc = 0;
+    hw_prof_spr_acc = 0;
+    hw_prof_occl_acc = 0;
+    hw_prof_wseg_acc = 0;
+    hw_prof_wquad_acc = 0;
+    hw_prof_sportal_acc = 0;
+    hw_prof_unb_acc = 0;
+    saturn_hw_prof_mflat = 0;
     saturn_hw_prof_flats = 0;
     saturn_hw_prof_bg = 0;
     saturn_hw_wall_quads = 0;
@@ -541,6 +584,14 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     } while (__builtin_expect(saturn_vbl_count != vb0, 0));
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
     saturn_hw_prof_segs = hw_prof_segs_acc;
+    saturn_hw_prof_ap = hw_prof_ap_acc;
+    saturn_hw_prof_fsub = hw_prof_fsub_acc;
+    saturn_hw_prof_spr = hw_prof_spr_acc;
+    saturn_hw_prof_occl = hw_prof_occl_acc;
+    saturn_hw_prof_wseg = hw_prof_wseg_acc;
+    saturn_hw_prof_wquad = hw_prof_wquad_acc;
+    saturn_hw_prof_sportal = hw_prof_sportal_acc;
+    saturn_hw_prof_unb = hw_prof_unb_acc;
     saturn_hw_prof_bsp = Saturn_ProfSpan(tb0, vb0);
 
     static int saturn_hw_sky_was_visible = 0;
@@ -554,11 +605,13 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         /* Overlap Master deferred flat overflow & background sky rendering with Slave SH-2 flat queue processing */
         if (hw_def_flat_count > 0)
         {
+            unsigned short tmf0 = SAT_FRT();
             for (int dj = 0; dj < hw_def_flat_count; dj++)
             {
                 HW_Master_ProcessJob(ipc, &hw_def_flat_jobs[dj]);
             }
             hw_def_flat_count = 0;
+            saturn_hw_prof_mflat = HW_ProfDelta(tmf0, SAT_FRT());
         }
         if (ipc->sky_visible)
             saturn_hw_sky_visible = 1;

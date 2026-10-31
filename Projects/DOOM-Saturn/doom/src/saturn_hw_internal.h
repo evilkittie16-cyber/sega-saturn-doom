@@ -237,6 +237,15 @@ int              saturn_hw_sky_prime = 0;
 int16_t        (*hw_node_bboxes)[2][4] = NULL;
 unsigned int saturn_hw_prof_bsp = 0;
 unsigned int saturn_hw_prof_segs = 0;
+unsigned int saturn_hw_prof_ap = 0;
+unsigned int saturn_hw_prof_fsub = 0;
+unsigned int saturn_hw_prof_spr = 0;
+unsigned int saturn_hw_prof_occl = 0;
+unsigned int saturn_hw_prof_wseg = 0;
+unsigned int saturn_hw_prof_wquad = 0;
+unsigned int saturn_hw_prof_sportal = 0;
+unsigned int saturn_hw_prof_unb = 0;
+unsigned int saturn_hw_prof_mflat = 0;
 unsigned int saturn_hw_prof_flats = 0;
 unsigned int saturn_hw_prof_bg = 0;
 unsigned int saturn_hw_prof_hud = 0;
@@ -278,9 +287,16 @@ typedef struct {
 #define HW_ALIGN16 __declspec(align(16))
 #endif
 
+#ifndef HW_PROF_SUBTIMERS
+#define HW_PROF_SUBTIMERS 0
+#endif
+
 static HW_NOINLINE HW_COLD_OS unsigned int HW_ProfDelta_Wrap(unsigned short t0, unsigned short t1)
 {
     extern volatile int saturn_frt_rate;
+    extern volatile int saturn_frt_vbl_reset;
+    if (!saturn_frt_vbl_reset)
+        return (unsigned int)(unsigned short)(t1 - t0);
     int span = saturn_frt_rate + (int)t1 - (int)t0;
     return (span > 0 && span <= saturn_frt_rate) ? (unsigned int)span : (unsigned int)t1;
 }

@@ -89,7 +89,9 @@ HW_ALWAYS_INLINE int32_t HW_MulsW_PairAdd(int a, int b, int c, int d, int32_t e)
 #endif
 }
 
-#define SATURN_OCLUT_ENTRIES 2048u
+#define SATURN_OCLUT_ENTRIES     2048u
+#define SATURN_OCLUT_FAR_OFFSET  5120u
+#define SATURN_OCLUT_FAR_ENTRIES 1024u
 #define SATURN_DIVLUT_ADDR SATURN_WRAM_L_DIVLUT_ADDR
 #define SATURN_OCLUT ((const unsigned int *)SATURN_WRAM_L_DIVLUT_ADDR)
 #define HW_FAST_SKY_ADDR   ((uint8_t *)SATURN_WRAM_L_SKY_ADDR)
@@ -105,11 +107,20 @@ static void HW_Divlut_Init(void)
         return;
     initialized = 1;
 
-    volatile unsigned int *lut = (volatile unsigned int *)SATURN_DIVLUT_ADDR;
+    /* SATURN_WRAM_L_DIVLUT_ADDR layout (32 KB = 0x00238000..0x0023FFFF):
+     * - [0x0000..0x1FFF] Tier 1 [0..2047]:     exact 1-unit reciprocal 10485760 / d for d in [0..2047]
+     * - [0x2000..0x4FFF] subsectors:           up to 1536 subsectors (12 KB)
+     * - [0x5000..0x5FFF] Tier 2 [5120..6143]:  8-unit step reciprocal 10485760 / (k << 3) covering d up to 8191
+     * - [0x6000..0x7FFF] validcount:           line validcount table (8 KB)
+     * Eliminates all HW_FastDiv_Slow function calls and register clobbers across the engine! */
+    volatile unsigned int *lut = (volatile unsigned int *)SATURN_WRAM_L_DIVLUT_UNCACHED;
     lut[0] = 10485760u / HW_NEAR_Z_UNITS;
     lut[1] = 10485760u / HW_NEAR_Z_UNITS;
     for (unsigned int d = 2; d < SATURN_OCLUT_ENTRIES; d++)
         lut[d] = 10485760u / d;
+    lut[SATURN_OCLUT_FAR_OFFSET] = 10485760u / HW_NEAR_Z_UNITS;
+    for (unsigned int k = 1; k < SATURN_OCLUT_FAR_ENTRIES; k++)
+        lut[SATURN_OCLUT_FAR_OFFSET + k] = 10485760u / (k << 3);
 }
 
 /* SH-2 Hardware 32x32->64 bit MAC multiplier with 16.16 fixed-point extraction:
@@ -562,22 +573,83 @@ static HW_NOINLINE HW_COLD_OS void HW_WallXYClamp_Slow(int *c)
         }                                                                                  \
     } while (0)
 
-static HW_NOINLINE HW_COLD_OS int HW_FastDiv_Slow(unsigned int dist)
-{
-    /* Evaluates to shift = 1, 2, 3, or 4 with zero pipeline flushes */
-    unsigned int shift = 1 + (dist >= 4096) + (dist >= 8192) + (dist >= 16384);
-    unsigned int idx = dist >> shift;
-    if (idx >= SATURN_OCLUT_ENTRIES)
-        idx = SATURN_OCLUT_ENTRIES - 1;
-    return (int)(SATURN_OCLUT[idx] >> shift);
-}
-
 HW_ALWAYS_INLINE int HW_FastDiv(fixed_t cz)
 {
     unsigned int dist = (unsigned int)cz >> FRACBITS;
-    if (__builtin_expect(dist < SATURN_OCLUT_ENTRIES, 1))
-        return (int)SATURN_OCLUT[dist];
-    return HW_FastDiv_Slow(dist);
+    if (__builtin_expect(dist >= SATURN_OCLUT_ENTRIES, 0))
+        dist = SATURN_OCLUT_FAR_OFFSET + ((dist >> 3) & (SATURN_OCLUT_FAR_ENTRIES - 1u));
+    return (int)SATURN_OCLUT[dist];
+}
+
+/* SH-2 1-cycle swap.w + xtrct fixed-point (16.16 pre-biased by +0x8000) right-edge vertex packer:
+ * Extracts s_px1 = cur_px_fp >> 16 and packs VDP1 CMDXB/CMDYB (w4) and CMDXC/CMDYC (w5) in 7 cycles
+ * without needing s_yb0 or s_yb1 integer registers. */
+HW_ALWAYS_INLINE void HW_PackLinearStripRight(
+    int cur_px_fp, int cur_ya0_fp, int cur_ya1_fp,
+    int *out_px1, uint32_t *out_w4, uint32_t *out_w5)
+{
+#ifndef SATURN_WIN32
+    int px1;
+    uint32_t w4, w5;
+    __asm__(
+        "mov    %3, %0 \n\t"
+        "swap.w %0, %0 \n\t"
+        "exts.w %0, %0 \n\t"
+        "mov    %4, %1 \n\t"
+        "xtrct  %0, %1 \n\t"
+        "mov    %5, %2 \n\t"
+        "xtrct  %0, %2 \n\t"
+        : "=&r"(px1), "=&r"(w4), "=&r"(w5)
+        : "r"(cur_px_fp), "r"(cur_ya0_fp), "r"(cur_ya1_fp)
+    );
+    *out_px1 = px1;
+    *out_w4  = w4;
+    *out_w5  = w5;
+#else
+    int px1 = cur_px_fp >> 16;
+    int yb0 = cur_ya0_fp >> 16;
+    int yb1 = cur_ya1_fp >> 16;
+    *out_px1 = px1;
+    *out_w4  = ((uint32_t)px1 << 16) | (uint16_t)yb0;
+    *out_w5  = ((uint32_t)px1 << 16) | (uint16_t)yb1;
+#endif
+}
+
+/* Zero-stall 3-multiply SH-2 MAC projection for perspective wall strips:
+ * Computes px = 160 + hi32(cx * scale), yb0 = vcy_top - hi32(dz_top * scale),
+ * and yb1 = vcy_bot - hi32(dz_bot * scale), hiding all dmuls.l latency slots. */
+HW_ALWAYS_INLINE void HW_ProjPerspStrip_SH2(
+    fixed_t cx, int dz_top, int dz_bot, int scale,
+    int vcy_top, int vcy_bot,
+    int *out_px, int *out_yb0, int *out_yb1)
+{
+#ifndef SATURN_WIN32
+    int px, yb0, yb1, tmp;
+    __asm__(
+        "dmuls.l %4, %7 \n\t"   /* M1: cx * scale */
+        "mov     %8, %1 \n\t"   /* HIDE STALL 1: yb0 = vcy_top */
+        "mov     %9, %2 \n\t"   /* HIDE STALL 2: yb1 = vcy_bot */
+        "sts     mach, %0 \n\t" /* px = M1_hi (0 STALLS) */
+        "dmuls.l %5, %7 \n\t"   /* M2: dz_top * scale */
+        "add     #80, %0 \n\t"  /* HIDE STALL 1: px += 80 */
+        "add     #80, %0 \n\t"  /* HIDE STALL 2: px += 80 (HW_VIEW_CX = 160) */
+        "sts     mach, %3 \n\t" /* tmp = M2_hi (0 STALLS) */
+        "dmuls.l %6, %7 \n\t"   /* M3: dz_bot * scale */
+        "sub     %3, %1 \n\t"   /* HIDE STALL 1: yb0 = vcy_top - M2_hi */
+        "sts     mach, %3 \n\t" /* tmp = M3_hi */
+        "sub     %3, %2 \n\t"   /* yb1 = vcy_bot - M3_hi */
+        : "=&r"(px), "=&r"(yb0), "=&r"(yb1), "=&r"(tmp)
+        : "r"(cx), "r"(dz_top), "r"(dz_bot), "r"(scale), "r"(vcy_top), "r"(vcy_bot)
+        : "mach", "macl"
+    );
+    *out_px  = px;
+    *out_yb0 = yb0;
+    *out_yb1 = yb1;
+#else
+    *out_px  = HW_ProjX(cx, scale, HW_VIEW_CX);
+    *out_yb0 = vcy_top - HW_MulHigh(dz_top, scale);
+    *out_yb1 = vcy_bot - HW_MulHigh(dz_bot, scale);
+#endif
 }
 
 HW_ALWAYS_INLINE int HW_WallLightLevel(int lightlevel, int dist)

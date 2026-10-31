@@ -443,7 +443,7 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
 
     int adv = coal_strips - 1;
     int c_uhi = (s + coal_strips) << 4;
-    int next_px1 = (c_uhi >= u_end) ? ctx->p1->px : ((cur_px_fp + step_px_fp * adv + 0x8000) >> 16);
+    int next_px1 = (c_uhi >= u_end) ? ctx->p1->px : ((cur_px_fp + step_px_fp * adv) >> 16);
     int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? 52 : 1000;
     if (next_px1 - s_px0 > max_coal_dx)
         return 0;
@@ -458,8 +458,8 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     return coal_strips;
 }
 
-static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
-    hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
+    hw_wall_emit_ctx_t *ctx, int s_min, int s_max, uint32_t lin_flags)
 {
     const int u_start = ctx->u_start;
     const int tw = ctx->tw;
@@ -503,58 +503,25 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
         step_ya1_fp = d_ya1 * step_t1;
         if (__builtin_expect((u_start & 15) == 0, 1))
         {
-            cur_px_fp  = (s_px0 << 16) + step_px_fp;
-            cur_ya0_fp = (s_ya0 << 16) + step_ya0_fp;
-            cur_ya1_fp = (s_ya1 << 16) + step_ya1_fp;
+            cur_px_fp  = (s_px0 << 16) + 0x8000 + step_px_fp;
+            cur_ya0_fp = (s_ya0 << 16) + 0x8000 + step_ya0_fp;
+            cur_ya1_fp = (s_ya1 << 16) + 0x8000 + step_ya1_fp;
         }
         else
         {
             int first_du = 16 - (u_start & 15);
             int first_t1 = (int)(((uint32_t)first_du * inv_u_span) >> 8);
-            cur_px_fp  = (s_px0 << 16) + d_px  * first_t1;
-            cur_ya0_fp = (s_ya0 << 16) + d_ya0 * first_t1;
-            cur_ya1_fp = (s_ya1 << 16) + d_ya1 * first_t1;
+            cur_px_fp  = (s_px0 << 16) + 0x8000 + d_px  * first_t1;
+            cur_ya0_fp = (s_ya0 << 16) + 0x8000 + d_ya0 * first_t1;
+            cur_ya1_fp = (s_ya1 << 16) + 0x8000 + d_ya1 * first_t1;
         }
     }
-
-    int u_len = ctx->u_span;
-    int can_coal = (tw == 32 && ctx->srca_mono != srca && u_len >= 32) |
-                   (tw >= 64 && (ctx->srca_64 != srca || ctx->srca_mono != srca) && u_len >= 64);
-
-    int wall_needs_clamp = (s_px0 < -500) | (end_px > 500) |
-        (((((unsigned int)(s_ya1 - s_ya0) | (unsigned int)(end_ya1 - end_ya0)) > 1022u) |
-          HW_ANY_OUT1024(s_ya0, end_ya0, s_ya1, end_ya1)));
-    int ytop_min = ctx->ytop_min;
-    int ybot_max = ctx->ybot_max;
-    int band_all_vis = (s_px0 >= 0) & (end_px <= HW_VIEW_W) &
-                       (s_ya0 < s_ya1) & (end_ya0 < end_ya1) &
-                       (s_ya1 > ytop_min) & (end_ya1 > ytop_min) &
-                       (s_ya0 < ybot_max) & (end_ya0 < ybot_max);
-    int u_end = u_start + u_len;
-    int partial_first = (u_start & 15) != 0;
-    int partial_last  = (u_end & 15) != 0;
-    int has_occl      = (ctx->occl_state != 0);
-    int wall_slow     = (!band_all_vis) | has_occl | wall_needs_clamp;
-    int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
-
-    /* Pack loop flags into a single 32-bit word:
-     * bit 0: can_coal, bit 1: cur_slow, bit 2: band_all_vis, bit 3: wall_slow,
-     * bit 4: is_partial_first, bit 5: partial_last, bit 6: has_occl, bit 7: wall_needs_clamp,
-     * bits 8..15: l_strips, bits 16..31: l_quads */
-    uint32_t lin_flags = (uint32_t)can_coal |
-                         ((uint32_t)first_slow << 1) |
-                         ((uint32_t)band_all_vis << 2) |
-                         ((uint32_t)wall_slow << 3) |
-                         ((uint32_t)partial_first << 4) |
-                         ((uint32_t)partial_last << 5) |
-                         ((uint32_t)has_occl << 6) |
-                         ((uint32_t)wall_needs_clamp << 7);
 
     for (int s = s_min; s <= s_max; s++)
     {
         int coal_strips = 0;
         uint32_t emit_cmd2 = cmd_w2_cur;
-        if (__builtin_expect((lin_flags & 1u) != 0, 0))
+        if (__builtin_expect((lin_flags & 1u) != 0 && ((s & 1) == 0) && (s + 1 <= s_max), 0))
         {
             hw_wall_coord_tmp[0] = cur_px_fp;
             hw_wall_coord_tmp[1] = step_px_fp;
@@ -575,9 +542,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
         int s_px1, s_yb0, s_yb1;
         if (__builtin_expect(s < s_max, 1))
         {
-            s_px1 = (cur_px_fp  + 0x8000) >> 16;
-            s_yb0 = (cur_ya0_fp + 0x8000) >> 16;
-            s_yb1 = (cur_ya1_fp + 0x8000) >> 16;
+            s_px1 = cur_px_fp  >> 16;
+            s_yb0 = cur_ya0_fp >> 16;
+            s_yb1 = cur_ya1_fp >> 16;
             cur_px_fp  += step_px_fp;
             cur_ya0_fp += step_ya0_fp;
             cur_ya1_fp += step_ya1_fp;
@@ -678,12 +645,145 @@ next_strip_lin:
     saturn_hw_wall_strips += l_strips;
 }
 
-static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
+static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+{
+    const int u_start = ctx->u_start;
+    const int u_len   = ctx->u_span;
+    const int u_end   = u_start + u_len;
+    const int tw      = ctx->tw;
+    const int srca    = ctx->srca;
+
+    int s_px0   = ctx->p0->px;
+    int s_ya0   = ctx->ya0;
+    int s_ya1   = ctx->ya1;
+    int end_px  = ctx->p1->px;
+    int end_ya0 = ctx->yb0;
+    int end_ya1 = ctx->yb1;
+
+    int can_coal = (tw == 32 && ctx->srca_mono != srca && (((u_start + 31) & ~31) + 32 <= u_end)) |
+                   (tw >= 64 && ((tw & 63) == 0) && (ctx->srca_64 != srca || ctx->srca_mono != srca) && (((u_start + 63) & ~63) + 64 <= u_end));
+
+    int wall_needs_clamp = (s_px0 < -500) | (end_px > 500) |
+        (((((unsigned int)(s_ya1 - s_ya0) | (unsigned int)(end_ya1 - end_ya0)) > 1022u) |
+          HW_ANY_OUT1024(s_ya0, end_ya0, s_ya1, end_ya1)));
+    int ytop_min = ctx->ytop_min;
+    int ybot_max = ctx->ybot_max;
+    int band_all_vis = (s_px0 >= 0) & (end_px <= HW_VIEW_W) &
+                       (s_ya0 < s_ya1) & (end_ya0 < end_ya1) &
+                       (s_ya1 > ytop_min) & (end_ya1 > ytop_min) &
+                       (s_ya0 < ybot_max) & (end_ya0 < ybot_max);
+    int partial_first = (u_start & 15) != 0;
+    int partial_last  = (u_end & 15) != 0;
+    int has_occl      = (ctx->occl_state != 0);
+    int wall_slow     = (!band_all_vis) | has_occl | wall_needs_clamp;
+    int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
+
+    uint32_t lin_flags = (uint32_t)can_coal |
+                         ((uint32_t)first_slow << 1) |
+                         ((uint32_t)band_all_vis << 2) |
+                         ((uint32_t)wall_slow << 3) |
+                         ((uint32_t)partial_first << 4) |
+                         ((uint32_t)partial_last << 5) |
+                         ((uint32_t)has_occl << 6) |
+                         ((uint32_t)wall_needs_clamp << 7);
+
+    uint16_t m_start = saturn_cmd_m_count;
+    if (__builtin_expect((lin_flags & (1u | 2u | 8u | 32u)) != 0 ||
+                         ((tw & (tw - 1)) != 0) ||
+                         (int)m_start + (s_max - s_min + 1) >= CMDBUF_M_CAP - 1, 0))
+    {
+        HW_EmitWallStrips_Linear_General(ctx, s_min, s_max, lin_flags);
+        return;
+    }
+
+    /* Zero-Call Leaf Fast Path: 100% in registers, 7-cycle SH-2 swap.w+xtrct vertex packing,
+     * shared edge reuse (w_left_top = w_right_top), and direct cmd32 pointer stepping! */
+    int num_strips = (tw > 0) ? (tw >> 4) : 1;
+    if (num_strips <= 0) num_strips = 1;
+    int cur_strip_idx = s_min & (num_strips - 1);
+    int th = ctx->th;
+
+    uint32_t size_lo     = (2u << 8) | ((uint32_t)ctx->rows & 0xFFu);
+    uint32_t srca_v      = (uint32_t)(srca + (ctx->cur_v << 1));
+    uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
+    uint32_t cmd_w2_step = (uint32_t)th << 17;
+    uint32_t cmd_w2_wrap = (uint32_t)num_strips * cmd_w2_step;
+    uint32_t cmd_w2_end  = cmd_w2_base + cmd_w2_wrap;
+    uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
+    uint32_t cmd_header1 = ctx->cmd_header1;
+    uint32_t w_left_top  = ((uint32_t)s_px0 << 16) | (uint16_t)s_ya0;
+    uint32_t w_left_bot  = ((uint32_t)s_px0 << 16) | (uint16_t)s_ya1;
+    aliased_uint32_t *cmd32 = (aliased_uint32_t *)&saturn_cmd_m[m_start];
+
+    int rem = s_max - s_min;
+    if (rem > 0)
+    {
+        int step_t1     = (int)(ctx->inv_u_span >> 4);
+        int step_px_fp  = (end_px  - s_px0) * step_t1;
+        int step_ya0_fp = (end_ya0 - s_ya0) * step_t1;
+        int step_ya1_fp = (end_ya1 - s_ya1) * step_t1;
+        int cur_px_fp   = (s_px0 << 16) + 0x8000 + step_px_fp;
+        int cur_ya0_fp  = (s_ya0 << 16) + 0x8000 + step_ya0_fp;
+        int cur_ya1_fp  = (s_ya1 << 16) + 0x8000 + step_ya1_fp;
+
+        do {
+            int s_px1;
+            uint32_t w_right_top, w_right_bot;
+            HW_PackLinearStripRight(cur_px_fp, cur_ya0_fp, cur_ya1_fp, &s_px1, &w_right_top, &w_right_bot);
+            cur_px_fp  += step_px_fp;
+            cur_ya0_fp += step_ya0_fp;
+            cur_ya1_fp += step_ya1_fp;
+            if (s_px1 > s_px0)
+            {
+                cmd32[0] = 0x00020000u;
+                cmd32[1] = cmd_header1;
+                cmd32[2] = cmd_w2_cur;
+                cmd32[3] = w_left_top;
+                cmd32[4] = w_right_top;
+                cmd32[5] = w_right_bot;
+                cmd32[6] = w_left_bot;
+                cmd32[7] = 0;
+                cmd32 += 8;
+            }
+            s_px0      = s_px1;
+            w_left_top = w_right_top;
+            w_left_bot = w_right_bot;
+            cmd_w2_cur += cmd_w2_step;
+            if (__builtin_expect(cmd_w2_cur >= cmd_w2_end, 0))
+                cmd_w2_cur -= cmd_w2_wrap;
+        } while (--rem > 0);
+    }
+
+    if (end_px > s_px0)
+    {
+        uint32_t end_xb_p = (uint32_t)end_px << 16;
+        cmd32[0] = 0x00020000u;
+        cmd32[1] = cmd_header1;
+        cmd32[2] = cmd_w2_cur;
+        cmd32[3] = w_left_top;
+        cmd32[4] = end_xb_p | (uint16_t)end_ya0;
+        cmd32[5] = end_xb_p | (uint16_t)end_ya1;
+        cmd32[6] = w_left_bot;
+        cmd32[7] = 0;
+        cmd32 += 8;
+    }
+
+    uint16_t m_end = (uint16_t)((vdp1_cmd_t *)cmd32 - saturn_cmd_m);
+    unsigned int l_quads = (unsigned int)(m_end - m_start);
+    saturn_cmd_m_count    = m_end;
+    saturn_v1w_cells      += (int)l_quads;
+    saturn_hw_wall_quads  += l_quads;
+    saturn_hw_wall_strips += l_quads;
+}
+
+static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
+    hw_wall_emit_ctx_t *ctx, int s_min, int s_max, uint32_t persp_flags)
 {
     const hw_trans_pillar_t *p0 = ctx->p0;
     const hw_trans_pillar_t *p1 = ctx->p1;
     const int u_start = ctx->u_start;
+    const int u_end   = u_start + ctx->u_span;
     const int tw = ctx->tw;
     const int th = ctx->th;
 
@@ -701,23 +801,14 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     uint32_t cmd_w2_end  = cmd_w2_base + (uint32_t)num_strips * cmd_w2_step;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
 
-    int s_px0   = p0->px;
-    int s_ya0   = ctx->ya0;
-    int s_ya1   = ctx->ya1;
+    int s_px0     = p0->px;
+    int s_ya0     = ctx->ya0;
+    int s_ya1     = ctx->ya1;
     fixed_t s_cz0 = p0->cz;
-    int end_px  = p1->px;
-    int end_ya0 = ctx->yb0;
-    int end_ya1 = ctx->yb1;
-
-    int light_s = ctx->seg->baked_light >> 4;
-    int const_light = 1;
-    if (light_s < 15)
-    {
-        const uint16_t *zlight_row = wall_zlight_cmdcolr_LUT[light_s];
-        unsigned int zb0 = (unsigned int)p0->cz >> 20; if (zb0 > 127u) zb0 = 127u;
-        unsigned int zb1 = (unsigned int)p1->cz >> 20; if (zb1 > 127u) zb1 = 127u;
-        const_light = (zlight_row[zb0] == zlight_row[zb1]);
-    }
+    int vcy_top   = HW_VIEW_CY - ctx->top_overlap;
+    int vcy_bot   = HW_VIEW_CY + ctx->bot_overlap;
+    int dz_top    = ctx->dz_top;
+    int dz_bot    = ctx->dz_bot;
 
     fixed_t cur_cx1 = 0, cur_cz1 = 0, step_cx1 = 0, step_cz1 = 0;
     if (s_min < s_max)
@@ -733,37 +824,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
         cur_cz1 += p0->cz;
         HW_FixedMulPair(d_cx, step_t1, d_cz, step_t1, &step_cx1, &step_cz1);
     }
-
-    int wall_needs_clamp = (s_px0 < -500) | (end_px > 500) |
-        (((((unsigned int)(s_ya1 - s_ya0) | (unsigned int)(end_ya1 - end_ya0)) > 1022u) |
-          HW_ANY_OUT1024(s_ya0, end_ya0, s_ya1, end_ya1)));
-    int ytop_min = ctx->ytop_min;
-    int ybot_max = ctx->ybot_max;
-    int band_all_vis = (s_px0 >= 0) & (end_px <= HW_VIEW_W) &
-                       (s_ya0 < s_ya1) & (end_ya0 < end_ya1) &
-                       (s_ya1 > ytop_min) & (end_ya1 > ytop_min) &
-                       (s_ya0 < ybot_max) & (end_ya0 < ybot_max);
-    int u_end = u_start + ctx->u_span;
-    int partial_first = (u_start & 15) != 0;
-    int partial_last  = (u_end & 15) != 0;
-    int has_occl      = (ctx->occl_state != 0);
-    int wall_slow     = (!const_light) | (!band_all_vis) | has_occl | wall_needs_clamp;
-    int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
-    int can_coal      = (tw >= 64) & ((tw & (tw - 1)) == 0) & ((ctx->srca_64 != ctx->srca) | (ctx->srca_mono != ctx->srca)) & (ctx->u_span >= 64);
-
-    /* Pack loop flags into a single 32-bit word:
-     * bit 0: const_light, bit 1: cur_slow, bit 2: band_all_vis, bit 3: wall_slow,
-     * bit 4: is_partial_first, bit 5: partial_last, bit 6: has_occl, bit 7: wall_needs_clamp,
-     * bit 8: can_coal, bits 16..31: l_quads */
-    uint32_t persp_flags = (uint32_t)const_light |
-                           ((uint32_t)first_slow << 1) |
-                           ((uint32_t)band_all_vis << 2) |
-                           ((uint32_t)wall_slow << 3) |
-                           ((uint32_t)partial_first << 4) |
-                           ((uint32_t)partial_last << 5) |
-                           ((uint32_t)has_occl << 6) |
-                           ((uint32_t)wall_needs_clamp << 7) |
-                           ((uint32_t)can_coal << 8);
 
     for (int s = s_min; s <= s_max; s++)
     {
@@ -806,12 +866,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
             s_cz1 = cur_cz1;
             cur_cx1 += step_cx1;
             cur_cz1 += step_cz1;
-            if (s_cz1 < HW_NEAR_Z) s_cz1 = HW_NEAR_Z;
+            if (__builtin_expect(s_cz1 < HW_NEAR_Z, 0)) s_cz1 = HW_NEAR_Z;
             int s_scale1 = HW_FastDiv(s_cz1);
-            s_px1 = HW_ProjX(s_cx1, s_scale1, HW_VIEW_CX);
-            HW_ProjYPair(HW_VIEW_CY, ctx->dz_top, s_scale1, ctx->dz_bot, s_scale1, &s_yb0, &s_yb1);
-            s_yb0 -= ctx->top_overlap;
-            s_yb1 += ctx->bot_overlap;
+            HW_ProjPerspStrip_SH2(s_cx1, dz_top, dz_bot, s_scale1, vcy_top, vcy_bot, &s_px1, &s_yb0, &s_yb1);
         }
         else
         {
@@ -922,6 +979,156 @@ next_strip_persp:
     saturn_hw_wall_strips += l_quads;
 }
 
+static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
+    hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+{
+    const hw_trans_pillar_t *p0 = ctx->p0;
+    const hw_trans_pillar_t *p1 = ctx->p1;
+    const int u_start = ctx->u_start;
+    const int u_end   = u_start + ctx->u_span;
+    const int tw      = ctx->tw;
+
+    int s_px0   = p0->px;
+    int s_ya0   = ctx->ya0;
+    int s_ya1   = ctx->ya1;
+    int end_px  = p1->px;
+    int end_ya0 = ctx->yb0;
+    int end_ya1 = ctx->yb1;
+
+    int light_s = ctx->seg->baked_light >> 4;
+    int const_light = 1;
+    if (light_s < 15)
+    {
+        const uint16_t *zlight_row = wall_zlight_cmdcolr_LUT[light_s];
+        unsigned int zb0 = (unsigned int)p0->cz >> 20; if (zb0 > 127u) zb0 = 127u;
+        unsigned int zb1 = (unsigned int)p1->cz >> 20; if (zb1 > 127u) zb1 = 127u;
+        const_light = (zlight_row[zb0] == zlight_row[zb1]);
+    }
+
+    int wall_needs_clamp = (s_px0 < -500) | (end_px > 500) |
+        (((((unsigned int)(s_ya1 - s_ya0) | (unsigned int)(end_ya1 - end_ya0)) > 1022u) |
+          HW_ANY_OUT1024(s_ya0, end_ya0, s_ya1, end_ya1)));
+    int ytop_min = ctx->ytop_min;
+    int ybot_max = ctx->ybot_max;
+    int band_all_vis = (s_px0 >= 0) & (end_px <= HW_VIEW_W) &
+                       (s_ya0 < s_ya1) & (end_ya0 < end_ya1) &
+                       (s_ya1 > ytop_min) & (end_ya1 > ytop_min) &
+                       (s_ya0 < ybot_max) & (end_ya0 < ybot_max);
+    int partial_first = (u_start & 15) != 0;
+    int partial_last  = (u_end & 15) != 0;
+    int has_occl      = (ctx->occl_state != 0);
+    int wall_slow     = (!const_light) | (!band_all_vis) | has_occl | wall_needs_clamp;
+    int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
+    int can_coal      = (tw >= 64) & ((tw & 63) == 0) & ((ctx->srca_64 != ctx->srca) | (ctx->srca_mono != ctx->srca)) & (((u_start + 63) & ~63) + 64 <= u_end);
+
+    uint32_t persp_flags = (uint32_t)const_light |
+                           ((uint32_t)first_slow << 1) |
+                           ((uint32_t)band_all_vis << 2) |
+                           ((uint32_t)wall_slow << 3) |
+                           ((uint32_t)partial_first << 4) |
+                           ((uint32_t)partial_last << 5) |
+                           ((uint32_t)has_occl << 6) |
+                           ((uint32_t)wall_needs_clamp << 7) |
+                           ((uint32_t)can_coal << 8);
+
+    uint16_t m_start = saturn_cmd_m_count;
+    if (__builtin_expect((persp_flags & (2u | 8u | 32u | 256u)) != 0 ||
+                         ((tw & (tw - 1)) != 0) ||
+                         (int)m_start + (s_max - s_min + 1) >= CMDBUF_M_CAP - 1, 0))
+    {
+        HW_EmitWallStrips_Persp_General(ctx, s_min, s_max, persp_flags);
+        return;
+    }
+
+    /* Zero-Call Leaf Fast Path for perspective strips:
+     * Direct SATURN_OCLUT lookup, 0-stall 3x dmuls.l projection, shared edge reuse, and direct cmd32 pointer stepping! */
+    int num_strips = (tw > 0) ? (tw >> 4) : 1;
+    if (num_strips <= 0) num_strips = 1;
+    int cur_strip_idx = s_min & (num_strips - 1);
+    int th = ctx->th;
+
+    uint32_t size_lo     = (2u << 8) | ((uint32_t)ctx->rows & 0xFFu);
+    uint32_t srca_v      = (uint32_t)(ctx->srca + (ctx->cur_v << 1));
+    uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
+    uint32_t cmd_w2_step = (uint32_t)th << 17;
+    uint32_t cmd_w2_wrap = (uint32_t)num_strips * cmd_w2_step;
+    uint32_t cmd_w2_end  = cmd_w2_base + cmd_w2_wrap;
+    uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
+    uint32_t cmd_header1 = ctx->cmd_header1;
+    uint32_t w_left_top  = ((uint32_t)s_px0 << 16) | (uint16_t)s_ya0;
+    uint32_t w_left_bot  = ((uint32_t)s_px0 << 16) | (uint16_t)s_ya1;
+    aliased_uint32_t *cmd32 = (aliased_uint32_t *)&saturn_cmd_m[m_start];
+
+    int rem = s_max - s_min;
+    if (rem > 0)
+    {
+        int step_t1      = (int)(ctx->inv_u_span >> 4);
+        int d_cx         = p1->cx - p0->cx;
+        int d_cz         = p1->cz - p0->cz;
+        fixed_t step_cx1, step_cz1;
+        HW_FixedMulPair(d_cx, step_t1, d_cz, step_t1, &step_cx1, &step_cz1);
+        fixed_t cur_cx1  = p0->cx + step_cx1;
+        fixed_t cur_cz1  = p0->cz + step_cz1;
+        int vcy_top      = HW_VIEW_CY - ctx->top_overlap;
+        int vcy_bot      = HW_VIEW_CY + ctx->bot_overlap;
+        int dz_top       = ctx->dz_top;
+        int dz_bot       = ctx->dz_bot;
+
+        do {
+            fixed_t s_cx1 = cur_cx1;
+            fixed_t s_cz1 = cur_cz1;
+            cur_cx1 += step_cx1;
+            cur_cz1 += step_cz1;
+            if (__builtin_expect(s_cz1 < HW_NEAR_Z, 0)) s_cz1 = HW_NEAR_Z;
+            int s_scale1 = HW_FastDiv(s_cz1);
+            int s_px1, s_yb0, s_yb1;
+            HW_ProjPerspStrip_SH2(s_cx1, dz_top, dz_bot, s_scale1, vcy_top, vcy_bot, &s_px1, &s_yb0, &s_yb1);
+            uint32_t s_xb_p      = (uint32_t)s_px1 << 16;
+            uint32_t w_right_top = s_xb_p | (uint16_t)s_yb0;
+            uint32_t w_right_bot = s_xb_p | (uint16_t)s_yb1;
+            if (s_px1 > s_px0)
+            {
+                cmd32[0] = 0x00020000u;
+                cmd32[1] = cmd_header1;
+                cmd32[2] = cmd_w2_cur;
+                cmd32[3] = w_left_top;
+                cmd32[4] = w_right_top;
+                cmd32[5] = w_right_bot;
+                cmd32[6] = w_left_bot;
+                cmd32[7] = 0;
+                cmd32 += 8;
+            }
+            s_px0      = s_px1;
+            w_left_top = w_right_top;
+            w_left_bot = w_right_bot;
+            cmd_w2_cur += cmd_w2_step;
+            if (__builtin_expect(cmd_w2_cur >= cmd_w2_end, 0))
+                cmd_w2_cur -= cmd_w2_wrap;
+        } while (--rem > 0);
+    }
+
+    if (end_px > s_px0)
+    {
+        uint32_t end_xb_p = (uint32_t)end_px << 16;
+        cmd32[0] = 0x00020000u;
+        cmd32[1] = cmd_header1;
+        cmd32[2] = cmd_w2_cur;
+        cmd32[3] = w_left_top;
+        cmd32[4] = end_xb_p | (uint16_t)end_ya0;
+        cmd32[5] = end_xb_p | (uint16_t)end_ya1;
+        cmd32[6] = w_left_bot;
+        cmd32[7] = 0;
+        cmd32 += 8;
+    }
+
+    uint16_t m_end = (uint16_t)((vdp1_cmd_t *)cmd32 - saturn_cmd_m);
+    unsigned int l_quads = (unsigned int)(m_end - m_start);
+    saturn_cmd_m_count    = m_end;
+    saturn_v1w_cells      += (int)l_quads;
+    saturn_hw_wall_quads  += l_quads;
+    saturn_hw_wall_strips += l_quads;
+}
+
 HW_ALWAYS_INLINE void HW_EmitWallStrips(hw_wall_emit_ctx_t *ctx)
 {
     int u_span = ctx->u_span;
@@ -989,7 +1196,7 @@ static HW_NOINLINE HW_COLD_OS void HW_TransformPillar_Shifted(
 }
 
 /* Pure zero-push leaf function: takes 3 register arguments (r4=idx, r5=dx, r6=dy), 0 stack arguments.
- * For |dx|, |dy| <= 1400, cz >> 16 is mathematically guaranteed <= 1401*sqrt(2) + 1 = 1982 < 2048,
+ * For |dx|, |dy| <= 2047, pdx/pdy fit in int16_t for 1-cycle muls.w and cz >> 16 <= 2897 < 4096,
  * allowing direct SATURN_OCLUT indexing with zero jsr calls and zero register saves! */
 static HW_NOINLINE HW_HOT_O2 void HW_TransformSubsectorPillar(int idx, int dx, int dy)
 {
@@ -1399,14 +1606,24 @@ static HW_NOINLINE HW_COLD_OS void HW_ClipPortalScales(
     hw_wall_coord_tmp[1] = s_B;
 }
 
-/* Takes 2 register arguments (r4=ctx, r5=bsec_idx), 0 stack arguments! */
+static unsigned int hw_prof_segs_acc = 0;
+static unsigned int hw_prof_wseg_acc = 0;
+static unsigned int hw_prof_wquad_acc = 0;
+static unsigned int hw_prof_sportal_acc = 0;
+static unsigned int hw_prof_unb_acc = 0;
+
+/* Takes 2 register arguments (r4=ctx, r5=bsec_idx), 0 stack arguments!
+ * Uses 16-byte hw_sec_fast_t (1 SH-2 cache line, indexed by bsec_idx << 4) with pre-subtracted dz_ceil/dz_floor. */
 static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     hw_wall_emit_ctx_t *ctx, int bsec_idx)
 {
     ctx->portal_recorded = 1;
-    if (ctx->seg_sx >= ctx->seg_ex || (unsigned)bsec_idx >= (unsigned)numsectors)
+    if (ctx->seg_sx >= ctx->seg_ex || (unsigned)bsec_idx >= HW_MAX_AP_SECTORS)
         return;
 
+#if HW_PROF_SUBTIMERS
+    unsigned short tsp0 = SAT_FRT();
+#endif
     const hw_trans_pillar_t *p0 = ctx->p0;
     const hw_trans_pillar_t *p1 = ctx->p1;
     int xa  = p0->px;
@@ -1422,9 +1639,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
 
     int s_min = (s_A < s_B) ? s_A : s_B;
     int s_max = (s_A > s_B) ? s_A : s_B;
-    const sector_t *bsec = &sectors[bsec_idx];
+    hw_sec_fast_t *bsec_f = &hw_sec_fast[bsec_idx];
+    int32_t b_dz_ceil  = bsec_f->dz_ceil;
+    int32_t b_dz_floor = bsec_f->dz_floor;
+    int32_t f_dz_ceil  = ctx->sec_ceiling;
+    int32_t f_dz_floor = ctx->sec_floor;
     hw_aperture_state_t *ap = HW_APERTURE;
-    const fixed_t vz = hw_viewz;
     const int vcy = HW_VIEW_CY;
     const int vh  = HW_VIEW_H;
     int p_yt = 0;
@@ -1432,54 +1652,48 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     int yt_att = ap->cur_sub_yt_attach;
     int yb_att = ap->cur_sub_yb_attach;
 
-    if (!ctx->is_sky_ceil || ((int16_t)bsec->ceilingpic != -1 && ctx->sec_ceiling > bsec->ceilingheight))
+    if (!ctx->is_sky_ceil || (!bsec_f->is_sky && f_dz_ceil > b_dz_ceil))
     {
-        fixed_t open_top = (ctx->sec_ceiling < bsec->ceilingheight) ? ctx->sec_ceiling : bsec->ceilingheight;
-        if (ctx->sec_ceiling > bsec->ceilingheight || open_top > vz)
+        int32_t dzt = (f_dz_ceil < b_dz_ceil) ? f_dz_ceil : b_dz_ceil;
+        if (f_dz_ceil > b_dz_ceil || dzt > 0)
         {
-            int dzt = HW_DZQ(open_top, vz);
             int yt_min = HW_ProjY(dzt, (dzt >= 0) ? s_max : s_min, vcy);
 
-            if ((int16_t)bsec->ceilingpic != -1 && (unsigned)bsec_idx < HW_MAX_AP_SECTORS)
+            if (!bsec_f->is_sky)
             {
                 int b_yt_att = (yt_min < 0) ? 0 : yt_min;
-                if (b_yt_att < ap->sec_yt_attach[bsec_idx])
-                    ap->sec_yt_attach[bsec_idx] = (int16_t)b_yt_att;
+                if (b_yt_att < bsec_f->yt_attach)
+                    bsec_f->yt_attach = (int16_t)b_yt_att;
             }
             int yt_pad = (s_max < 8192) ? 0 : 1;
             if (yt_min - yt_pad > ctx->ytop_min)
             {
                 p_yt = yt_min - yt_pad;
-                if (ctx->sec_ceiling > bsec->ceilingheight)
+                if (f_dz_ceil > b_dz_ceil)
                 {
-                    int dzt_hi = HW_DZQ(ctx->sec_ceiling, vz);
-                    int w_yt_att = HW_ProjY(dzt_hi, (dzt_hi >= 0) ? s_max : s_min, vcy);
+                    int w_yt_att = HW_ProjY(f_dz_ceil, (f_dz_ceil >= 0) ? s_max : s_min, vcy);
                     if (w_yt_att < yt_att) yt_att = w_yt_att;
                 }
             }
         }
     }
 
-    fixed_t open_bot = (ctx->sec_floor > bsec->floorheight) ? ctx->sec_floor : bsec->floorheight;
-    if (ctx->sec_floor < bsec->floorheight || open_bot < vz)
+    int32_t dzb = (f_dz_floor > b_dz_floor) ? f_dz_floor : b_dz_floor;
+    if (f_dz_floor < b_dz_floor || dzb < 0)
     {
-        int dzb = HW_DZQ(open_bot, vz);
         int yb_max = HW_ProjY(dzb, (dzb <= 0) ? s_max : s_min, vcy);
 
-        if ((unsigned)bsec_idx < HW_MAX_AP_SECTORS)
-        {
-            int b_yb_att = (yb_max > vh) ? vh : yb_max;
-            if (b_yb_att > ap->sec_yb_attach[bsec_idx])
-                ap->sec_yb_attach[bsec_idx] = (int16_t)b_yb_att;
-        }
+        int b_yb_att = (yb_max > vh) ? vh : yb_max;
+        if (b_yb_att > bsec_f->yb_attach)
+            bsec_f->yb_attach = (int16_t)b_yb_att;
+
         int yb_pad = (s_max < 8192) ? 0 : 1;
         if (yb_max + yb_pad < ctx->ybot_max)
         {
             p_yb = yb_max + yb_pad;
-            if (ctx->sec_floor < bsec->floorheight)
+            if (f_dz_floor < b_dz_floor)
             {
-                int dzb_lo = HW_DZQ(ctx->sec_floor, vz);
-                int w_yb_att = HW_ProjY(dzb_lo, (dzb_lo <= 0) ? s_max : s_min, vcy);
+                int w_yb_att = HW_ProjY(f_dz_floor, (f_dz_floor <= 0) ? s_max : s_min, vcy);
                 if (w_yb_att > yb_att) yb_att = w_yb_att;
             }
         }
@@ -1487,9 +1701,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
 
     if (p_yt > 0 || p_yb < vh)
         HW_RecordPortalSpan(((int)ctx->seg_sx << 16) | (uint16_t)ctx->seg_ex, p_yt, p_yb, (yt_att << 16) | (uint16_t)yb_att);
+#if HW_PROF_SUBTIMERS
+    hw_prof_sportal_acc += HW_ProfDelta(tsp0, SAT_FRT());
+#endif
 }
-
-static unsigned int hw_prof_segs_acc = 0;
 
 #if defined(__GNUC__) && !defined(__clang__)
 #define HW_HOT_O2_NOTHREAD __attribute__((optimize("O2,no-thread-jumps")))
@@ -1715,6 +1930,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
 
 static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t *ctx)
 {
+#if HW_PROF_SUBTIMERS
+    unsigned short twq0 = SAT_FRT();
+#endif
     const hw_trans_pillar_t *p0 = ctx->p0;
     const hw_trans_pillar_t *p1 = ctx->p1;
     int dx = p1->px - p0->px;
@@ -1722,6 +1940,9 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
     if (__builtin_expect(ctx->was_near_clipped, 0))
     {
         HW_EmitSubdividedBakedSeg(ctx, (dx >= 24 && saturn_wall_subdivision));
+#if HW_PROF_SUBTIMERS
+        hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
+#endif
         return;
     }
 
@@ -1765,6 +1986,9 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
             HW_NeedPerspectiveStrips(dx, u_span, p0->cz, p1->cz, tw))
         {
             HW_EmitSubdividedBakedSeg(ctx, 1);
+#if HW_PROF_SUBTIMERS
+            hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
+#endif
             return;
         }
 
@@ -1811,6 +2035,9 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         HW_EmitSubdividedBakedSeg(ctx, 0);
     else
         HW_EmitMonolithicBakedSeg(ctx, mono_tw, mono_base_srca, needs_clip);
+#if HW_PROF_SUBTIMERS
+    hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
+#endif
 }
 
 static HW_NOINLINE HW_COLD_OS void HW_OccludeZeroHeightSeg(
@@ -1827,15 +2054,15 @@ static HW_NOINLINE HW_COLD_OS void HW_OccludeZeroHeightSeg(
             return;
     }
 
-    const sector_t *bsec = &sectors[bsec_idx];
+    const hw_sec_fast_t *bsec_f = &hw_sec_fast[bsec_idx];
     int occlude_only = 0;
     if (is_solid)
     {
         occlude_only = 1;
     }
     else if (!ctx->portal_recorded &&
-             ((!ctx->is_sky_ceil && (ctx->sec_ceiling != bsec->ceilingheight || ctx->sec_ceiling > hw_viewz)) ||
-              (ctx->sec_floor != bsec->floorheight || ctx->sec_floor < hw_viewz)))
+             ((!ctx->is_sky_ceil && (ctx->sec_ceiling != bsec_f->dz_ceil || ctx->sec_ceiling > 0)) ||
+              (ctx->sec_floor != bsec_f->dz_floor || ctx->sec_floor < 0)))
     {
         occlude_only = 2;
     }
@@ -1879,14 +2106,14 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     if (seg_flags & (SEG_FLAG_LOWER | SEG_FLAG_UPPER))
     {
         bsec_idx = seg->back_sec_idx;
-        if (__builtin_expect((unsigned)bsec_idx >= (unsigned)numsectors, 0))
+        if (__builtin_expect((unsigned)bsec_idx >= HW_MAX_AP_SECTORS, 0))
             return;
-        const sector_t *bsec = &sectors[bsec_idx];
-        fixed_t bceil  = bsec->ceilingheight;
-        fixed_t bfloor = bsec->floorheight;
+        const hw_sec_fast_t *bsec_f = &hw_sec_fast[bsec_idx];
+        fixed_t bceil  = bsec_f->dz_ceil;
+        fixed_t bfloor = bsec_f->dz_floor;
         fixed_t mbot   = (sec_floor > bfloor) ? sec_floor : bfloor;
         fixed_t mtop   = (sec_ceiling < bceil) ? sec_ceiling : bceil;
-        is_solid = (!ctx->is_sky_ceil && (int16_t)bsec->ceilingpic != -1 && mtop <= mbot);
+        is_solid = (!ctx->is_sky_ceil && !bsec_f->is_sky && mtop <= mbot);
 
         top_world_z = (seg_flags & SEG_FLAG_UPPER) ? sec_ceiling : bfloor;
         bot_world_z = (seg_flags & SEG_FLAG_UPPER) ? bceil       : sec_floor;
@@ -1918,13 +2145,13 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
         {
             is_solid = 0;
             bsec_idx = seg->back_sec_idx;
-            if ((unsigned)bsec_idx < (unsigned)numsectors)
+            if ((unsigned)bsec_idx < HW_MAX_AP_SECTORS)
             {
-                const sector_t *bsec = &sectors[bsec_idx];
-                if (bsec->ceilingheight < top_world_z)
-                    top_world_z = bsec->ceilingheight;
-                if (bsec->floorheight > bot_world_z)
-                    bot_world_z = bsec->floorheight;
+                const hw_sec_fast_t *bsec_f = &hw_sec_fast[bsec_idx];
+                if (bsec_f->dz_ceil < top_world_z)
+                    top_world_z = bsec_f->dz_ceil;
+                if (bsec_f->dz_floor > bot_world_z)
+                    bot_world_z = bsec_f->dz_floor;
             }
         }
         if (__builtin_expect(top_world_z <= bot_world_z, 0))
@@ -1938,9 +2165,8 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     int wall_h = (top_world_z - bot_world_z) >> FRACBITS;
     if (__builtin_expect(wall_h <= 0, 0))
         wall_h = 1;
-    const fixed_t vz      = hw_viewz;
-    ctx->dz_top           = HW_DZQ(top_world_z, vz);
-    ctx->dz_bot           = HW_DZQ(bot_world_z, vz);
+    ctx->dz_top           = top_world_z;
+    ctx->dz_bot           = bot_world_z;
     ctx->wall_h           = (int16_t)wall_h;
     ctx->cur_v            = (int16_t)v_base;
     ctx->was_near_clipped = 0;
@@ -2357,7 +2583,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_WalkSubsectorBakedSegs(
 /* Master Blueprint: Zero-Runtime-Math 1D LOD Subsector Wall Renderer (Phase 3)
  * Fast Culling & Pillar Projection Loop (< 400 bytes, zero register spills):
  * rejects ~72% of segs in registers and dispatches surviving visible segs to HW_EmitVisibleBakedSeg. */
-static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector_t *sec)
+static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const hw_sec_fast_t *sf)
 {
     if (!saturn_baked_walls_active || (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
         return 0;
@@ -2367,13 +2593,21 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
     int num_segs = (int)ss->num_segs;
     hw_wctx.portal_first = ss->portal_first;
     hw_wctx.portal_count = ss->portal_count;
-    hw_wctx.sec_ceiling  = sec->ceilingheight;
-    hw_wctx.sec_floor    = sec->floorheight;
-    hw_wctx.is_sky_ceil  = (uint8_t)((int16_t)sec->ceilingpic == -1);
+    hw_wctx.sec_ceiling  = sf->dz_ceil;
+    hw_wctx.sec_floor    = sf->dz_floor;
+    hw_wctx.is_sky_ceil  = sf->is_sky;
     if (num_segs <= 0)
     {
         if (hw_wctx.portal_count > 0 && hw_solid_count < HW_VIEW_W)
+        {
+#if HW_PROF_SUBTIMERS
+            unsigned short tu0 = SAT_FRT();
+#endif
             HW_RecordSubsectorUnbakedPortals(&hw_wctx);
+#if HW_PROF_SUBTIMERS
+            hw_prof_unb_acc += HW_ProfDelta(tu0, SAT_FRT());
+#endif
+        }
         hw_prof_segs_acc += HW_ProfDelta(tw0, SAT_FRT());
         return 1;
     }
@@ -2411,10 +2645,17 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, sector
     hw_wctx.ybot_max     = (int16_t)HW_VIEW_H;
 
     HW_WalkSubsectorBakedSegs(seg, seg_end, pillars);
+#if HW_PROF_SUBTIMERS
+    unsigned short tw1 = SAT_FRT();
+    hw_prof_wseg_acc += HW_ProfDelta(tw0, tw1);
+#endif
 
     if (hw_wctx.portal_count > 0 && hw_solid_count < HW_VIEW_W)
     {
         HW_RecordSubsectorUnbakedPortals(&hw_wctx);
+#if HW_PROF_SUBTIMERS
+        hw_prof_unb_acc += HW_ProfDelta(tw1, SAT_FRT());
+#endif
     }
 
     saturn_hw_seg_iter += (unsigned int)num_segs;
@@ -2450,56 +2691,54 @@ static HW_NOINLINE HW_COLD_OS int HW_CheckNearSubsectorFrustum(const saturn_flat
     return 1;
 }
 
+static const hw_sec_fast_t *hw_psec_fast = NULL;
+
 static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
-    const sector_t *sec, uint32_t secnum_and_flags, int s_max, int s_min)
+    hw_sec_fast_t *sf, uint32_t flags, int s_max, int s_min)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
-    uint32_t secnum  = secnum_and_flags >> 16;
-    int valid_sec    = (secnum < HW_MAX_AP_SECTORS);
-    const fixed_t vz = hw_viewz;
-    const int vcy    = HW_VIEW_CY;
-    const int vh     = HW_VIEW_H;
+    const int vcy = HW_VIEW_CY;
+    const int vh  = HW_VIEW_H;
+    int32_t dzf   = sf->dz_floor;
+    int32_t dzc   = sf->dz_ceil;
+    int is_sky    = sf->is_sky;
 
-    if (__builtin_expect(!(secnum_and_flags & HW_FLAT_AP_OR_NEAR), 1))
+    if (__builtin_expect(!(flags & HW_FLAT_AP_OR_NEAR), 1))
     {
-        if (sec->floorheight < vz)
+        if (dzf < 0)
         {
-            int yf_max = HW_ProjY(HW_DZQ(sec->floorheight, vz), s_max, vcy);
+            int yf_max = HW_ProjY(dzf, s_max, vcy);
             int yb_att = (yf_max > vh) ? vh : yf_max;
-            if (valid_sec)
-            {
-                if (yb_att > ap->sec_yb_attach[secnum])
-                    ap->sec_yb_attach[secnum] = (int16_t)yb_att;
-                yb_att = ap->sec_yb_attach[secnum];
-            }
+            if (yb_att > sf->yb_attach)
+                sf->yb_attach = (int16_t)yb_att;
+            else
+                yb_att = sf->yb_attach;
             ap->cur_sub_yb_attach = (int16_t)yb_att;
         }
         else
         {
-            ap->cur_sub_yb_attach = valid_sec ? ap->sec_yb_attach[secnum] : 0;
+            ap->cur_sub_yb_attach = sf->yb_attach;
         }
 
-        if ((int16_t)sec->ceilingpic != -1 && sec->ceilingheight > vz)
+        if (!is_sky && dzc > 0)
         {
-            int yc_min = HW_ProjY(HW_DZQ(sec->ceilingheight, vz), s_max, vcy);
+            int yc_min = HW_ProjY(dzc, s_max, vcy);
             int yt_att = (yc_min < 0) ? 0 : yc_min;
-            if (valid_sec)
-            {
-                if (yt_att < ap->sec_yt_attach[secnum])
-                    ap->sec_yt_attach[secnum] = (int16_t)yt_att;
-                yt_att = ap->sec_yt_attach[secnum];
-            }
+            if (yt_att < sf->yt_attach)
+                sf->yt_attach = (int16_t)yt_att;
+            else
+                yt_att = sf->yt_attach;
             ap->cur_sub_yt_attach = (int16_t)yt_att;
         }
         else
         {
-            ap->cur_sub_yt_attach = ((int16_t)sec->ceilingpic == -1) ? 0 : (valid_sec ? ap->sec_yt_attach[secnum] : (int16_t)vh);
+            ap->cur_sub_yt_attach = is_sky ? 0 : sf->yt_attach;
         }
-        return (int)((secnum_and_flags & (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK)) | HW_FLAT_ALLOW_BOTH);
+        return (int)((flags & (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK)) | HW_FLAT_ALLOW_BOTH);
     }
 
-    int check_ap     = (int)((secnum_and_flags & HW_FLAT_CHECK_AP) != 0);
-    int near_or_psec = (int)((secnum_and_flags & HW_FLAT_NEAR_OR_PSEC) != 0);
+    int check_ap     = (int)((flags & HW_FLAT_CHECK_AP) != 0);
+    int near_or_psec = (int)((flags & HW_FLAT_NEAR_OR_PSEC) != 0);
     int ytop_min     = ap->cur_ytop_min;
     int ybot_max     = ap->cur_ybot_max;
     int pad          = (s_max < 8192) ? 1 : 2;
@@ -2509,19 +2748,16 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
     int yf_max = vh;
     int yc_min = 0;
 
-    if (sec->floorheight < vz)
+    if (dzf < 0)
     {
-        int dzf = HW_DZQ(sec->floorheight, vz);
         if (!near_or_psec)
         {
             yf_max = HW_ProjY(dzf, s_max, vcy);
             int yb_att = (yf_max > vh) ? vh : yf_max;
-            if (valid_sec)
-            {
-                if (yb_att > ap->sec_yb_attach[secnum])
-                    ap->sec_yb_attach[secnum] = (int16_t)yb_att;
-                yb_att = ap->sec_yb_attach[secnum];
-            }
+            if (yb_att > sf->yb_attach)
+                sf->yb_attach = (int16_t)yb_att;
+            else
+                yb_att = sf->yb_attach;
             ap->cur_sub_yb_attach = (int16_t)yb_att;
             if (check_ap)
             {
@@ -2532,8 +2768,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
         }
         else
         {
-            if (valid_sec)
-                ap->sec_yb_attach[secnum] = (int16_t)vh;
+            sf->yb_attach = (int16_t)vh;
             int yf_min = HW_ProjY(dzf, s_min, vcy);
             if (yf_min >= ybot_max)
                 allow_floor = 0;
@@ -2547,24 +2782,21 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
     }
     else if (!near_or_psec)
     {
-        ap->cur_sub_yb_attach = valid_sec ? ap->sec_yb_attach[secnum] : 0;
+        ap->cur_sub_yb_attach = sf->yb_attach;
     }
 
-    if ((int16_t)sec->ceilingpic != -1)
+    if (!is_sky)
     {
-        if (sec->ceilingheight > vz)
+        if (dzc > 0)
         {
-            int dzc = HW_DZQ(sec->ceilingheight, vz);
             if (!near_or_psec)
             {
                 yc_min = HW_ProjY(dzc, s_max, vcy);
                 int yt_att = (yc_min < 0) ? 0 : yc_min;
-                if (valid_sec)
-                {
-                    if (yt_att < ap->sec_yt_attach[secnum])
-                        ap->sec_yt_attach[secnum] = (int16_t)yt_att;
-                    yt_att = ap->sec_yt_attach[secnum];
-                }
+                if (yt_att < sf->yt_attach)
+                    sf->yt_attach = (int16_t)yt_att;
+                else
+                    yt_att = sf->yt_attach;
                 ap->cur_sub_yt_attach = (int16_t)yt_att;
                 if (check_ap)
                 {
@@ -2575,8 +2807,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
             }
             else
             {
-                if (valid_sec)
-                    ap->sec_yt_attach[secnum] = 0;
+                sf->yt_attach = 0;
                 int yc_max = HW_ProjY(dzc, s_min, vcy);
                 if (yc_max <= ytop_min)
                     allow_ceil = 0;
@@ -2590,7 +2821,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
         }
         else if (!near_or_psec)
         {
-            ap->cur_sub_yt_attach = valid_sec ? ap->sec_yt_attach[secnum] : (int16_t)vh;
+            ap->cur_sub_yt_attach = sf->yt_attach;
         }
     }
     else if (!near_or_psec)
@@ -2600,26 +2831,26 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
 
     if (check_ap)
     {
-        int sub_y_max = (sec->floorheight < vz)
+        int sub_y_max = (dzf < 0)
             ? yf_max
-            : HW_ProjY(HW_DZQ(sec->floorheight, vz), (sec->floorheight <= vz) ? s_max : s_min, vcy);
+            : HW_ProjY(dzf, (dzf <= 0) ? s_max : s_min, vcy);
         if (sub_y_max + pad <= ytop_min)
             return -1;
-        if ((int16_t)sec->ceilingpic != -1)
+        if (!is_sky)
         {
-            int sub_y_min = (sec->ceilingheight > vz)
+            int sub_y_min = (dzc > 0)
                 ? yc_min
-                : HW_ProjY(HW_DZQ(sec->ceilingheight, vz), (sec->ceilingheight >= vz) ? s_max : s_min, vcy);
+                : HW_ProjY(dzc, (dzc >= 0) ? s_max : s_min, vcy);
             if (sub_y_min - pad >= ybot_max)
                 return -1;
         }
     }
 
-    return (int)((secnum_and_flags & (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK)) | ((uint32_t)(allow_floor | (allow_ceil << 1)) << 2));
+    return (int)((flags & (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK)) | ((uint32_t)(allow_floor | (allow_ceil << 1)) << 2));
 }
 
 /* Walk a subsector: returns flat_flags = (fully_inside & 3) | ((allow_floor | (allow_ceil << 1) | use_lod1) << 2), or -1 if culled */
-static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t *sec, int secnum_and_inside)
+static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int secnum_and_inside)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     int fully_inside  = secnum_and_inside & (int)HW_FLAT_INSIDE_MASK;
@@ -2817,39 +3048,39 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
         ap->cur_sub_ybot = (ybot_max + pad < vh) ? (uint8_t)(ybot_max + pad) : (uint8_t)vh;
     }
 
-    int near_or_psec = (any_behind || sec == hw_psec);
+    int near_or_psec = (any_behind || sf == hw_psec_fast);
     if (__builtin_expect((check_ap || near_or_psec) && !s_min, 0))
         s_min = HW_FastDiv(max_cz);
 
-    uint32_t packed = ((uint32_t)(secnum_and_inside & ~0xFF) << 8) |
-                      (near_or_psec ? HW_FLAT_NEAR_OR_PSEC : 0u) |
+    uint32_t packed = (near_or_psec ? HW_FLAT_NEAR_OR_PSEC : 0u) |
                       (check_ap     ? HW_FLAT_CHECK_AP     : 0u) |
                       (uint32_t)use_lod1 |
                       ((uint32_t)fully_inside & HW_FLAT_INSIDE_MASK);
-    int flat_flags = HW_EvalSubsectorFlatAperture(sec, packed, s_max, s_min);
+    int flat_flags = HW_EvalSubsectorFlatAperture(sf, packed, s_max, s_min);
     if (flat_flags >= 0 && check_ap && !near_or_psec &&
         !(flat_flags & (int)HW_FLAT_ALLOW_FLOOR) &&
-        ((int16_t)sec->ceilingpic == -1 || !(flat_flags & (int)HW_FLAT_ALLOW_CEIL)) &&
+        (sf->is_sky || !(flat_flags & (int)HW_FLAT_ALLOW_CEIL)) &&
         saturn_baked_wall_subsectors)
     {
         const saturn_wl_subsector_t *wss = &saturn_baked_wall_subsectors[subnum];
         if (wss->max_bsec0 >= 0)
         {
-            fixed_t z_floor = sectors[wss->max_bsec0].floorheight;
-            int floor_ok = (z_floor <= sec->floorheight) ||
-                           (z_floor <= hw_viewz && HW_ProjY(HW_DZQ(z_floor, hw_viewz), s_min, HW_VIEW_CY) >= ybot_max);
+            int32_t dz_f = hw_sec_fast[wss->max_bsec0].dz_floor;
+            int floor_ok = (dz_f <= sf->dz_floor) ||
+                           (dz_f <= 0 && HW_ProjY(dz_f, s_min, HW_VIEW_CY) >= ybot_max);
             if (floor_ok)
             {
                 int ceil_ok = 1;
                 if (wss->max_bsec1 >= 0)
                 {
-                    fixed_t z_ceil = sectors[wss->max_bsec1].ceilingheight;
-                    ceil_ok = (z_ceil >= sec->ceilingheight) ||
-                              (z_ceil >= hw_viewz && HW_ProjY(HW_DZQ(z_ceil, hw_viewz), s_min, HW_VIEW_CY) <= ytop_min);
+                    int32_t dz_c = hw_sec_fast[wss->max_bsec1].dz_ceil;
+                    ceil_ok = (dz_c >= sf->dz_ceil) ||
+                              (dz_c >= 0 && HW_ProjY(dz_c, s_min, HW_VIEW_CY) <= ytop_min);
                 }
-                if (ceil_ok && !HW_SubsectorHasThings(sec, (uint32_t)(secnum_and_inside >> 8), subnum))
+                int secnum = secnum_and_inside >> 8;
+                if (ceil_ok && (!sf->has_things || !HW_SubsectorHasThings(&sectors[secnum], (uint32_t)secnum, subnum)))
                 {
-                    if ((int16_t)sec->ceilingpic == -1)
+                    if (sf->is_sky)
                         saturn_hw_sky_visible = 1;
                     return -1;
                 }
