@@ -448,7 +448,7 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     if (next_px1 - s_px0 > max_coal_dx)
         return 0;
 
-    if (coal_strips == 4 && (next_px1 - s_px0 <= 52 || srca_64 == srca) && srca_mono != srca)
+    if (coal_strips == 4 && (next_px1 - s_px0 <= 28 || srca_64 == srca) && srca_mono != srca)
     {
         emit_srca = srca_mono + (cur_v << 2) + (cur_strip_idx >> 2) * (th << 2);
         emit_size_hi = 4u << 8;
@@ -749,7 +749,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     int has_occl      = (ctx->occl_state != 0);
     int wall_slow     = (!const_light) | (!band_all_vis) | has_occl | wall_needs_clamp;
     int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
-    int can_coal      = (tw >= 64) & ((tw & (tw - 1)) == 0) & (ctx->srca_mono != ctx->srca) & (ctx->u_span >= 64);
+    int can_coal      = (tw >= 64) & ((tw & (tw - 1)) == 0) & ((ctx->srca_64 != ctx->srca) | (ctx->srca_mono != ctx->srca)) & (ctx->u_span >= 64);
 
     /* Pack loop flags into a single 32-bit word:
      * bit 0: const_light, bit 1: cur_slow, bit 2: band_all_vis, bit 3: wall_slow,
@@ -779,8 +779,16 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
             {
                 coal_strips = 4;
                 int blk = cur_strip_idx >> 2;
-                int emit_srca = (int)ctx->srca_mono + ((int)ctx->cur_v << 2) + blk * (th << 2);
-                emit_cmd2 = ((uint32_t)emit_srca << 16) | (4u << 8) | ((uint32_t)ctx->rows & 0xFFu);
+                if (ctx->srca_64 != ctx->srca)
+                {
+                    int emit_srca = (int)ctx->srca_64 + ((int)ctx->cur_v << 3) + blk * (th << 3);
+                    emit_cmd2 = ((uint32_t)emit_srca << 16) | (8u << 8) | ((uint32_t)ctx->rows & 0xFFu);
+                }
+                else
+                {
+                    int emit_srca = (int)ctx->srca_mono + ((int)ctx->cur_v << 2) + blk * (th << 2);
+                    emit_cmd2 = ((uint32_t)emit_srca << 16) | (4u << 8) | ((uint32_t)ctx->rows & 0xFFu);
+                }
                 cmd_w2_cur += cmd_w2_step * 3u;
                 cur_strip_idx += 3;
                 cur_cx1 += step_cx1 * 3;
@@ -940,7 +948,9 @@ HW_ALWAYS_INLINE int HW_NeedPerspectiveStrips(int dx, int u_span, fixed_t cz0, f
     /* Perpendicular walls: < 12.5% depth change across the wall has minimal affine warping */
     fixed_t min_z = (cz0 < cz1) ? cz0 : cz1;
     fixed_t max_z = (cz0 > cz1) ? cz0 : cz1;
-    if ((max_z - min_z) < (min_z >> 3)) return 0;
+    fixed_t dz = max_z - min_z;
+    if (dz < (min_z >> 3)) return 0;
+    if (min_z > (288 << FRACBITS) && (dx < 32 || dz < (min_z >> 2))) return 0;
     /* Don't subdivide if average strip is < 4 screen pixels wide */
     if ((dx << 4) < (u_span * 4)) return 0;
     return 1;
@@ -1785,7 +1795,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         }
         else if (tw >= 64 && (((u_span ^ 64) | (u_start & 63)) == 0) && (unsigned)u_start < (unsigned)tw)
         {
-            if ((dx <= 48 || (srca_64 == srca && dx <= 56)) && srca_mono != srca)
+            if ((dx <= 28 || (srca_64 == srca && dx <= 56)) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono + (int)(((unsigned)u_start >> 6) * (unsigned)(th << 2));
                 mono_tw = 32;
@@ -2685,6 +2695,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
     int any_behind = 0;
     int s_min = 0, s_max = 0;
 
+    int vh = HW_VIEW_H;
+    int ytop_min = 0;
+    int ybot_max = vh;
     if (__builtin_expect(min_cz < HW_NEAR_Z, 0))
     {
         any_behind = 1;
@@ -2708,38 +2721,54 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
         ex += 2;
         if (sx < 0) sx = 0;
         if (ex > HW_VIEW_W) ex = HW_VIEW_W;
-        if (sx >= ex)
+        int ex_m1 = ex - 1;
+        if (sx > ex_m1)
             return -1;
-        if (!ap->aperture_active && hw_solid_count > 0 && HW_CheckSpanOcclusion(sx, ex) == 2)
+        if (__builtin_expect((unsigned int)(sx ^ ex_m1) < 32u, 1))
+        {
+            int w0 = (int)((unsigned int)sx >> 5);
+            uint32_t sm = hw_solid_mask[w0];
+            if (sm != 0)
+            {
+                uint32_t mask = hw_mask_left[sx & 31] & hw_mask_right[ex_m1 & 31];
+                if ((sm & mask) == mask)
+                    return -1;
+            }
+            if (ap->aperture_active)
+            {
+                ytop_min = hw_ap_words[w0].yt_min;
+                ybot_max = hw_ap_words[w0].yb_max;
+                if (ytop_min >= ybot_max)
+                    return -1;
+            }
+        }
+        else if (ap->aperture_active)
+        {
+            int ap_pack = HW_GetSpanAperture(sx, ex);
+            if (ap_pack < 0)
+                return -1;
+            ytop_min = ap_pack >> 16;
+            ybot_max = (int16_t)ap_pack;
+        }
+        else if (hw_solid_count > 0 && HW_CheckSpanOcclusion(sx, ex) == 2)
+        {
             return -1;
+        }
     }
 
-    int vh = HW_VIEW_H;
     ap->cur_sub_yt_attach = 0;
     ap->cur_sub_yb_attach = (int16_t)vh;
     ap->cur_sub_ytop      = 0;
     ap->cur_sub_ybot      = (uint8_t)vh;
-    ap->cur_ytop_min      = 0;
-    ap->cur_ybot_max      = (int16_t)vh;
+    ap->cur_ytop_min      = (int16_t)ytop_min;
+    ap->cur_ybot_max      = (int16_t)ybot_max;
     int check_ap = 0;
-    int ytop_min = 0;
-    int ybot_max = vh;
-    if (ap->aperture_active && sx < ex)
+    if (ytop_min > 0 || ybot_max < vh)
     {
-        int ap_pack = HW_GetSpanAperture(sx, ex);
-        if (ap_pack < 0)
-            return -1;
-        ytop_min = ap_pack >> 16;
-        ybot_max = (int16_t)ap_pack;
-        ap->cur_ytop_min = (int16_t)ytop_min;
-        ap->cur_ybot_max = (int16_t)ybot_max;
-        if (ytop_min > 0 || ybot_max < vh)
-        {
-            int pad = (s_max < 8192) ? 1 : 2;
-            check_ap = 1;
-            ap->cur_sub_ytop = (ytop_min > pad) ? (uint8_t)(ytop_min - pad) : 0;
-            ap->cur_sub_ybot = (ybot_max + pad < vh) ? (uint8_t)(ybot_max + pad) : (uint8_t)vh;
-        }
+        int pad = (s_max < 8192) ? 1 : 2;
+        check_ap = 1;
+        ap->cur_sub_ytop = (ytop_min > pad) ? (uint8_t)(ytop_min - pad) : 0;
+        ap->cur_sub_ybot = (ybot_max + pad < vh) ? (uint8_t)(ybot_max + pad) : (uint8_t)vh;
     }
 
     int near_or_psec = (any_behind || sec == hw_psec);

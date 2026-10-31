@@ -104,11 +104,11 @@ HW_ALWAYS_INLINE int HW_FlatQuadDy_PreClamped(int x0, int y0, int x1, int y1,
     int dy = (d03 > d12) ? d03 : d12;
     if (d01 > dy) dy = d01;
     if (d32 > dy) dy = d32;
-    if (__builtin_expect(dy > 16, 1))
+    if (__builtin_expect(dy > 24, 1))
     {
         if (((x0 == x1 && y0 == y1) | (x1 == x2 && y1 == y2) |
              (x2 == x3 && y2 == y3) | (x3 == x0 && y3 == y0)))
-            dy = 16;
+            dy = 24;
     }
     return dy;
 }
@@ -134,7 +134,7 @@ HW_ALWAYS_INLINE int HW_FlatTriDy(int y0, int y1, int y2)
     int d01 = y1 - y0; if (d01 < 0) d01 = -d01;
     int dy = (d02 > d12) ? d02 : d12;
     if (d01 > dy) dy = d01;
-    if (dy > 14) dy = 14;
+    if (dy > 24) dy = 24;
     return dy;
 }
 
@@ -144,12 +144,12 @@ static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_siz
     int v0   = (int)(quad_size >> 16);
     int rows = (int)(quad_size & 0xFFu);
 
-    if (dy > 42)
+    if (dy > 26)
     {
         uint32_t srca = (uint32_t)base_srca + (uint32_t)(v0 << 3);
         return (srca << 16) | 0x0800u | (uint32_t)rows;
     }
-    if (dy > 18)
+    if (dy > 11)
     {
         int v0_32   = v0 >> 1;
         int rows_32 = (rows + 1) >> 1;
@@ -158,7 +158,7 @@ static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_siz
         uint32_t srca = (uint32_t)base_srca + 512u + (uint32_t)(v0_32 << 2);
         return (srca << 16) | 0x0400u | (uint32_t)rows_32;
     }
-    if (dy > 5)
+    if (dy > 3)
     {
         int v0_16   = v0 >> 2;
         int rows_16 = (rows + 3) >> 2;
@@ -887,9 +887,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
     uint32_t multi_bits = 0;
     if (__builtin_expect(!(fctx->fully_inside & HW_FLAT_USE_LOD1), 1))
     {
-        if (__builtin_expect(cz_L_min < (96 << FRACBITS) && d03 > 52, 0))
+        if (__builtin_expect(cz_L_min < (112 << FRACBITS) && d03 > 40, 0))
             multi_bits |= 0x4000u;
-        if (__builtin_expect(cz_R_min < (96 << FRACBITS) && d12 > 52, 0))
+        if (__builtin_expect(cz_R_min < (112 << FRACBITS) && d12 > 40, 0))
             multi_bits |= 0x8000u;
     }
 
@@ -1344,22 +1344,36 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
         int dy = (qy * 16) - cam_y16 + (fr & 15);
 
         fixed_t cz, cx;
-        if (__builtin_expect((((unsigned int)dx + 262144u) | ((unsigned int)dy + 262144u)) > 524287u, 0))
+        int s;
+        if (__builtin_expect((((unsigned int)dx + 22400u) | ((unsigned int)dy + 22400u)) <= 44800u, 1))
         {
-            HW_TransformFlatVert_Shifted(dx, dy, fctx, p_ptr);
-            cx = p_ptr->cx;
-            cz = p_ptr->cz;
+            ProjectPillar_2D_16(dx, dy, vcos, vsin, cz_origin, cx_origin, &cz, &cx);
+            p_ptr->cx = cx;
+            p_ptr->cz = cz;
+            if (cz < HW_NEAR_Z)
+                goto vert_behind;
+            s = (int)SATURN_OCLUT[(unsigned int)cz >> FRACBITS];
         }
         else
         {
-            ProjectPillar_2D(dx, dy, vcos, vsin, cz_origin, cx_origin, &cz, &cx);
-            p_ptr->cx = cx;
-            p_ptr->cz = cz;
+            if (__builtin_expect((((unsigned int)dx + 262144u) | ((unsigned int)dy + 262144u)) > 524287u, 0))
+            {
+                HW_TransformFlatVert_Shifted(dx, dy, fctx, p_ptr);
+                cx = p_ptr->cx;
+                cz = p_ptr->cz;
+            }
+            else
+            {
+                ProjectPillar_2D(dx, dy, vcos, vsin, cz_origin, cx_origin, &cz, &cx);
+                p_ptr->cx = cx;
+                p_ptr->cz = cz;
+            }
+            if (cz < HW_NEAR_Z)
+                goto vert_behind;
+            s = HW_FastDiv(cz);
         }
 
-        if (cz >= HW_NEAR_Z)
         {
-            int s = HW_FastDiv(cz);
 
             if (emit_ceil && emit_floor)
             {
@@ -1443,8 +1457,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
                     p_ptr->py_f = (int16_t)HW_CLAMP_PROJ_WIDE(py);
 #endif
             }
+            continue;
         }
-        else
+vert_behind:
         {
 #ifndef SATURN_WIN32
             aliased_uint32_t *pw = (aliased_uint32_t *)p_ptr;
@@ -1531,25 +1546,24 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             if ((cw_c | cw_f) == 0)
                 continue;
 
-            int wy0 = verts[qv0].y, wy1 = verts[qv1].y;
-            int wy2 = verts[qv2].y, wy3 = verts[qv3].y;
-            int y_bot = (wy0 + wy1) >> 1;
-            int y_top = (wy2 + wy3) >> 1;
-            int quad_v0 = 0, quad_rows = 64;
-            if (wy2 >= wy1 && wy3 >= wy0 && y_top > y_bot)
+            uint32_t qpack_base = 64u << 16;
+            if (__builtin_expect(!(fully_inside & HW_FLAT_USE_LOD1), 1))
             {
-                int dy = y_top - y_bot;
-                if (dy <= 64)
+                int wy0 = verts[qv0].y, wy1 = verts[qv1].y;
+                int wy2 = verts[qv2].y, wy3 = verts[qv3].y;
+                int y_bot = (wy0 + wy1) >> 1;
+                int y_top = (wy2 + wy3) >> 1;
+                if (wy2 >= wy1 && wy3 >= wy0 && y_top > y_bot)
                 {
-                    int vn = (-y_top) & 63;
-                    if (vn + dy <= 64)
+                    int dy = y_top - y_bot;
+                    if (dy <= 64)
                     {
-                        quad_v0 = vn;
-                        quad_rows = dy;
+                        int vn = (-y_top) & 63;
+                        if (vn + dy <= 64)
+                            qpack_base = ((uint32_t)vn << 24) | ((uint32_t)dy << 16);
                     }
                 }
             }
-            uint32_t qpack_base = ((uint32_t)quad_v0 << 24) | ((uint32_t)quad_rows << 16);
 
             if (cw_c != 0)
             {

@@ -688,6 +688,21 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
     {
         if (HW_CommitPortalClosedWord(w, newly_closed))
             return 2;
+        return 1;
+    }
+    if (w_mod && !touch_ret && !(w_and_flags & 8))
+    {
+        hw_ap_word_t *aw = &hw_ap_words[w];
+        int ok_yt = !do_yt || (yt_req > aw->yt_min);
+        int ok_yb = !do_yb || (yb_req < aw->yb_max);
+        if (ok_yt && ok_yb)
+        {
+            if (do_yt && new_yt > aw->yt_max) aw->yt_max = (int16_t)new_yt;
+            if (do_yb && new_yb < aw->yb_min) aw->yb_min = (int16_t)new_yb;
+            ap->dirty_words |= hw_bit_lut[w];
+            ap->aperture_active = 1;
+            return 0;
+        }
     }
     return w_mod;
 }
@@ -726,7 +741,7 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(
         if (!do_yt && !do_yb)
             continue;
 
-        int fast_ok = (sm == 0 && !is_touched) ? 4 : 0;
+        int fast_ok = (sm == 0 && !is_touched) ? 4 : (is_touched ? 8 : 0);
         int res = HW_UpdatePortalWordPartial((w << 8) | fast_ok | do_yt | (do_yb << 1), ps);
         if (res == 2)
         {
