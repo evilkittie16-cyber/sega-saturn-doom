@@ -2251,10 +2251,21 @@ static HW_NOINLINE HW_HOT_O2 int HW_ProjectAndCullPillarPair(
                     return -1;
                 occl_state = (hit != 0);
             }
-            int16_t yt = hw_ap_words[w0].yt_min;
-            int16_t yb = hw_ap_words[w0].yb_max;
-            if (yt >= yb)
+            const hw_ap_word_t *aw = &hw_ap_words[w0];
+            int16_t yt = aw->yt_min;
+            int16_t yb = aw->yb_max;
+            if (__builtin_expect(yt < aw->yt_max || yb > aw->yb_min, 0))
+            {
+                int ap_pack = HW_GetSpanAperture(seg_sx, seg_ex);
+                if (ap_pack < 0)
+                    return -1;
+                yt = (int16_t)(ap_pack >> 16);
+                yb = (int16_t)ap_pack;
+            }
+            else if (yt >= yb)
+            {
                 return -1;
+            }
             ctx->ytop_min = yt;
             ctx->ybot_max = yb;
         }
@@ -2666,7 +2677,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
     int32_t raw_min_cz = HW_MulsW_PairAdd(x_cz_min, nx, y_cz_min, ny, 0);
     if (raw_min_cz > (HW_FAR_Z_UNITS << 12))
         return -1;
-    fixed_t min_cz = (raw_min_cz + cz_off) << 4;
+    fixed_t true_min_cz = (raw_min_cz + cz_off) << 4;
+    fixed_t min_cz = true_min_cz;
 
     int x_cx_min = (ny >= 0) ? dx0 : dx1;
     int x_cx_max = (ny >= 0) ? dx1 : dx0;
@@ -2698,7 +2710,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
     int vh = HW_VIEW_H;
     int ytop_min = 0;
     int ybot_max = vh;
-    if (__builtin_expect(min_cz < HW_NEAR_Z, 0))
+    if (__builtin_expect(true_min_cz < HW_NEAR_Z, 0))
     {
         any_behind = 1;
         min_cz = HW_NEAR_Z;
@@ -2708,22 +2720,44 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
     }
     else
     {
-        s_max = HW_FastDiv(min_cz);
+        fixed_t cz_left  = HW_MulsW_PairAdd(x_cx_min, nx, y_cx_min, ny, cz_off) << 4;
+        fixed_t cz_right = (true_min_cz + max_cz) - cz_left;
+        fixed_t cx_near  = HW_MulsW_PairAdd(x_cz_min, ny, y_cz_min, neg_nx, cx_off) << 4;
+
+        s_max = HW_FastDiv(true_min_cz);
+        int s_left  = HW_FastDiv(cz_left);
+        int s_right = HW_FastDiv(cz_right);
+        int px_near = HW_ProjX(cx_near, s_max, HW_VIEW_CX);
+        HW_ProjXPair(min_cx, s_left, max_cx, s_right, HW_VIEW_CX, &sx, &ex);
+        if (px_near < sx) sx = px_near;
+        if (px_near > ex) ex = px_near;
         if (min_cx >= 0 || max_cx <= 0)
+        {
             s_min = HW_FastDiv(max_cz);
-        int s_sx = (min_cx < 0) ? s_max : s_min;
-        int s_ex = (max_cx > 0) ? s_max : s_min;
-        HW_ProjXPair(min_cx, s_sx, max_cx, s_ex, HW_VIEW_CX, &sx, &ex);
+            fixed_t cx_far = (min_cx + max_cx) - cx_near;
+            int px_far = HW_ProjX(cx_far, s_min, HW_VIEW_CX);
+            if (px_far < sx) sx = px_far;
+            if (px_far > ex) ex = px_far;
+        }
+        if (cz_fmin > true_min_cz)
+            s_max = HW_FastDiv(min_cz);
         if (!fully_inside && raw_min_cz >= (16 << 12) && sx >= 0 && ex <= HW_VIEW_W)
             fully_inside = 1;
 
-        sx -= 2;
-        ex += 2;
+        sx -= 1;
+        ex += 1;
         if (sx < 0) sx = 0;
         if (ex > HW_VIEW_W) ex = HW_VIEW_W;
         int ex_m1 = ex - 1;
         if (sx > ex_m1)
             return -1;
+        int ap_sx = sx;
+        int ap_ex = ex;
+        if (ex - sx > 4)
+        {
+            ap_sx = sx + 2;
+            ap_ex = ex - 2;
+        }
         if (__builtin_expect((unsigned int)(sx ^ ex_m1) < 32u, 1))
         {
             int w0 = (int)((unsigned int)sx >> 5);
@@ -2736,15 +2770,28 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
             }
             if (ap->aperture_active)
             {
-                ytop_min = hw_ap_words[w0].yt_min;
-                ybot_max = hw_ap_words[w0].yb_max;
-                if (ytop_min >= ybot_max)
+                const hw_ap_word_t *aw = &hw_ap_words[w0];
+                ytop_min = aw->yt_min;
+                ybot_max = aw->yb_max;
+                if (__builtin_expect(ytop_min < aw->yt_max || ybot_max > aw->yb_min, 0))
+                {
+                    int ap_pack = HW_GetSpanAperture(ap_sx, ap_ex);
+                    if (ap_pack < 0)
+                        return -1;
+                    ytop_min = ap_pack >> 16;
+                    ybot_max = (int16_t)ap_pack;
+                }
+                else if (ytop_min >= ybot_max)
+                {
                     return -1;
+                }
             }
         }
         else if (ap->aperture_active)
         {
-            int ap_pack = HW_GetSpanAperture(sx, ex);
+            if (hw_solid_count > 0 && HW_CheckSpanOcclusion(sx, ex) == 2)
+                return -1;
+            int ap_pack = HW_GetSpanAperture(ap_sx, ap_ex);
             if (ap_pack < 0)
                 return -1;
             ytop_min = ap_pack >> 16;

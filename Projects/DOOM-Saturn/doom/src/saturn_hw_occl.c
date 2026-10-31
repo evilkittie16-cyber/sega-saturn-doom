@@ -358,30 +358,115 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
     int b1 = ex_m1 & 31;
     if (__builtin_expect((unsigned int)(sx ^ ex_m1) < 32u, 1))
     {
+        uint32_t sm = hw_solid_mask[w0];
         uint32_t mask = hw_mask_left[b0] & hw_mask_right[b1];
-        if ((hw_solid_mask[w0] & mask) == mask)
+        if ((sm & mask) == mask)
             return -1;
         const hw_ap_word_t *aw = &hw_ap_words[w0];
         int yt_min = aw->yt_min;
         int yb_max = aw->yb_max;
+        if (__builtin_expect(yt_min < aw->yt_max || yb_max > aw->yb_min, 0))
+        {
+            const uint8_t *ytop = ap->ytop;
+            const uint8_t *ybot = ap->ybot;
+            yt_min = HW_VIEW_H;
+            yb_max = 0;
+            for (int x = sx; x <= ex_m1; x++)
+            {
+                if (sm & hw_bit_lut[x & 31])
+                    continue;
+                int yt = ytop[x];
+                int yb = ybot[x];
+                if (yt < yt_min) yt_min = yt;
+                if (yb > yb_max) yb_max = yb;
+            }
+        }
         return (yt_min >= yb_max) ? -1 : ((yt_min << 16) | (uint16_t)yb_max);
     }
     int w1 = (int)((unsigned int)ex_m1 >> 5);
     if (b0 != 0 && (hw_solid_mask[w0] & hw_mask_left[b0]) == hw_mask_left[b0])
+    {
         w0++;
+        b0 = 0;
+        sx = w0 << 5;
+    }
     if (b1 != 31 && (hw_solid_mask[w1] & hw_mask_right[b1]) == hw_mask_right[b1])
+    {
         w1--;
-    if (w0 <= w1 && !((ap->dirty_words | hw_solid_summary) & (hw_span_mask_lut[w1 + 1] ^ hw_span_mask_lut[w0])))
+        b1 = 31;
+        ex_m1 = (w1 << 5) + 31;
+    }
+    if (w0 > w1)
+        return -1;
+    if (!((ap->dirty_words | hw_solid_summary) & (hw_span_mask_lut[w1 + 1] ^ hw_span_mask_lut[w0])))
         return (int)HW_VIEW_H;
     int yt_min = HW_VIEW_H;
     int yb_max = 0;
-    for (int w = w0; w <= w1; w++)
+    int wf0 = (b0 == 0) ? w0 : (w0 + 1);
+    int wf1 = (b1 == 31) ? w1 : (w1 - 1);
+    for (int w = wf0; w <= wf1; w++)
     {
         if (hw_solid_mask[w] == 0xFFFFFFFFu)
             continue;
         const hw_ap_word_t *aw = &hw_ap_words[w];
         if (aw->yt_min < yt_min) yt_min = aw->yt_min;
         if (aw->yb_max > yb_max) yb_max = aw->yb_max;
+    }
+    if (b0 != 0 && hw_solid_mask[w0] != 0xFFFFFFFFu)
+    {
+        const hw_ap_word_t *aw0 = &hw_ap_words[w0];
+        if (aw0->yt_min < yt_min || aw0->yb_max > yb_max)
+        {
+            if (aw0->yt_min == aw0->yt_max && aw0->yb_min == aw0->yb_max)
+            {
+                if (aw0->yt_min < yt_min) yt_min = aw0->yt_min;
+                if (aw0->yb_max > yb_max) yb_max = aw0->yb_max;
+            }
+            else
+            {
+                uint32_t sm0 = hw_solid_mask[w0];
+                const uint8_t *ytop = ap->ytop;
+                const uint8_t *ybot = ap->ybot;
+                int x_end = (w0 << 5) + 31;
+                for (int x = sx; x <= x_end; x++)
+                {
+                    if (sm0 & hw_bit_lut[x & 31])
+                        continue;
+                    int yt = ytop[x];
+                    int yb = ybot[x];
+                    if (yt < yt_min) yt_min = yt;
+                    if (yb > yb_max) yb_max = yb;
+                }
+            }
+        }
+    }
+    if (b1 != 31 && hw_solid_mask[w1] != 0xFFFFFFFFu)
+    {
+        const hw_ap_word_t *aw1 = &hw_ap_words[w1];
+        if (aw1->yt_min < yt_min || aw1->yb_max > yb_max)
+        {
+            if (aw1->yt_min == aw1->yt_max && aw1->yb_min == aw1->yb_max)
+            {
+                if (aw1->yt_min < yt_min) yt_min = aw1->yt_min;
+                if (aw1->yb_max > yb_max) yb_max = aw1->yb_max;
+            }
+            else
+            {
+                uint32_t sm1 = hw_solid_mask[w1];
+                const uint8_t *ytop = ap->ytop;
+                const uint8_t *ybot = ap->ybot;
+                int x_start = w1 << 5;
+                for (int x = x_start; x <= ex_m1; x++)
+                {
+                    if (sm1 & hw_bit_lut[x & 31])
+                        continue;
+                    int yt = ytop[x];
+                    int yb = ybot[x];
+                    if (yt < yt_min) yt_min = yt;
+                    if (yb > yb_max) yb_max = yb;
+                }
+            }
+        }
     }
     return (yt_min >= yb_max) ? -1 : ((yt_min << 16) | (uint16_t)yb_max);
 }

@@ -298,7 +298,7 @@ static __declspec(noinline) void HW_ClipQuadPlane(
     int c1 = *c1_p, p1 = *p1_p;
     int c2 = *c2_p, p2 = *p2_p;
     int c3 = *c3_p, p3 = *p3_p;
-    int clip_far = clip_p - (dir * (swap_xy ? 64 : 24));
+    int clip_far = clip_p - dir * 64;
 
     switch (mask)
     {
@@ -426,7 +426,7 @@ static __declspec(noinline) int HW_ClipFlatQuadOffscreen(
     if (m_top != 0)
         HW_ClipQuadPlane(&x0, &y0, &x1, &y1, &x2, &y2, &x3, &y3, y_top, m_top, 1, 0, &ntris, tx, ty, vw, vh);
 
-    const int y_bot = vh + 2;
+    const int y_bot = vh + 12;
     int m_bot = (y0 > y_bot) | ((y1 > y_bot) << 1) | ((y2 > y_bot) << 2) | ((y3 > y_bot) << 3);
     if (m_bot == 15) return 0;
     if (m_bot != 0)
@@ -439,13 +439,13 @@ static __declspec(noinline) int HW_ClipFlatQuadOffscreen(
             return 0;
     }
 
-    const int x_left = -4;
+    const int x_left = -48;
     int m_left = (x0 < x_left) | ((x1 < x_left) << 1) | ((x2 < x_left) << 2) | ((x3 < x_left) << 3);
     if (m_left == 15 && ntris == 0) return 0;
     if (m_left != 0 && m_left != 15)
         HW_ClipQuadPlane(&y0, &x0, &y1, &x1, &y2, &x2, &y3, &x3, x_left, m_left, 1, 1, &ntris, tx, ty, vw, vh);
 
-    const int x_right = vw + 4;
+    const int x_right = vw + 48;
     int m_right = (x0 > x_right) | ((x1 > x_right) << 1) | ((x2 > x_right) << 2) | ((x3 > x_right) << 3);
     if (m_right == 15 && ntris == 0) return 0;
     if (m_right != 0 && m_right != 15)
@@ -491,11 +491,11 @@ HW_ALWAYS_INLINE void HW_Worker_EmitNormalizedQuad(vdp1_cmd_t *cmd_s_out, int *q
     if (srca <= 0) return;
 
     int ntris = 0, tx[6][3], ty[6][3];
-    int r_lim = vw + 16;
-    int b_lim = vh + 8;
-    if (((x0 + 16) | (x1 + 16) | (x2 + 16) | (x3 + 16) |
+    int r_lim = vw + 48;
+    int b_lim = vh + 12;
+    if (((x0 + 48) | (x1 + 48) | (x2 + 48) | (x3 + 48) |
          (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
-         (y0 + 8) | (y1 + 8) | (y2 + 8) | (y3 + 8) |
+         (y0 + 2) | (y1 + 2) | (y2 + 2) | (y3 + 2) |
          (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0)
     {
         if (!HW_ClipFlatQuadOffscreen(&x0, &y0, &x1, &y1, &x2, &y2, &x3, &y3, vw, vh,
@@ -919,11 +919,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         int x2 = pv2->px, y2 = py2;
         int x3 = pv3->px, y3 = py3;
 
-        int r_lim = fctx->vw + 16;
-        int b_lim = vh + 8;
-        if (__builtin_expect(((x0 + 16) | (x1 + 16) | (x2 + 16) | (x3 + 16) |
+        int r_lim = fctx->vw + 48;
+        int b_lim = vh + 12;
+        if (__builtin_expect(((x0 + 48) | (x1 + 48) | (x2 + 48) | (x3 + 48) |
                               (r_lim - x0) | (r_lim - x1) | (r_lim - x2) | (r_lim - x3) |
-                              (y0 + 8) | (y1 + 8) | (y2 + 8) | (y3 + 8) |
+                              (y0 + 2) | (y1 + 2) | (y2 + 2) | (y3 + 2) |
                               (b_lim - y0) | (b_lim - y1) | (b_lim - y2) | (b_lim - y3)) < 0, 0))
         {
             fctx->clip_xy[0] = x0; fctx->clip_xy[1] = y0;
