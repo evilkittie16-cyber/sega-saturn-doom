@@ -449,6 +449,47 @@ void Saturn_HW_RenderInit(void)
     if (numsubsectors > 0 && numsubsectors <= HW_MAX_AP_SUBSECTORS &&
         segs && lines && sides && sectors && vertexes)
     {
+        uint8_t sec_can_move[256];
+        for (int s = 0; s < 256; s++)
+            sec_can_move[s] = (s < numsectors && (P_GetSectorTag(&sectors[s]) != 0 || sectors[s].specialdata != 0)) ? 1u : 0u;
+        for (int l = 0; l < numlines; l++)
+        {
+            if (lines[l].special != 0)
+            {
+                for (int side = 0; side < 2; side++)
+                {
+                    int sn = lines[l].sidenum[side];
+                    if ((unsigned)sn < (unsigned)numsides)
+                    {
+                        int sec = sides[sn].sector;
+                        if ((unsigned)sec < 256u)
+                            sec_can_move[sec] = 1u;
+                    }
+                }
+            }
+        }
+        /* Propagate along same-floorpic 2-sided lines to cover untagged EV_BuildStairs steps */
+        for (int pass = 0; pass < 8; pass++)
+        {
+            int changed = 0;
+            for (int l = 0; l < numlines; l++)
+            {
+                int sn0 = lines[l].sidenum[0], sn1 = lines[l].sidenum[1];
+                if ((unsigned)sn0 < (unsigned)numsides && (unsigned)sn1 < (unsigned)numsides)
+                {
+                    int s0 = sides[sn0].sector, s1 = sides[sn1].sector;
+                    if ((unsigned)s0 < 256u && (unsigned)s1 < 256u &&
+                        (sec_can_move[s0] ^ sec_can_move[s1]) &&
+                        sectors[s0].floorpic == sectors[s1].floorpic)
+                    {
+                        sec_can_move[s0] = sec_can_move[s1] = 1u;
+                        changed = 1;
+                    }
+                }
+            }
+            if (!changed)
+                break;
+        }
         hw_portal_seg_t *portal_segs = HW_PORTAL_SEGS;
         int p_total = 0;
         for (int subnum = 0; subnum < numsubsectors; subnum++)
@@ -684,6 +725,69 @@ void Saturn_HW_RenderInit(void)
                                 break;
                             }
                         }
+                    }
+
+                    /* 3b. Prune permanently zero-height static 2-sided segs whose portal aperture
+                     *     is already recorded by another seg in the subsector. */
+                    if ((unsigned)fsec_idx < 256u && !sec_can_move[fsec_idx])
+                    {
+                        int is_fsky = ((int16_t)sectors[fsec_idx].ceilingpic == -1);
+                        fixed_t f_floor = sectors[fsec_idx].floorheight;
+                        fixed_t f_ceil  = sectors[fsec_idx].ceilingheight;
+                        int keep_n = 0;
+                        for (int i = 0; i < nsegs; i++)
+                        {
+                            baked_seg_t s = segs_base[i];
+                            uint8_t fl = s.flags & (uint8_t)~SEG_FLAG_PORTAL_DONE;
+                            int bsec_idx = s.back_sec_idx;
+                            if (!(fl & (SEG_FLAG_SOLID | SEG_FLAG_MID)) &&
+                                (unsigned)bsec_idx < 256u && !sec_can_move[bsec_idx])
+                            {
+                                fixed_t b_floor = sectors[bsec_idx].floorheight;
+                                fixed_t b_ceil  = sectors[bsec_idx].ceilingheight;
+                                int is_bsky = ((int16_t)sectors[bsec_idx].ceilingpic == -1);
+                                int zero_h = 0;
+                                if ((fl & SEG_FLAG_LOWER) && !(fl & SEG_FLAG_UPPER))
+                                    zero_h = (b_floor <= f_floor);
+                                else if ((fl & SEG_FLAG_UPPER) && !(fl & SEG_FLAG_LOWER))
+                                    zero_h = ((is_fsky && is_bsky) || b_ceil >= f_ceil);
+                                if (zero_h)
+                                {
+                                    int covered = (s.flags & SEG_FLAG_PORTAL_DONE) != 0;
+                                    if (!covered)
+                                    {
+                                        for (int k = 0; k < keep_n; k++)
+                                        {
+                                            if (segs_base[k].pillar_idx[0] == s.pillar_idx[0] &&
+                                                segs_base[k].pillar_idx[1] == s.pillar_idx[1] &&
+                                                segs_base[k].back_sec_idx == bsec_idx)
+                                            {
+                                                covered = 1;
+                                                break;
+                                            }
+                                        }
+                                        if (!covered)
+                                        {
+                                            for (int k = i + 1; k < nsegs; k++)
+                                            {
+                                                if (segs_base[k].pillar_idx[0] == s.pillar_idx[0] &&
+                                                    segs_base[k].pillar_idx[1] == s.pillar_idx[1] &&
+                                                    segs_base[k].back_sec_idx == bsec_idx)
+                                                {
+                                                    covered = 1;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (covered)
+                                        continue;
+                                }
+                            }
+                            segs_base[keep_n++] = s;
+                        }
+                        nsegs = keep_n;
+                        wss->num_segs = (uint16_t)nsegs;
                     }
 
                     /* 4. Record max floor & min ceiling backsectors for non-solid/non-mid subsectors */

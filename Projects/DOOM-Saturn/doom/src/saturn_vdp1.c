@@ -1093,6 +1093,25 @@ static int v1_tex_get(int texnum, int *w, int *h)
         tag->srca_mono = (unsigned short)(tag->srca + 512u);
         tag->srca_64   = (unsigned short)(tag->srca + 640u);
     }
+    else if (texnum > 0 && tw == 8)
+    {
+        /* VDP1 wall strip emitters use 16-texel (2u << 8) strip width when
+         * u_span > tw or near-clipped (e.g. DOORTRAK on 16-unit door jambs).
+         * Tile 8-pixel-wide wall textures twice horizontally into a 16xth block. */
+        int y;
+        off = v1_arena_alloc(16 * th);
+        if (off == 0)
+            return 0;
+        for (y = 0; y < th; y++)
+        {
+            v1_copy_block(off + (unsigned)(y * 16), src + y * 8, 8);
+            v1_copy_block(off + (unsigned)(y * 16 + 8), src + y * 8, 8);
+        }
+        tw = 16;
+        tag->srca = (unsigned short)(off / 8u);
+        tag->srca_mono = tag->srca;
+        tag->srca_64   = tag->srca;
+    }
     else
     {
         off = v1_arena_alloc(tw * th);

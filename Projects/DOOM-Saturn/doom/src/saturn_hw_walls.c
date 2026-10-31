@@ -2697,7 +2697,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, sector_t 
     if (cz_fmin > min_cz)
         min_cz = cz_fmin;
 #if HW_DBG_FLAT_LOD
-    int use_lod1 = (min_cz >= (160 << FRACBITS)) ? (int)HW_FLAT_USE_LOD1 : 0;
+    int use_lod1 = (true_min_cz >= (288 << FRACBITS) && min_cz >= (320 << FRACBITS)) ? (int)HW_FLAT_USE_LOD1 : 0;
 #else
     int use_lod1 = 0;
 #endif

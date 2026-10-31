@@ -147,6 +147,8 @@ static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_siz
 {
     int v0   = (int)(quad_size >> 16);
     int rows = (int)(quad_size & 0xFFu);
+    if (__builtin_expect(rows <= 32, 0))
+        dy <<= (rows <= 16) ? 2 : 1;
 
     if (dy > 26)
     {
@@ -950,6 +952,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         uint16_t base_srca = (qpack & 0x80000000u) ? fctx->ceil_srca : fctx->floor_srca;
         int dy = HW_FlatQuadDy_PreClamped(x0, y0, x1, y1, x2, y2, x3, y3,
                                           cy0, cy1, cy2, cy3, d03, d12);
+        if (cz_near < (384 << FRACBITS) && dy >= 6 && dy < 12)
+            dy = 12;
         uint32_t w2 = HW_FlatSizeLOD(base_srca, quad_size, dy);
 
         uint32_t w0, w3, w4, w5, w6;
@@ -1013,7 +1017,7 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
     raw_cx[2] = pv2->cx; raw_cz[2] = pv2->cz;
     raw_cx[3] = pv3->cx; raw_cz[3] = pv3->cz;
 
-    if (!fctx->fully_inside && HW_OutsideFrustum(raw_cx, raw_cz, 4))
+    if (!(fctx->fully_inside & 3) && HW_OutsideFrustum(raw_cx, raw_cz, 4))
         return local_q;
 
     int base_v0 = 0;
@@ -1881,7 +1885,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     }
 
     uint32_t sky_flags = (uint32_t)fc->is_sky & allow_sky;
-    uint32_t w3_pack = (emit_floor << 24) | (emit_ceil << 16) | ((u_flags & 3u) << 8) | sky_flags;
+    uint32_t w3_pack = (emit_floor << 24) | (emit_ceil << 16) | ((u_flags & 19u) << 8) | sky_flags;
     uint32_t vq_pack = ((uint32_t)(uint16_t)v_count << 16) | (uint16_t)q_count;
     int fjob_idx = ++hw_frame_flat_jobs;
 
@@ -1961,7 +1965,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     if (saturn_vdp2_plane_active && sec == &sectors[saturn_vdp2_plane_sec]) emit_floor = 0;
     emit_floor &= (fully_inside >> 2) & 1;
     emit_ceil  &= allow_sky;
-    fully_inside &= 3;
+    fully_inside &= 19;
 
     if (!emit_ceil && !emit_floor)
         return;
