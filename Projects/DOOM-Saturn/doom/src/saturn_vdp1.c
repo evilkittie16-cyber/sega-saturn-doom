@@ -1433,6 +1433,10 @@ void Saturn_Vdp1Wall_Reset(void)
         v1_page_flush[0] = 0;
         v1_page_flush[1] = 0;
         Saturn_Vdp1_ClearTexCacheMRU();
+        {
+            extern unsigned int saturn_v1_page_flushes;
+            saturn_v1_page_flushes++;   /* HUD 'Y': texture cache refills */
+        }
     }
     v1_arena_off = v1_page_off[0];
 

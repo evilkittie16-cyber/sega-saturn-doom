@@ -836,6 +836,25 @@ void Saturn_HUD_Draw(void)
         acc_vbl += delta;
         frames++;
 
+        /* Hitch diagnostics (HUD 'Z' / 'Y'): worst frame of the window in
+         * vblanks, the largest per-frame VDP1 texture upload, and texture
+         * page flushes. saturn_vdp1_bus_tex_bytes only ever grows on the
+         * Saturn, so per-frame uploads are differences. */
+        static unsigned int win_worst_vbl = 0, pf_worst_ms = 0;
+        static unsigned int win_up_max = 0, pf_up_kb = 0, last_bus = 0;
+        static unsigned int last_flushes = 0, pf_flushes = 0;
+        {
+            extern uint32_t     saturn_vdp1_bus_tex_bytes;
+            unsigned int bus = (unsigned int)saturn_vdp1_bus_tex_bytes;
+            /* (the Windows VDP1 emulator resets the counter every frame) */
+            unsigned int up  = (bus >= last_bus) ? (bus - last_bus) : bus;
+            last_bus = bus;
+            if (up > win_up_max)
+                win_up_max = up;
+            if (delta > win_worst_vbl)
+                win_worst_vbl = delta;
+        }
+
         {
             extern int saturn_v1w_refuse;
             extern int saturn_v1w_edsr;
@@ -896,6 +915,15 @@ void Saturn_HUD_Draw(void)
             if (pf_del_ms > 999) pf_del_ms = 999;
             saturn_prof_cef = 0;
             saturn_prof_del = 0;
+            {
+                extern unsigned int saturn_v1_page_flushes;
+                pf_worst_ms  = (win_worst_vbl * 50u) / 3u;     /* vblanks -> ms (60 Hz) */
+                pf_up_kb     = (win_up_max + 1023u) >> 10;
+                pf_flushes   = saturn_v1_page_flushes - last_flushes;
+                last_flushes = saturn_v1_page_flushes;
+                win_worst_vbl = 0;
+                win_up_max    = 0;
+            }
             pf_quads  = win_quads;
             pf_drop   = win_drop;
             pf_ref    = win_ref;
@@ -1068,6 +1096,12 @@ void Saturn_HUD_Draw(void)
                 dn = hud_tiny_tag(dbg, dn, 'Q', pf_quads);
                 dbg[dn++] = ' ';
                 dn = hud_tiny_tag(dbg, dn, 'D', pf_drop);
+                dbg[dn++] = ' ';
+                dn = hud_tiny_tag(dbg, dn, 'Z', (int)pf_worst_ms);
+                dbg[dn++] = '/';
+                dn = hud_tiny_num(dbg, dn, (int)pf_up_kb);
+                dbg[dn++] = ' ';
+                dn = hud_tiny_tag(dbg, dn, 'Y', (int)pf_flushes);
                 dbg[dn] = 0;
                 hud_tiny(50, dbg_y, 262, dbg);
 
