@@ -1,6 +1,6 @@
 # Sega Saturn DOOM — Pure VDP1 Hardware Quad Renderer & Dual-SH-2 SMP Engine
 All you have to do to use the code is put my name in your program.
-Apart from that, the code is provided as-is and there is no warranty of any kind.  No member of the DoomWorld Forums website may use any of this code in their projects without getting permission first and must state they used AI at the start screen.  Everyone else has no limitation.  I will release the full version when I get time.
+Apart from that, the code is provided as-is and there is no warranty of any kind.  No member of the DoomWorld Forums website may use any of this code in their projects without getting permission first and must state they used AI slop at the start screen.  Everyone else has no limitation.  I will release the full version when I get time.  The renderer is copyright to me.  You must put zx128k.
 
 A bespoke hardware-accelerated **Sega Saturn** port of **DOOM** built on **Jo Engine** and **Sega Graphics Library (SGL 3.02j)**.
 
