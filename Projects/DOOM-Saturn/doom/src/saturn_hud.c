@@ -1096,12 +1096,26 @@ void Saturn_HUD_Draw(void)
                 dn = hud_tiny_tag(dbg, dn, 'Q', pf_quads);
                 dbg[dn++] = ' ';
                 dn = hud_tiny_tag(dbg, dn, 'D', pf_drop);
-                dbg[dn++] = ' ';
-                dn = hud_tiny_tag(dbg, dn, 'Z', (int)pf_worst_ms);
-                dbg[dn++] = '/';
-                dn = hud_tiny_num(dbg, dn, (int)pf_up_kb);
-                dbg[dn++] = ' ';
-                dn = hud_tiny_tag(dbg, dn, 'Y', (int)pf_flushes);
+                /* Last hitch (>10-vblank frame) breakdown latched in
+                 * d_main.c: Z frame / render / tics / CD fill (vblanks) /
+                 * CD cold lump reads in that frame. Uploads and page
+                 * flushes read 0 on hardware, so they are not shown. */
+                {
+                    extern volatile int saturn_prof_hitch_fv, saturn_prof_hitch_r,
+                                        saturn_prof_hitch_t, saturn_prof_hitch_f,
+                                        saturn_prof_hitch_c;
+                    dbg[dn++] = ' ';
+                    dn = hud_tiny_tag(dbg, dn, 'Z', saturn_prof_hitch_fv);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, saturn_prof_hitch_r);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, saturn_prof_hitch_t);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, saturn_prof_hitch_f);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, saturn_prof_hitch_c);
+                }
+                (void)pf_worst_ms; (void)pf_up_kb; (void)pf_flushes;
                 dbg[dn] = 0;
                 hud_tiny(50, dbg_y, 262, dbg);
 
