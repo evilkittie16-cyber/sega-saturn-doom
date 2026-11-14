@@ -48,6 +48,7 @@
 #include "saturn_segs.h"   /* round 11b probe struct */
 #include "saturn_vdp1.h"   /* VDP1 scaled-sprite wall prototype */
 #include "saturn_memmap.h"
+#include "saturn_light_lut.h" /* saturn_bank_row[] for the shaded CRAM banks */
 
 /* Under JO_COMPILE_USING_SGL=1, jo_engine's vdp1_command_pipeline.c body
  * is excluded (#if !JO_COMPILE_USING_SGL). The non-SGL helpers
@@ -2009,7 +2010,8 @@ void I_SetPalette(const byte *palette)
 
 /* Shaded CRAM banks for the VDP1 wall quads (2026-09-07). CRAM total is
  * 4 KB = 8 banks of 256; bank 0 stays the raw palette (NBG0 + the HUD
- * glyph channel), banks 1..7 = palette[COLORMAP[4k][i]] for k = 1..7.
+ * glyph channel), banks 1..7 = palette[COLORMAP[saturn_bank_row[k]][i]]
+ * (rows 4,9,13,18,22,27,31 — spread to reach DOOM's near-black row 31).
  * Nothing else in this project writes CRAM above entry 255 (Jo's
  * palette allocator is never called), and COLORMAP rows 4..28 sit well
  * inside the lump's 32 light rows. Called from I_SetPalette (palette
@@ -2028,7 +2030,8 @@ void Saturn_Cram_ShadedBanks(void)
 
         for (k = 1; k < 8; k++)
         {
-            const byte *row = cm + ((k << 8) << 2);  /* COLORMAP row 4k */
+            /* COLORMAP rows 4,9,13,18,22,27,31 (saturn_light_lut.h) */
+            const byte *row = cm + ((unsigned)saturn_bank_row[k] << 8);
 
             for (i = 0; i < 256; i++)
                 cram[(k << 8) + i] = saturn_palette16[row[i]];

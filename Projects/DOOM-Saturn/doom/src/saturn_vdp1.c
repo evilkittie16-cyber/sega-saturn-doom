@@ -8,6 +8,7 @@
 #include "saturn_vdp1.h"
 #include "saturn_tex.h"
 #include "r_local.h"    /* texture/flat translation + counts (tag tables) */
+#include "saturn_light_lut.h"   /* saturn_shade_bank[]: shade -> CRAM bank */
 
 #ifdef SATURN_VDP1_WALL
 
@@ -89,9 +90,10 @@ extern byte *Saturn_SpritePatch(int s, int *w, int *h, int *lofs,
  * (0..30 rows = down to ~6% brightness) and blows dark texels out to
  * white at negative rates (the forced-shade build's white strip). The
  * scheme instead bakes the COLORMAP into CRAM: banks 1..7 hold the
- * active palette remapped through COLORMAP rows 4k (i_video.c's
- * Saturn_Cram_ShadedBanks), so a quad at CMDCOLR = k*256 displays
- * BIT-IDENTICAL to the software paint at shade row 4k. Per-quad bank =
+ * active palette remapped through COLORMAP rows saturn_bank_row[k]
+ * (4,9,13,18,22,27,31; i_video.c's Saturn_Cram_ShadedBanks), so a quad at
+ * CMDCOLR = k*256 displays BIT-IDENTICAL to the software paint at that
+ * row. Per-quad bank =
  * nearest k to the walk's own shade (max error 2 colormap rows, at the
  * k boundaries). CMDCOLR for CL256Bnk is the START COLOR INDEX (Jo's
  * sprites.h:367: color_table_index = palette_id * 256), so bank k =
@@ -1254,9 +1256,7 @@ int Saturn_Vdp1Spr_Add(int scache, int xA, int xB, int yt, int yb,
     if (rows <= 0)
         return 0;
     srca += (srcrow * pw) / 8;
-    k = (shade + 2) >> 2;
-    if (k < 0)  k = 0;
-    if (k > 7)  k = 7;
+    k = saturn_shade_bank[(shade < 0) ? 0 : ((shade > 31) ? 31 : shade)];
 
     uint32_t pmod = ((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu;
     uint32_t colr = ((uint32_t)k << 8) & 0xFFFFu;
@@ -1553,12 +1553,9 @@ static int v1_add_quad_common(int x0, int y0,
         saturn_v1w_refuse++;
         return 1;                   /* nothing drawable */
     }
-    /* Shade (COLORMAP row 0..30) -> nearest shaded CRAM bank k (0..7,
-     * exact rows 0,4,..,28). Bank 8 doesn't exist, so sh 30..31 clamp
-     * to bank 7 (2 rows bright of the true shade). */
-    k = (shade + 2) >> 2;
-    if (k < 0)  k = 0;
-    if (k > 7)  k = 7;
+    /* Shade (COLORMAP row 0..31) -> nearest shaded CRAM bank k (0..7,
+     * rows 0,4,9,13,18,22,27,31 — see saturn_light_lut.h). */
+    k = saturn_shade_bank[(shade < 0) ? 0 : ((shade > 31) ? 31 : shade)];
     v1q[v1q_count][0] = (short)x0;
     v1q[v1q_count][1] = (short)y0;
     v1q[v1q_count][2] = (short)y3;

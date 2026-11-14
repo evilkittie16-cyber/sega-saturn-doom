@@ -473,6 +473,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             s_out->yb_attach  = 0;
             s_out->is_sky     = (uint8_t)((int16_t)s_in->ceilingpic == -1);
             s_out->has_things = (uint8_t)(s_in->thinglist != NULL);
+            s_out->light_delta = (int16_t)(HW_SecLight16(s_in->lightlevel) - (int)hw_sec_light0[i]);
         }
         hw_psec_fast = (hw_psec && (unsigned)(hw_psec - sectors) < HW_MAX_AP_SECTORS)
                      ? &hw_sec_fast[hw_psec - sectors]

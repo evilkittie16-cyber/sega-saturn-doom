@@ -19,6 +19,25 @@ import os
 import math
 import numpy as np
 
+# COLORMAP row held by each of the 8 shaded CRAM banks (i_video.c
+# Saturn_Cram_ShadedBanks). Spread over the full 0..31 range so the darkest
+# bank is DOOM's true near-black row 31 (the old 0,4,..,28 set floored
+# darkness at row 28 and dark sectors never went black).
+BANK_ROWS = [0, 4, 9, 13, 18, 22, 27, 31]
+
+def _nearest_bank(level):
+    """COLORMAP row (0..31) -> nearest bank; ties go to the darker bank."""
+    best = 0
+    for k, row in enumerate(BANK_ROWS):
+        if abs(row - level) <= abs(BANK_ROWS[best] - level):
+            best = k
+    return best
+
+SHADE_BANK = [_nearest_bank(level) for level in range(32)]
+
+def bank_of(level):
+    return SHADE_BANK[max(0, min(31, int(level)))]
+
 def compute_light_tables(
     num_sectors=16,
     screen_height=224,
@@ -57,7 +76,7 @@ def compute_light_tables(
             level = max(0, min(31, startmap - scale_distmap))
 
             flat_colormap[s, y] = level
-            bank = min(7, max(0, (level + 2) // 4))
+            bank = bank_of(level)
             flat_banks[s, y] = bank
             flat_cmdcolr[s, y] = (bank << 8)
 
@@ -74,7 +93,7 @@ def compute_light_tables(
             level = max(0, min(31, startmap - (idx // 2)))
 
             wall_colormap[s, b] = level
-            bank = min(7, max(0, (level + 2) // 4))
+            bank = bank_of(level)
             wall_banks[s, b] = bank
             wall_cmdcolr[s, b] = (bank << 8)
 
@@ -89,7 +108,7 @@ def compute_light_tables(
         for j in range(num_z_buckets):
             scale = 160 // (j + 1)
             level = max(0, min(31, startmap - (scale // 2)))
-            bank = min(7, max(0, (level + 1) // 4))
+            bank = bank_of(level)
             flat_zlight_colormap[s, j] = level
             flat_zlight_banks[s, j] = bank
             flat_zlight_cmdcolr[s, j] = (bank << 8)
@@ -105,7 +124,7 @@ def compute_light_tables(
             dist = max(16.0, b * 16.0 + 8.0)
             idx = min(47, int(2560.0 / dist))
             level = max(0, min(31, startmap - (idx // 2)))
-            bank = min(7, max(0, (level + 2) // 4))
+            bank = bank_of(level)
             wall_zlight_colormap[s, b] = level
             wall_zlight_banks[s, b] = bank
             wall_zlight_cmdcolr[s, b] = (bank << 8)
@@ -161,6 +180,17 @@ def export_c_header(data, filepath):
         f.write(f"#define LIGHT_WALL_BUCKETS   {num_wall_buckets}\n")
         f.write(f"#define LIGHT_Z_BUCKETS      {data['num_z_buckets']}\n")
         f.write(f"#define LIGHT_AMBIENT_FLOOR  {data['ambient_floor']}\n\n")
+
+        # Bank <-> COLORMAP row mapping shared by i_video.c (CRAM fill),
+        # saturn_vdp1.c (shade -> bank) and the Windows VDP1 emulator.
+        f.write("/* COLORMAP row held by each shaded CRAM bank (bank 0 = raw palette). */\n")
+        f.write("static const uint8_t saturn_bank_row[8] = { ")
+        f.write(", ".join(str(r) for r in BANK_ROWS))
+        f.write(" };\n\n")
+        f.write("/* COLORMAP row (0..31) -> nearest shaded CRAM bank (0..7). */\n")
+        f.write("static const uint8_t saturn_shade_bank[32] = { ")
+        f.write(", ".join(str(k) for k in SHADE_BANK))
+        f.write(" };\n\n")
 
         # 1. flat_light_bank_LUT (3.5 KB - fits in 4 KB OCRAM)
         f.write("/* 2D Flat Light Bank LUT: flat_light_bank_LUT[sector >> 4][screen_y]\n")

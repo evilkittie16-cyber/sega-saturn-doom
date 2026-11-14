@@ -260,8 +260,21 @@ typedef struct {
     int16_t  yb_attach;  /* init to 0 */
     uint8_t  is_sky;     /* (int16_t)sec->ceilingpic == -1 */
     uint8_t  has_things; /* sec->thinglist != NULL */
-    uint16_t pad;
+    int16_t  light_delta;/* (lightlevel >> 4) now minus at level load: walls add
+                          * it to their baked light so glow/flicker/strobe and
+                          * light-change triggers reach them like flats/sprites */
 } HW_ALIGN16 hw_sec_fast_t;
+
+/* Sector light (>> 4) captured at level load (Saturn_HW_RenderInit), the
+ * value bake_walls.py baked into every seg's baked_light. */
+static uint8_t hw_sec_light0[HW_MAX_AP_SECTORS];
+
+HW_ALWAYS_INLINE int HW_SecLight16(int lightlevel)
+{
+    if ((unsigned)lightlevel > 255u)
+        lightlevel = (lightlevel < 0) ? 0 : 255;
+    return lightlevel >> 4;
+}
 
 typedef struct {
     /* Bytes 0..23: hot scalars at offset 0 for 1-cycle @(disp, rAp) access on SH-2 */

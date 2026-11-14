@@ -3,6 +3,18 @@
  * & Monolithic VDP1 Wall Quad Emitters, and Subsector Flat Aperture Evaluator.
  */
 
+/* Live light adjustment for the subsector being drawn (hw_sec_fast_t
+ * light_delta, set in HW_RenderSubsectorBakedWalls). baked_light holds the
+ * level-load sector light + fake contrast; adding the delta makes glowing /
+ * flickering / strobing sectors and light-change linedefs reach walls. */
+static int hw_wall_light_delta = 0;
+
+HW_ALWAYS_INLINE int HW_SegLight16(const baked_seg_t *seg)
+{
+    int l = (int)(seg->baked_light >> 4) + hw_wall_light_delta;
+    return (l < 0) ? 0 : ((l > 15) ? 15 : l);
+}
+
 #define BBOX_OUTSIDE        0
 #define BBOX_INTERSECT_NEAR 1
 #define BBOX_INTERSECT      2
@@ -903,7 +915,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
     int end_ya1   = ctx->yb1;
     fixed_t s_cz0 = p0->cz;
 
-    int light_s = ctx->seg->baked_light >> 4;
+    int light_s = HW_SegLight16(ctx->seg);
     int const_light = 1;
     if (light_s < 15)
     {
@@ -1069,7 +1081,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
                     unsigned int s_zb = ((unsigned int)s_cz0 + (unsigned int)s_cz1) >> 21;
                     if (__builtin_expect(s_zb > 127u, 0)) s_zb = 127u;
                     strip_cmd1 = (strip_cmd1 & ~0x0000FFFFu) |
-                                 ((uint32_t)wall_zlight_cmdcolr_LUT[ctx->seg->baked_light >> 4][s_zb] & 0xFF00u);
+                                 ((uint32_t)wall_zlight_cmdcolr_LUT[light_s][s_zb] & 0xFF00u);
                 }
 
                 int is_partial_last = (s == s_max) && ((persp_flags & 32u) != 0);
@@ -1159,7 +1171,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     int ytop_min = ctx->ytop_min;
     int ybot_max = ctx->ybot_max;
 
-    int light_s = ctx->seg->baked_light >> 4;
+    int light_s = HW_SegLight16(ctx->seg);
     int const_light = 1;
     if (light_s < 15)
     {
@@ -1880,11 +1892,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitSubdividedBakedSeg(
     const baked_seg_t *s_ptr = ctx->seg;
     const hw_trans_pillar_t *p0 = ctx->p0;
     const hw_trans_pillar_t *p1 = ctx->p1;
-    unsigned int zb = (__builtin_expect(s_ptr->baked_light < 240, 1))
+    int light_s = HW_SegLight16(s_ptr);
+    unsigned int zb = (__builtin_expect(light_s < 15, 1))
         ? (((uint32_t)p0->cz + (uint32_t)p1->cz) >> 21)
         : 0u;
     if (__builtin_expect(zb > 127u, 0)) zb = 127u;
-    int k_shade = (int)(wall_zlight_cmdcolr_LUT[s_ptr->baked_light >> 4][zb] & 0xFF00u);
+    int k_shade = (int)(wall_zlight_cmdcolr_LUT[light_s][zb] & 0xFF00u);
 
     uint32_t pmod = (s_ptr->flags & SEG_FLAG_MID)
         ? (((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)
@@ -1974,11 +1987,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
         return;
 
     const baked_seg_t *s_ptr = ctx->seg;
-    unsigned int zb = (__builtin_expect(s_ptr->baked_light < 240, 1))
+    int light_s = HW_SegLight16(s_ptr);
+    unsigned int zb = (__builtin_expect(light_s < 15, 1))
         ? (((uint32_t)ctx->p0->cz + (uint32_t)ctx->p1->cz) >> 21)
         : 0u;
     if (__builtin_expect(zb > 127u, 0)) zb = 127u;
-    int k_shade = (int)(wall_zlight_cmdcolr_LUT[s_ptr->baked_light >> 4][zb] & 0xFF00u);
+    int k_shade = (int)(wall_zlight_cmdcolr_LUT[light_s][zb] & 0xFF00u);
 
     uint32_t pmod = (s_ptr->flags & SEG_FLAG_MID)
         ? (((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)
@@ -2827,6 +2841,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
     hw_wctx.sec_ceiling  = sf->dz_ceil;
     hw_wctx.sec_floor    = sf->dz_floor;
     hw_wctx.is_sky_ceil  = sf->is_sky;
+    hw_wall_light_delta  = sf->light_delta;
     if (num_segs <= 0)
     {
         if (hw_wctx.portal_count > 0 && hw_solid_count < HW_VIEW_W)

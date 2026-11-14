@@ -10,7 +10,7 @@
  *   - User Clip Outside exclusion mode (CMDPMOD bit 9 & 10) for DOOM's column occlusion
  *   - Mesh transparency pattern ((x ^ y) & 1, CMDPMOD bit 8)
  *   - Transparent-pixel disable (SPD, CMDPMOD bit 6) and End-code (ECD, CMDPMOD bit 7)
- *   - CRAM bank shading (k_bank * 4 colormap row mapping)
+ *   - CRAM bank shading (bank -> COLORMAP row via saturn_bank_row[])
  */
 
 #include "vdp1_emu.h"
@@ -19,6 +19,7 @@
 #include "saturn_vdp1.h"
 #include "saturn_memmap.h"
 #include "saturn_tex.h"
+#include "saturn_light_lut.h"   /* saturn_bank_row[]: bank -> COLORMAP row */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -961,7 +962,7 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
             }
 
             /* CRAM bank shading (or exact colormap row if bit 7 is set) */
-            int cmap_row = (colr & 0x80) ? (colr & 0x1F) : (((colr >> 8) & 0x07) * 4);
+            int cmap_row = (colr & 0x80) ? (colr & 0x1F) : saturn_bank_row[(colr >> 8) & 0x07];
             if (cmap_row > 31) cmap_row = 31;
             const uint8_t *cmap = colormap ? (colormap + cmap_row * 256) : NULL;
 

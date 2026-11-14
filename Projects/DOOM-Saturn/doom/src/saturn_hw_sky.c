@@ -234,6 +234,8 @@ void Saturn_HW_RenderInit(void)
     Saturn_Vdp1_ClearPages();
 
     int s;
+    for (s = 0; s < HW_MAX_AP_SECTORS; s++)
+        hw_sec_light0[s] = (s < numsectors) ? (uint8_t)HW_SecLight16(sectors[s].lightlevel) : 0;
     for (s = 0; s < numsectors; s++)
     {
         int f;

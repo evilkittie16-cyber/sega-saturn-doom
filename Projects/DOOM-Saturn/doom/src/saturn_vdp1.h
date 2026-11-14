@@ -70,8 +70,8 @@ void Saturn_Vdp1Wall_Init(void);
  * addressable via SRCA; 0 for the full texture), rows = how many
  * texture rows it spans (SIZE.Y). shade = COLORMAP row 0..31 from
  * the paint path's own Saturn_LightRow — quantized to the nearest
- * shaded CRAM bank (COLORMAP rows 0,4,..,28, bank k = CMDCOLR k<<8;
- * max error 2 rows at the bank boundaries). clip_x0/clip_x1: user-clip
+ * shaded CRAM bank (COLORMAP rows 0,4,9,13,18,22,27,31, bank k = CMDCOLR
+ * k<<8; max error 2 rows at the bank boundaries). clip_x0/clip_x1: user-clip
  * x span for u-phase pieces (partial repetitions drawn EXTENDED to
  * their full texture repetition); clip_x0 == clip_x1 = no clip.
  * Returns 1 = stored, 0 = table full (saturn_v1w_captured set). */
