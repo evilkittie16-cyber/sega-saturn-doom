@@ -589,6 +589,12 @@ typedef struct {
     uint16_t                alt_floor_srca;
     uint16_t                alt_ceil_srca;
     int32_t                 near_size;      /* (base_v0 << 16) | rows for ClipNearQuad, -1 = derive */
+    /* Banded emitter (HW_EmitFlatQuadBanded): camera depth below which a
+     * floor / ceiling point projects past the screen's bottom / top guard
+     * band (never less than HW_NEAR_Z). Clipping against it slices texture
+     * rows instead of fanning polygons that each repeat the texture. */
+    fixed_t                 z_eff_floor;
+    fixed_t                 z_eff_ceil;
 } hw_flat_emit_ctx_t;
 
 #if HW_JOB_PAD_WORDS < 1
@@ -1209,6 +1215,272 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
     return local_q;
 }
 
+/* =========================================================================
+ * Texture-correct banded emitter for flat quads near the camera.
+ *
+ * The old paths fan-split near-plane / off-screen clipped quads into
+ * polygons and gave EVERY piece the quad's whole texture slice, so the
+ * pattern repeated close to the viewer. Here the quad is cut into row bands
+ * in camera space (each band keeps an exact texture row range), and each
+ * band is clipped against z_eff = max(near plane, the depth at which the
+ * plane leaves the screen's top/bottom guard band). Clipped corners slide
+ * along the band's side edges, which trims texture rows exactly. A full
+ * 64x64 cell whose clip line runs across its columns is redrawn transposed
+ * so the cut still falls on rows. More bands near the camera also tame
+ * VDP1's affine (non-perspective) warp.
+ * ========================================================================= */
+
+/* Smallest camera depth whose projected offset |y_w * s| stays within
+ * limit_px (s = SATURN_OCLUT, decreasing with depth). */
+static HW_NOINLINE HW_COLD_OS fixed_t HW_ScreenClipDepth(fixed_t y_w, int limit_px)
+{
+    unsigned int lo = HW_NEAR_Z_UNITS, hi = 4096;
+    if (y_w < 0) y_w = -y_w;
+    if (limit_px < 8) limit_px = 8;
+    if (HW_MulHigh(y_w, HW_SlaveFastDiv((fixed_t)(lo << FRACBITS))) <= limit_px)
+        return HW_NEAR_Z;
+    while (lo + 1 < hi)
+    {
+        unsigned int mid = (lo + hi) >> 1;
+        if (HW_MulHigh(y_w, HW_SlaveFastDiv((fixed_t)(mid << FRACBITS))) <= limit_px)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return (fixed_t)(hi << FRACBITS);
+}
+
+/* Point where segment in->out (camera space) reaches depth z (in is in front). */
+HW_ALWAYS_INLINE void HW_SlideToDepth(fixed_t in_cx, fixed_t in_cz, fixed_t out_cx, fixed_t out_cz,
+                                      fixed_t z, fixed_t *rcx, fixed_t *rcz, fixed_t *rf)
+{
+    fixed_t f = HW_ClampedFrac((unsigned int)(in_cz - z), (unsigned int)(in_cz - out_cz));
+    if (f > FRACUNIT) f = FRACUNIT;
+    *rcx = in_cx + FixedMul(out_cx - in_cx, f);
+    *rcz = z;
+    *rf  = f;
+}
+
+#define HW_FLAT_BANDS_MAX 4
+
+/* Emits one surface (floor or ceiling) of quad qp with texture rows
+ * [start, start + count). Returns the new local_q. */
+static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
+    hw_flat_emit_ctx_t *fctx, const saturn_flat_quad_idx_t *qp,
+    int start, int count, int is_ceil, uint16_t srca, uint16_t alt_srca, int local_q)
+{
+    const saturn_proj_v_t *proj_v = fctx->proj_v;
+    fixed_t cx[4], cz[4];
+    int i, k, n_bands;
+    int order[4] = { 0, 1, 2, 3 };
+    const fixed_t z_eff = is_ceil ? fctx->z_eff_ceil : fctx->z_eff_floor;
+    const fixed_t y_w   = is_ceil ? fctx->y_ceil_w : fctx->y_floor_w;
+    const int vw = fctx->vw, vh = fctx->vh, vcx = fctx->vcx, vcy = fctx->vcy;
+    const int qcap = fctx->qcap;
+    const uint32_t pmod = (PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu;
+
+    if (count <= 0 || srca == 0)
+        return local_q;
+
+    for (i = 0; i < 4; i++)
+    {
+        const saturn_proj_v_t *pv = &proj_v[qp->v[i]];
+        cx[i] = pv->cx;
+        cz[i] = pv->cz;
+    }
+
+    /* Depth changes mostly along the columns (p0->p1)? A full cell can be
+     * drawn transposed (v2, v1, v0, v3) so the clip slices rows instead. */
+    if (alt_srca && start == 0 && count == 64)
+    {
+        fixed_t d_row = (cz[0] >> 1) + (cz[1] >> 1) - (cz[3] >> 1) - (cz[2] >> 1);
+        fixed_t d_col = (cz[1] >> 1) + (cz[2] >> 1) - (cz[0] >> 1) - (cz[3] >> 1);
+        if (d_row < 0) d_row = -d_row;
+        if (d_col < 0) d_col = -d_col;
+        if (d_col > d_row)
+        {
+            order[0] = 2; order[2] = 0;
+            srca = alt_srca;
+        }
+    }
+    {
+        fixed_t tx[4], tz[4];
+        for (i = 0; i < 4; i++) { tx[i] = cx[order[i]]; tz[i] = cz[order[i]]; }
+        for (i = 0; i < 4; i++) { cx[i] = tx[i]; cz[i] = tz[i]; }
+    }
+
+    /* Band count from the depth ratio between the row-start and row-end
+     * edges (clamped to z_eff): bands only fix perspective along the rows,
+     * and each one is an extra VDP1 command. */
+    {
+        fixed_t z_s = (cz[3] >> 1) + (cz[2] >> 1);
+        fixed_t z_e = (cz[0] >> 1) + (cz[1] >> 1);
+        if (z_s < z_eff) z_s = z_eff;
+        if (z_e < z_eff) z_e = z_eff;
+        fixed_t z_lo = (z_s < z_e) ? z_s : z_e;
+        fixed_t z_hi = (z_s < z_e) ? z_e : z_s;
+        int needs_clip = (cz[0] < z_eff) | (cz[1] < z_eff) | (cz[2] < z_eff) | (cz[3] < z_eff);
+        if (needs_clip || z_hi >= z_lo * 3)
+            n_bands = HW_FLAT_BANDS_MAX;
+        else if (z_hi * 2 >= z_lo * 3)
+            n_bands = 2;
+        else
+            n_bands = 1;
+        if (n_bands > count)
+            n_bands = count;
+    }
+    for (k = 0; k < n_bands; k++)
+    {
+        /* Band corners: rows run p3p2 (start) -> p0p1 (start + count). */
+        fixed_t t0 = (fixed_t)((k * FRACUNIT) / n_bands);
+        fixed_t t1 = (fixed_t)(((k + 1) * FRACUNIT) / n_bands);
+        int r0 = start + (count * k) / n_bands;
+        int r1 = start + (count * (k + 1)) / n_bands;
+        fixed_t bx[4], bz[4];
+        if (r1 <= r0)
+            continue;
+        /* q0 = row-end left, q1 = row-end right, q2 = row-start right, q3 = row-start left */
+        bx[3] = cx[3] + FixedMul(cx[0] - cx[3], t0); bz[3] = cz[3] + FixedMul(cz[0] - cz[3], t0);
+        bx[2] = cx[2] + FixedMul(cx[1] - cx[2], t0); bz[2] = cz[2] + FixedMul(cz[1] - cz[2], t0);
+        bx[0] = cx[3] + FixedMul(cx[0] - cx[3], t1); bz[0] = cz[3] + FixedMul(cz[0] - cz[3], t1);
+        bx[1] = cx[2] + FixedMul(cx[1] - cx[2], t1); bz[1] = cz[2] + FixedMul(cz[1] - cz[2], t1);
+
+        int out = 0;
+        for (i = 0; i < 4; i++)
+            if (bz[i] < z_eff) out |= 1 << i;
+        if (out == 15)
+            continue;
+        if (out)
+        {
+            fixed_t f0, f1;
+            switch (out)
+            {
+            case 3:   /* row-end edge out: slide along the sides, trim rows at the end */
+                HW_SlideToDepth(bx[3], bz[3], bx[0], bz[0], z_eff, &bx[0], &bz[0], &f0);
+                HW_SlideToDepth(bx[2], bz[2], bx[1], bz[1], z_eff, &bx[1], &bz[1], &f1);
+                r1 = r0 + (((r1 - r0) * ((f0 + f1) >> 1)) + (FRACUNIT >> 1)) / FRACUNIT;
+                if (r1 <= r0) r1 = r0 + 1;
+                break;
+            case 12:  /* row-start edge out: trim rows at the start */
+                HW_SlideToDepth(bx[0], bz[0], bx[3], bz[3], z_eff, &bx[3], &bz[3], &f0);
+                HW_SlideToDepth(bx[1], bz[1], bx[2], bz[2], z_eff, &bx[2], &bz[2], &f1);
+                r0 = r1 - (((r1 - r0) * ((f0 + f1) >> 1)) + (FRACUNIT >> 1)) / FRACUNIT;
+                if (r0 >= r1) r0 = r1 - 1;
+                break;
+            case 9:   /* left side out (q0, q3): slide along the row edges */
+                HW_SlideToDepth(bx[1], bz[1], bx[0], bz[0], z_eff, &bx[0], &bz[0], &f0);
+                HW_SlideToDepth(bx[2], bz[2], bx[3], bz[3], z_eff, &bx[3], &bz[3], &f1);
+                break;
+            case 6:   /* right side out (q1, q2) */
+                HW_SlideToDepth(bx[0], bz[0], bx[1], bz[1], z_eff, &bx[1], &bz[1], &f0);
+                HW_SlideToDepth(bx[3], bz[3], bx[2], bz[2], z_eff, &bx[2], &bz[2], &f1);
+                break;
+            default:
+            {
+                /* One or three corners out: slide each out corner towards an
+                 * in-front neighbour (row partner first, then side partner);
+                 * a corner with no in-front neighbour collapses onto the
+                 * midpoint of the two slid neighbours (triangle). */
+                static const int8_t row_p[4]  = { 1, 0, 3, 2 };
+                static const int8_t side_p[4] = { 3, 2, 1, 0 };
+                fixed_t ox[4], oz[4];
+                int lone = -1;
+                for (i = 0; i < 4; i++) { ox[i] = bx[i]; oz[i] = bz[i]; }
+                for (i = 0; i < 4; i++)
+                {
+                    if (!(out & (1 << i)))
+                        continue;
+                    int p = row_p[i];
+                    if (out & (1 << p))
+                        p = side_p[i];
+                    if (out & (1 << p)) { lone = i; continue; }
+                    HW_SlideToDepth(ox[p], oz[p], ox[i], oz[i], z_eff, &bx[i], &bz[i], &f0);
+                }
+                if (lone >= 0)
+                {
+                    int a = row_p[lone], b = side_p[lone];
+                    bx[lone] = (bx[a] >> 1) + (bx[b] >> 1);
+                    bz[lone] = (bz[a] >> 1) + (bz[b] >> 1);
+                    if (bz[lone] < z_eff) bz[lone] = z_eff;
+                }
+                break;
+            }
+            }
+        }
+
+        /* Project the band */
+        int px[4], py[4];
+        fixed_t cz_min = bz[0], cz_max = bz[0];
+        for (i = 0; i < 4; i++)
+        {
+            int s = HW_SlaveFastDiv(bz[i]);
+            px[i] = HW_ProjX(bx[i], s, vcx);
+            py[i] = HW_ProjY(y_w, s, vcy);
+            if (bz[i] < cz_min) cz_min = bz[i];
+            if (bz[i] > cz_max) cz_max = bz[i];
+        }
+        if ((px[0] < 0 && px[1] < 0 && px[2] < 0 && px[3] < 0) ||
+            (px[0] > vw && px[1] > vw && px[2] > vw && px[3] > vw) ||
+            (py[0] < 0 && py[1] < 0 && py[2] < 0 && py[3] < 0) ||
+            (py[0] > vh && py[1] > vh && py[2] > vh && py[3] > vh))
+            continue;
+        if (is_ceil)
+        {
+            if (py[0] < (int)fctx->ap_ytop && py[1] < (int)fctx->ap_ytop &&
+                py[2] < (int)fctx->ap_ytop && py[3] < (int)fctx->ap_ytop)
+                continue;
+        }
+        else if (py[0] > (int)fctx->ap_ybot && py[1] > (int)fctx->ap_ybot &&
+                 py[2] > (int)fctx->ap_ybot && py[3] > (int)fctx->ap_ybot)
+            continue;
+
+        int cw = HW_MulsW_PairAdd(px[2] - px[0], py[3] - py[1], px[1] - px[3], py[2] - py[0], 0);
+        if (cw == 0)
+            continue;
+
+        unsigned int zb = (((unsigned int)cz_min >> 1) + ((unsigned int)cz_max >> 1)) >> 20;
+        if (zb > 127u) zb = 127u;
+        uint32_t w1 = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
+        uint32_t quad_size = ((uint32_t)r0 << 16) | 0x0800u | (uint32_t)(r1 - r0);
+
+        int big = 0;
+        for (i = 0; i < 4; i++)
+            if ((unsigned int)(px[i] + 1000) > 2000u || (unsigned int)(py[i] + 1000) > 2000u)
+                big = 1;
+        if (big)
+        {
+            /* Still beyond VDP1's coordinate range: old clipper (rare). */
+            fctx->clip_xy[0] = px[0]; fctx->clip_xy[1] = py[0];
+            fctx->clip_xy[2] = px[1]; fctx->clip_xy[3] = py[1];
+            fctx->clip_xy[4] = px[2]; fctx->clip_xy[5] = py[2];
+            fctx->clip_xy[6] = px[3]; fctx->clip_xy[7] = py[3];
+            uint16_t saved = is_ceil ? fctx->ceil_srca : fctx->floor_srca;
+            if (is_ceil) fctx->ceil_srca = srca; else fctx->floor_srca = srca;
+            local_q = HW_EmitFlatQuad_Clipped(fctx, local_q, w1,
+                                              quad_size | (is_ceil ? 0x80000000u : 0u));
+            if (is_ceil) fctx->ceil_srca = saved; else fctx->floor_srca = saved;
+            continue;
+        }
+        if (local_q >= qcap)
+            break;
+
+        int dy = HW_FlatQuadDy(px[0], py[0], px[1], py[1], px[2], py[2], px[3], py[3]);
+        uint32_t w2 = HW_FlatSizeLOD(srca, quad_size, dy);
+        uint32_t p0 = ((uint32_t)px[0] << 16) | (uint16_t)py[0];
+        uint32_t p1 = ((uint32_t)px[1] << 16) | (uint16_t)py[1];
+        uint32_t p2 = ((uint32_t)px[2] << 16) | (uint16_t)py[2];
+        uint32_t p3 = ((uint32_t)px[3] << 16) | (uint16_t)py[3];
+        aliased_uint32_t *c32 = (aliased_uint32_t *)&fctx->cmd_s_out[local_q++];
+        c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
+        c32[1] = w1;
+        c32[2] = w2;
+        if (cw < 0) { c32[3] = p1; c32[4] = p0; c32[5] = p3; c32[6] = p2; }
+        else        { c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3; }
+        c32[7] = 0;
+    }
+    return local_q;
+}
+
 /* Cold helper for extreme-distance (>16384 map units) flat vertex transform.
  * Takes 4 register arguments (r4=dx, r5=dy, r6=fctx, r7=p_ptr), 0 stack arguments! */
 static HW_NOINLINE HW_COLD_OS void HW_TransformFlatVert_Shifted(
@@ -1386,6 +1658,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     fctx->solid_count      = (uint8_t)(solid_count > 255 ? 255 : (solid_count < 0 ? 0 : solid_count));
     fctx->ap_ytop          = (uint8_t)ap_ytop;
     fctx->ap_ybot          = (uint8_t)ap_ybot;
+    /* Screen guard band of 16 px below / above the view for the banded emitter. */
+    fctx->z_eff_floor = (emit_floor && quads && fctx->quv)
+        ? HW_ScreenClipDepth(y_floor_w, fctx->vh + 16 - fctx->vcy) : HW_NEAR_Z;
+    fctx->z_eff_ceil  = (emit_ceil && quads && fctx->quv)
+        ? HW_ScreenClipDepth(y_ceil_w, fctx->vcy + 16) : HW_NEAR_Z;
 
 #ifndef SATURN_WIN32
     if (solid_count <= 0)
@@ -1618,10 +1895,12 @@ vert_behind:
         const saturn_flat_quad_idx_t *qp = q_ptr;
         saturn_flat_quad_idx_t q_perm;
         uint32_t qpack_quv = 0;
+        uint32_t q_mode = 0;
         if (quv_ptr)
         {
             uint32_t w    = quv_ptr[q];
             uint32_t mode = w >> 14;
+            q_mode = mode;
             if (__builtin_expect(mode == SATURN_QUV_NORMAL || mode == 0, 1))
             {
                 fctx->floor_srca = base_floor_srca;
@@ -1662,12 +1941,29 @@ vert_behind:
         int min_x = px0; if (px1 < min_x) min_x = px1; if (px2 < min_x) min_x = px2; if (px3 < min_x) min_x = px3;
         int max_x = px0; if (px1 > max_x) max_x = px1; if (px2 > max_x) max_x = px2; if (px3 > max_x) max_x = px3;
 
+        /* Transposed pyramid a full NORMAL cell may switch to in the banded
+         * emitter (LOD0 jobs carry the transposed pack as their alt SRCAs). */
+        const int can_flip = (q_mode == SATURN_QUV_NORMAL) && !(fully_inside & HW_FLAT_USE_LOD1);
+        const uint16_t flip_c = can_flip ? alt_ceil_srca : 0;
+        const uint16_t flip_f = can_flip ? alt_floor_srca : 0;
+
         if (__builtin_expect(min_x == -32768, 0))
         {
             if (max_x > -32768)
             {
-                fctx->near_size = qpack_quv ? (int32_t)(((qpack_quv >> 24) << 16) | ((qpack_quv >> 16) & 0xFFu)) : -1;
-                local_q = HW_Worker_ClipNearQuad(fctx, qp, local_q);
+                if (qpack_quv)
+                {
+                    int st = (int)(qpack_quv >> 24), cnt = (int)((qpack_quv >> 16) & 0xFFu);
+                    if (emit_ceil)
+                        local_q = HW_EmitFlatQuadBanded(fctx, qp, st, cnt, 1, fctx->ceil_srca, flip_c, local_q);
+                    if (emit_floor)
+                        local_q = HW_EmitFlatQuadBanded(fctx, qp, st, cnt, 0, fctx->floor_srca, flip_f, local_q);
+                }
+                else
+                {
+                    fctx->near_size = -1;
+                    local_q = HW_Worker_ClipNearQuad(fctx, qp, local_q);
+                }
             }
             continue;
         }
@@ -1731,13 +2027,27 @@ vert_behind:
             }
         }
 
+        /* Near the camera (or crossing the screen-edge depth): banded emitter. */
+        fixed_t q_cz_min = pv0->cz;
+        if (pv1->cz < q_cz_min) q_cz_min = pv1->cz;
+        if (pv2->cz < q_cz_min) q_cz_min = pv2->cz;
+        if (pv3->cz < q_cz_min) q_cz_min = pv3->cz;
+        const int near_q = qpack_quv && q_cz_min < (128 << FRACBITS);
+        const int st = (int)(qpack_base >> 24) & 0x7F, cnt = (int)((qpack_base >> 16) & 0xFFu);
+
         if (cw_c != 0)
         {
-            local_q = HW_EmitFlatBands(fctx, qp, cw_c, qpack_base | 0x80000000u | (uint32_t)local_q);
+            if (near_q || (qpack_quv && q_cz_min < fctx->z_eff_ceil))
+                local_q = HW_EmitFlatQuadBanded(fctx, qp, st, cnt, 1, fctx->ceil_srca, flip_c, local_q);
+            else
+                local_q = HW_EmitFlatBands(fctx, qp, cw_c, qpack_base | 0x80000000u | (uint32_t)local_q);
         }
         if (cw_f != 0)
         {
-            local_q = HW_EmitFlatBands(fctx, qp, cw_f, qpack_base | (uint32_t)local_q);
+            if (near_q || (qpack_quv && q_cz_min < fctx->z_eff_floor))
+                local_q = HW_EmitFlatQuadBanded(fctx, qp, st, cnt, 0, fctx->floor_srca, flip_f, local_q);
+            else
+                local_q = HW_EmitFlatBands(fctx, qp, cw_f, qpack_base | (uint32_t)local_q);
         }
     }
 
@@ -1870,6 +2180,14 @@ HW_ALWAYS_INLINE int HW_FlatAltVariant(int use_lod1, int subnum)
         return 2;
     if (saturn_baked_flat_subflags && (saturn_baked_flat_subflags[subnum] & SATURN_SUBFLAG_TRANSPOSED))
         return 1;
+    /* Near the camera the banded emitter may draw full cells transposed. */
+    if (saturn_baked_flat_bboxes)
+    {
+        const saturn_flat_bbox_t *bb = &saturn_baked_flat_bboxes[subnum];
+        if (hw_cam_x > bb->min_x - 160 && hw_cam_x < bb->max_x + 160 &&
+            hw_cam_y > bb->min_y - 160 && hw_cam_y < bb->max_y + 160)
+            return 1;
+    }
     return 0;
 }
 
@@ -1877,7 +2195,7 @@ HW_ALWAYS_INLINE int HW_FlatAltVariant(int use_lod1, int subnum)
 static uint32_t hw_def_alt_pack = 0;    /* alt pack for HW_DeferMasterFlatJob */
 #endif
 
-static hw_flat_sec_cache_t hw_flat_sec_cache = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static hw_flat_sec_cache_t hw_flat_sec_cache = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static void HW_RenderSubsectorBakedFlats(int sub_idx, int subnum, sector_t *sec, int fully_inside);
 
