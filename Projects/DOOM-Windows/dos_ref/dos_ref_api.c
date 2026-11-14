@@ -19,6 +19,7 @@
 #include "z_zone.h"
 #include "v_video.h"
 #include "r_sky.h"
+#include "m_swap.h"
 
 extern boolean setsizeneeded;
 extern void R_ExecuteSetViewSize(void);
@@ -389,6 +390,146 @@ DOS_EXPORT void DOS_SyncSectors(const dos_sync_sector_t *sec_list, int count)
     }
 }
 
+/* ------------------------------------------------------------------
+ * Status bar (classic DOS STBAR layout, st_stuff.c coordinates minus ST_Y)
+ * The caller fills dos_status_t from the Saturn player each frame; the bar
+ * is composed into a 320x32 strip in screens[1] and copied into the output
+ * at stbar_y (168 in DOS view mode, 192 in Saturn full view mode) so it sits
+ * at the same rows as the Saturn pane's HUD. Weapon/ammo indices here are
+ * already converted to PC DOOM order by the caller.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int health;            /* mo->health */
+    int armor;             /* armorpoints */
+    int ready_ammo;        /* ammo count of the ready weapon, -1 = none (fist/saw) */
+    int ammo[4];           /* clip, shell, cell, misl */
+    int maxammo[4];
+    int arms[6];           /* slots 2..7 owned (pistol, shotgun, chaingun, rocket, plasma, bfg) */
+    int cards[6];          /* blue/yellow/red card, blue/yellow/red skull */
+    int god;               /* god mode cheat active */
+} dos_status_t;
+
+static dos_status_t s_status;
+static int          s_status_valid = 0;
+static int          s_stbar_y = 168;
+
+static patch_t *s_p_stbar, *s_p_starms, *s_p_tallnum[10], *s_p_tallpct;
+static patch_t *s_p_shortnum[10], *s_p_graynum[10], *s_p_keys[6];
+static patch_t *s_p_faces[5], *s_p_god, *s_p_dead;
+static int      s_st_loaded = 0;
+
+static patch_t *ST_Lump(const char *name)
+{
+    int lump = W_CheckNumForName((char *)name);
+    return (lump >= 0) ? (patch_t *)W_CacheLumpNum(lump, PU_STATIC) : NULL;
+}
+
+static void ST_LoadPatches(void)
+{
+    char name[9];
+    if (s_st_loaded) return;
+    s_p_stbar  = ST_Lump("STBAR");
+    s_p_starms = ST_Lump("STARMS");
+    s_p_tallpct = ST_Lump("STTPRCNT");
+    for (int i = 0; i < 10; i++) {
+        sprintf(name, "STTNUM%d", i);  s_p_tallnum[i]  = ST_Lump(name);
+        sprintf(name, "STYSNUM%d", i); s_p_shortnum[i] = ST_Lump(name);
+        sprintf(name, "STGNUM%d", i);  s_p_graynum[i]  = ST_Lump(name);
+    }
+    for (int i = 0; i < 6; i++) {
+        sprintf(name, "STKEYS%d", i);  s_p_keys[i] = ST_Lump(name);
+    }
+    for (int i = 0; i < 5; i++) {
+        sprintf(name, "STFST%d1", i);  s_p_faces[i] = ST_Lump(name);  /* straight-ahead face */
+    }
+    s_p_god  = ST_Lump("STFGOD0");
+    s_p_dead = ST_Lump("STFDEAD0");
+    s_st_loaded = 1;
+}
+
+static void ST_Patch(int x, int y, patch_t *p)
+{
+    if (p) V_DrawPatch(x, y, 1, p);
+}
+
+/* STlib_drawNum: right-aligned at x, up to 'digits' digits, 0 draws one zero. */
+static void ST_Num(int x, int y, int num, int digits, patch_t **font)
+{
+    if (!font[0]) return;
+    int w = SHORT(font[0]->width);
+    if (num < 0) num = 0;
+    if (num == 0) { ST_Patch(x - w, y, font[0]); return; }
+    while (num && digits--) {
+        x -= w;
+        ST_Patch(x, y, font[num % 10]);
+        num /= 10;
+    }
+}
+
+static void ST_DrawBar(void)
+{
+    ST_LoadPatches();
+    memset(screens[1], 0, SCREENWIDTH * 32);
+
+    ST_Patch(0, 0, s_p_stbar);
+    ST_Patch(104, 0, s_p_starms);
+
+    /* Ready-weapon ammo, health %, armor % (tall red digits) */
+    if (s_status.ready_ammo >= 0)
+        ST_Num(44, 3, s_status.ready_ammo, 3, s_p_tallnum);
+    ST_Num(90, 3, s_status.health, 3, s_p_tallnum);
+    ST_Patch(90, 3, s_p_tallpct);
+    ST_Num(221, 3, s_status.armor, 3, s_p_tallnum);
+    ST_Patch(221, 3, s_p_tallpct);
+
+    /* Arms 2..7: yellow if owned, gray otherwise */
+    for (int i = 0; i < 6; i++) {
+        patch_t *p = s_status.arms[i] ? s_p_shortnum[i + 2] : s_p_graynum[i + 2];
+        ST_Patch(111 + (i % 3) * 12, 4 + (i / 3) * 10, p);
+    }
+
+    /* Face: dead / god / straight face by pain level (ST_calcPainOffset) */
+    {
+        patch_t *face;
+        if (s_status.health <= 0) {
+            face = s_p_dead;
+        } else if (s_status.god) {
+            face = s_p_god;
+        } else {
+            int h = s_status.health > 100 ? 100 : s_status.health;
+            int pain = ((100 - h) * 5) / 101;
+            face = s_p_faces[pain];
+        }
+        ST_Patch(143, 0, face);
+    }
+
+    /* Keys: skull overrides card in the same slot */
+    for (int i = 0; i < 3; i++) {
+        int k = -1;
+        if (s_status.cards[i])     k = i;
+        if (s_status.cards[i + 3]) k = i + 3;
+        if (k >= 0) ST_Patch(239, 3 + i * 10, s_p_keys[k]);
+    }
+
+    /* Ammo / max ammo table (small yellow digits). On-screen rows top to
+     * bottom are bull, shel, rckt, cell, so cell and misl swap rows. */
+    {
+        static const int ammo_y[4] = { 5, 11, 23, 17 };   /* clip, shell, cell, misl */
+        for (int i = 0; i < 4; i++) {
+            ST_Num(288, ammo_y[i], s_status.ammo[i], 3, s_p_shortnum);
+            ST_Num(314, ammo_y[i], s_status.maxammo[i], 3, s_p_shortnum);
+        }
+    }
+}
+
+DOS_EXPORT void DOS_SetStatus(const dos_status_t *st, int stbar_y)
+{
+    if (!st) { s_status_valid = 0; return; }
+    s_status = *st;
+    s_stbar_y = stbar_y;
+    s_status_valid = 1;
+}
+
 DOS_EXPORT void DOS_RenderFrame(uint32_t *out_rgba_352x224)
 {
     if (!s_initialized || !s_playpal || !out_rgba_352x224) return;
@@ -421,6 +562,19 @@ DOS_EXPORT void DOS_RenderFrame(uint32_t *out_rgba_352x224)
             uint8_t b = pal[col_idx * 3 + 2];
             /* Standard DIB BI_RGB: 0x00RRGGBB */
             dst_row[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+
+    /* Overlay the status bar at the same rows as the Saturn HUD */
+    if (s_status_valid && s_stbar_y >= 0 && s_stbar_y + 32 <= 224) {
+        ST_DrawBar();
+        for (int y = 0; y < 32; y++) {
+            uint32_t *dst_row = out_rgba_352x224 + (s_stbar_y + y) * 352 + 16;
+            const byte *src_row = screens[1] + y * SCREENWIDTH;
+            for (int x = 0; x < 320; x++) {
+                const uint8_t *c = pal + src_row[x] * 3;
+                dst_row[x] = ((uint32_t)c[0] << 16) | ((uint32_t)c[1] << 8) | (uint32_t)c[2];
+            }
         }
     }
 }

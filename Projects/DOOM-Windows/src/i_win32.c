@@ -75,6 +75,20 @@ typedef struct {
 typedef void (*fn_DOS_SyncMobjs)(const dos_sync_mobj_t *mobjs, int count);
 typedef void (*fn_DOS_SyncSectors)(const dos_sync_sector_t *sec_list, int count);
 
+/* Must match dos_status_t in dos_ref/dos_ref_api.c */
+typedef struct {
+    int health;
+    int armor;
+    int ready_ammo;        /* -1 = weapon uses no ammo */
+    int ammo[4];           /* clip, shell, cell, misl */
+    int maxammo[4];
+    int arms[6];           /* slots 2..7 */
+    int cards[6];
+    int god;
+} dos_status_t;
+typedef void (*fn_DOS_SetStatus)(const dos_status_t *st, int stbar_y);
+static fn_DOS_SetStatus pDOS_SetStatus = NULL;
+
 static HMODULE            s_dos_dll = NULL;
 static fn_DOS_Init        pDOS_Init = NULL;
 static fn_DOS_SetCamera   pDOS_SetCamera = NULL;
@@ -133,6 +147,7 @@ static void InitDosRefDll(void)
     pDOS_SyncSectors = (fn_DOS_SyncSectors)GetProcAddress(s_dos_dll, "DOS_SyncSectors");
     pDOS_RenderFrame = (fn_DOS_RenderFrame)GetProcAddress(s_dos_dll, "DOS_RenderFrame");
     pDOS_GetPalette  = (fn_DOS_GetPalette)GetProcAddress(s_dos_dll, "DOS_GetPalette");
+    pDOS_SetStatus   = (fn_DOS_SetStatus)GetProcAddress(s_dos_dll, "DOS_SetStatus");
 
     if (pDOS_Init && pDOS_SetCamera && pDOS_RenderFrame) {
         const char *wad = FindWadPath();
@@ -738,6 +753,35 @@ void I_FinishUpdate(void)
                 s_sync_secs[s].lightlevel    = sectors[s].lightlevel;
             }
             pDOS_SyncSectors(s_sync_secs, sec_cnt);
+        }
+        if (pDOS_SetStatus) {
+            /* Convert Saturn (d32xr) player state to the DOS status bar.
+             * d32xr weapon order: fist, pistol, shotgun, supershotgun,
+             * chaingun, missile, plasma, bfg, chainsaw. */
+            extern int saturn_stbar_y;
+            const player_t *pl = &players[0];
+            dos_status_t st;
+            memset(&st, 0, sizeof(st));
+            st.health = pl->mo ? pl->mo->health : pl->health;
+            st.armor  = pl->armorpoints;
+            st.ready_ammo = -1;
+            if (pl->readyweapon >= 0 && pl->readyweapon < NUMWEAPONS) {
+                int at = weaponinfo[pl->readyweapon].ammo;
+                if (at >= 0 && at < NUMAMMO) st.ready_ammo = pl->ammo[at];
+            }
+            for (int a = 0; a < NUMAMMO && a < 4; a++) {
+                st.ammo[a]    = pl->ammo[a];
+                st.maxammo[a] = pl->maxammo[a];
+            }
+            st.arms[0] = pl->weaponowned[wp_pistol];
+            st.arms[1] = pl->weaponowned[wp_shotgun] || pl->weaponowned[wp_supershotgun];
+            st.arms[2] = pl->weaponowned[wp_chaingun];
+            st.arms[3] = pl->weaponowned[wp_missile];
+            st.arms[4] = pl->weaponowned[wp_plasma];
+            st.arms[5] = pl->weaponowned[wp_bfg];
+            for (int k = 0; k < NUMCARDS && k < 6; k++) st.cards[k] = pl->cards[k];
+            st.god = (pl->cheats & CF_GODMODE) != 0;
+            pDOS_SetStatus(&st, saturn_stbar_y);
         }
         pDOS_RenderFrame(s_dos_fb);
     } else {
