@@ -33,43 +33,31 @@ extern int saturn_stbar_y;
 #define ST_BAR_Y    saturn_stbar_y
 
 /* ---- layout constants ----
- * X positions are derived from THIS WAD's own STBAR art (the 32X-era
- * bar): each tall number is CENTERED in its label's metal panel
- * (AMMO 3-46, HEALTH 50-97, ARMOR 180-233 — borders measured from the
- * lump), matching the rerelease bar where every number sits centered
- * over its label. The vanilla DOS constants 44/90/221 belong to the PC
- * bar art and hang these numbers outside this art's panels. Y = PC+24. */
-#define ST_AMMOX     24       /* main ammo, panel center */
+ * Verbatim linuxdoom-1.10 st_stuff.c ST_* coordinates with ST_Y (168)
+ * replaced by ST_BAR_Y. DOOM1.WAD carries the PC STBAR art, so the PC
+ * positions are the correct ones. Numbers are right-aligned at their X
+ * (STlib_drawNum), and every patch is placed with its WAD left/top
+ * offsets applied (hud_patch), exactly like V_DrawPatch. */
+#define ST_AMMOX     44       /* right edge, 3 digits */
 #define ST_AMMOY     (ST_BAR_Y + 3)
-#define ST_HEALTHX   74
+#define ST_HEALTHX   90       /* right edge; STTPRCNT drawn at the same x */
 #define ST_HEALTHY   (ST_BAR_Y + 3)
-#define ST_ARMORX    206
+#define ST_ARMORX    221
 #define ST_ARMORY    (ST_BAR_Y + 3)
 #define ST_ARMSXSPACE 12
 #define ST_ARMSYSPACE 10
-/* Arms numbers 2-7: the vanilla STARMS patch (40x32, six empty boxes +
- * baked ARMS label) is drawn OVER this 32X-era art's third panel (fb
- * x ~101-142, which bakes a FRAG label instead) — exactly how the PC
- * bar composes it (ST_ARMSBGX 104 = panel x, bar top + 1; bottom row
- * clips, also vanilla). Digits then land on the boxes at the PC
- * offsets from the patch origin: x +7, cols pitch 12; rows +3 / +13.
- * (An earlier grid at x=146 sat inside the face hole, 143-177.) */
-#define ST_ARMSBGX   (ST_WEAPON0X - 7)     /* 101: STARMS panel origin  */
-#define ST_ARMSBGY   (ST_BAR_Y + 1)        /* 193                       */
-#define ST_WEAPON0X  108
-#define ST_WEAPON0Y  (ST_ARMSBGY + 3)      /* 196; row 2 = +10 more     */
-/* Face: the STBAR art's face hole is fb x 143-177 (35 px) but the
- * STF* patches are 24 wide — center them in the hole instead of
- * leaving an 11-px black band on the right. */
-#define ST_FX        148
-#define ST_FY        (ST_BAR_Y + 1)
+#define ST_ARMSBGX   104
+#define ST_ARMSBGY   ST_BAR_Y
+#define ST_WEAPON0X  111
+#define ST_WEAPON0Y  (ST_BAR_Y + 4)
+#define ST_FX        143      /* face patches carry their own offsets */
+#define ST_FY        ST_BAR_Y
 #define ST_KEY0X     239
 #define ST_KEY0Y     (ST_BAR_Y + 3)
 #define ST_KEY1Y     (ST_BAR_Y + 13)
 #define ST_KEY2Y     (ST_BAR_Y + 23)
-#define ST_AMMO0X    290      /* per-type ammo counts, right edge
-                               * (count gap 268-291, slash at 292-295) */
-#define ST_MAXAMMOX  317      /* maxes area 297-318 */
+#define ST_AMMO0X    288      /* per-type ammo counts, right edge */
+#define ST_MAXAMMOX  314      /* max ammo, right edge */
 
 /* PC layout: rows 173/179/185/191 = clip/shells/rockets/cells.
  * d32xr's ammotype_t orders cell(2) before misl(3) — remap. */
@@ -98,6 +86,8 @@ static const void *hud_tallpct;       /* STTPRCNT             */
 static const void *hud_graynum[10];   /* STGNUM0-9            */
 static const void *hud_ylwnum[10];    /* STYSNUM0-9           */
 static const void *hud_keys[6];       /* STKEYS0-5            */
+
+static void hud_patch(int x, int y, const void *patch);
 
 /* ---- message line ----
  * d32xr's gameplay code sets player->message in ~40 places but the
@@ -171,10 +161,8 @@ void Saturn_HUD_Init(void)
         {
             byte *saved_fb = I_VideoBuffer;
             I_VideoBuffer = hud_stbar_linear - ST_BAR_Y * 320;
-            if (hud_stbar)
-                Saturn_DrawPatch(0, ST_BAR_Y, hud_stbar, ST_BAR_Y, DOOM_FBHEIGHT);
-            if (hud_armsbg)
-                Saturn_DrawPatch(ST_ARMSBGX, ST_ARMSBGY, hud_armsbg, ST_BAR_Y, DOOM_FBHEIGHT);
+            hud_patch(0, ST_BAR_Y, hud_stbar);
+            hud_patch(ST_ARMSBGX, ST_ARMSBGY, hud_armsbg);
             I_VideoBuffer = saved_fb;
         }
     }
@@ -184,122 +172,50 @@ void Saturn_HUD_Init(void)
     }
 }
 
-/* Tall red digits drawn at 3/4 scale — the rerelease bar's numbers are
- * ~10x12, not the DOS STTNUM 14x16, and only the smaller size keeps
- * "100%" inside this art's HEALTH panel (50-97). pct: append STTPRCNT.
- * x is the CENTER of the number (panel-centered, see ST_*X above). */
-#define HUD_NUM_SCALE_N 3
-#define HUD_NUM_SCALE_D 4
-
-static int hud_scaled_w(const void *patch)
+/* Patch header fields (little-endian WAD data, read bytewise). */
+static int hud_patch_w(const void *patch)
 {
-    int w = ((const byte *)patch)[0] | (((const byte *)patch)[1] << 8);
-
-    return w * HUD_NUM_SCALE_N / HUD_NUM_SCALE_D;
+    const byte *p = (const byte *)patch;
+    return p[0] | (p[1] << 8);
 }
 
-static void hud_num(int x, int y, int value, int pct)
+/* V_DrawPatch equivalent: Saturn_DrawPatch* place the patch's top-left
+ * corner at (x,y) and ignore the WAD offsets, so subtract them here. */
+static void hud_patch(int x, int y, const void *patch)
 {
-    const void *patch[3];
-    int         n = 0, i;
-    int         total;
+    const byte *p = (const byte *)patch;
+    short lo, to;
 
+    if (!patch)
+        return;
+    lo = (short)(p[4] | (p[5] << 8));
+    to = (short)(p[6] | (p[7] << 8));
+    Saturn_DrawPatchFS(x - lo, y - to, patch);
+}
+
+/* STlib_drawNum: right-aligned at x, at most 3 digits, fixed pitch =
+ * width of the '0' glyph, a lone 0 for zero. Negative values clamp to 0
+ * (d32xr clamps player health at 0, armor/ammo never go negative). */
+static void hud_drawnum(int x, int y, int value, const void *const *font)
+{
+    int w, digits = 3;
+
+    if (!font[0])
+        return;
+    w = hud_patch_w(font[0]);
+    if (value < 0)   value = 0;
     if (value > 999) value = 999;
-    if (value < -99) value = -99;
 
-    if (value < 0)
+    if (value == 0)
     {
-        /* minus sign, no digits (health never reads negative here) */
-        if (hud_tallminus)
-            Saturn_DrawPatchScale(x - hud_scaled_w(hud_tallminus) / 2, y,
-                                  hud_tallminus, 0, DOOM_FBHEIGHT,
-                                  HUD_NUM_SCALE_N, HUD_NUM_SCALE_D);
+        hud_patch(x - w, y, font[0]);
         return;
     }
-
-    if (value >= 100) patch[n++] = hud_tallnum[(value / 100) % 10];
-    if (value >= 10)  patch[n++] = hud_tallnum[(value / 10) % 10];
-    patch[n++] = hud_tallnum[value % 10];
-
-    total = 0;
-    for (i = 0; i < n; i++)
-        if (patch[i])
-            total += hud_scaled_w(patch[i]);
-    if (pct && hud_tallpct)
-        total += hud_scaled_w(hud_tallpct);
-
-    /* walk left to right from the centered left edge */
+    while (value && digits--)
     {
-        int cx = x - total / 2;
-
-        for (i = 0; i < n; i++)
-        {
-            if (patch[i])
-                Saturn_DrawPatchScale(cx, y, patch[i], 0, DOOM_FBHEIGHT,
-                                      HUD_NUM_SCALE_N, HUD_NUM_SCALE_D);
-            cx += hud_scaled_w(patch[i]);
-        }
-        if (pct && hud_tallpct)
-            Saturn_DrawPatchScale(cx, y, hud_tallpct, 0, DOOM_FBHEIGHT,
-                                  HUD_NUM_SCALE_N, HUD_NUM_SCALE_D);
-    }
-}
-
-/* Small right-aligned number from a named digit font ("STGNUM",
- * "STYSNUM", "AMMNUM" — 6-7 char prefixes + one digit). Advance is the
- * glyph's real width + 1 px of spacing (AMMNUM 3, STGNUM/STYSNUM 4) —
- * a fixed 6-px pitch hangs 2-3 blank px after every digit and drags
- * the whole number left of its slot. */
-static void hud_small_num(int x, int y, int value, const char *prefix)
-{
-    const void *patch[3];
-    int         n = 0, i, total = 0, cx;
-
-    if (value > 999) value = 999;
-    if (value < 0) value = 0;
-
-    const void *const *font = (prefix[2] == 'Y') ? hud_ylwnum : (prefix[2] == 'G' ? hud_graynum : NULL);
-    if (font)
-    {
-        if (value >= 100) patch[n++] = font[(value / 100) % 10];
-        if (value >= 10)  patch[n++] = font[(value / 10) % 10];
-        patch[n++] = font[value % 10];
-    }
-    else
-    {
-        char name[9];
-        int plen = 0;
-        while (prefix[plen] && plen < 7)
-        {
-            name[plen] = prefix[plen];
-            plen++;
-        }
-        name[plen + 1] = 0;
-
-        if (value >= 100) { name[plen] = (char)('0' + (value / 100) % 10);
-                            patch[n++] = Saturn_CachePatch(name); }
-        if (value >= 10)  { name[plen] = (char)('0' + (value / 10) % 10);
-                            patch[n++] = Saturn_CachePatch(name); }
-        name[plen] = (char)('0' + value % 10);
-        patch[n++] = Saturn_CachePatch(name);
-    }
-
-    for (i = 0; i < n; i++)
-        if (patch[i])
-            total += (((const byte *)patch[i])[0] |
-                      (((const byte *)patch[i])[1] << 8)) + 1;
-    if (total)
-        total--;                    /* no trailing space after last digit */
-
-    cx = x - total;
-    for (i = 0; i < n; i++)
-    {
-        if (patch[i])
-        {
-            Saturn_DrawPatchFS(cx, y, patch[i]);
-            cx += (((const byte *)patch[i])[0] |
-                   (((const byte *)patch[i])[1] << 8)) + 1;
-        }
+        x -= w;
+        hud_patch(x, y, font[value % 10]);
+        value /= 10;
     }
 }
 
@@ -314,14 +230,11 @@ static void hud_small_num(int x, int y, int value, const char *prefix)
 static int hud_face_frame = 0;
 static int hud_special_left = 0;
 
-/* Face art is 24 wide (STFST); turn faces run 26-30 wide. Center
- * them on the 24-px window (width straight from the patch header). */
+/* All STF* faces are positioned by their own WAD offsets from (143,ST_Y),
+ * as in st_stuff.c's w_faces widget. */
 static void hud_draw_face(const void *patch)
 {
-    const byte *p = (const byte *)patch;
-    int         w = p[0] | (p[1] << 8);
-
-    Saturn_DrawPatchFS(ST_FX - ((w - 24) >> 1), ST_FY, patch);
+    hud_patch(ST_FX, ST_FY, patch);
 }
 
 static void hud_face(int health)
@@ -692,11 +605,9 @@ void Saturn_HUD_Draw(void)
     {
         sb = hud_stbar;
         if (sb)
-            Saturn_DrawPatch(0, ST_BAR_Y, sb,
-                             ST_BAR_Y, DOOM_FBHEIGHT);
+            hud_patch(0, ST_BAR_Y, sb);
         if (hud_armsbg)
-            Saturn_DrawPatch(ST_ARMSBGX, ST_ARMSBGY, hud_armsbg,
-                             ST_BAR_Y, DOOM_FBHEIGHT);
+            hud_patch(ST_ARMSBGX, ST_ARMSBGY, hud_armsbg);
     }
 
     static int top_border_clean = 0;
@@ -746,29 +657,19 @@ void Saturn_HUD_Draw(void)
         }
     }
 
-    /* main ammo of the ready weapon; '-' for fist/chainsaw */
+    /* main ammo of the ready weapon; blank for fist/chainsaw (DOS) */
     {
         int am = weaponinfo[p->readyweapon].ammo;
 
-        if (am == am_noammo)
-        {
-            if (hud_tallminus)
-                Saturn_DrawPatchScale(ST_AMMOX - 5, ST_AMMOY,
-                                      hud_tallminus, 0, DOOM_FBHEIGHT,
-                                      HUD_NUM_SCALE_N, HUD_NUM_SCALE_D);
-        }
-        else
-            hud_num(ST_AMMOX, ST_AMMOY, p->ammo[am], 0);
+        if (am != am_noammo)
+            hud_drawnum(ST_AMMOX, ST_AMMOY, p->ammo[am], hud_tallnum);
     }
 
     health = p->health;
-    hud_num(ST_HEALTHX, ST_HEALTHY, health, 1);
-    hud_num(ST_ARMORX, ST_ARMORY, p->armorpoints, 1);
-
-    /* STARMS panel bg: pre-baked in linear buffer, only drawn in fallback mode */
-    if (!hud_stbar_linear && hud_armsbg)
-        Saturn_DrawPatch(ST_ARMSBGX, ST_ARMSBGY, hud_armsbg,
-                         ST_BAR_Y, DOOM_FBHEIGHT);
+    hud_drawnum(ST_HEALTHX, ST_HEALTHY, health, hud_tallnum);
+    hud_patch(ST_HEALTHX, ST_HEALTHY, hud_tallpct);
+    hud_drawnum(ST_ARMORX, ST_ARMORY, p->armorpoints, hud_tallnum);
+    hud_patch(ST_ARMORX, ST_ARMORY, hud_tallpct);
 
     for (i = 0; i < 6; i++)
     {
@@ -784,15 +685,14 @@ void Saturn_HUD_Draw(void)
             owned = p->weaponowned[hud_arms_weapon[i]];
 
         g = owned ? hud_ylwnum[i + 2] : hud_graynum[i + 2];
-        if (g)
-            Saturn_DrawPatchFS(x, y, g);
+        hud_patch(x, y, g);
     }
 
-    /* keys: cards 0-2 and skull keys 3-5 share three rows, side by
-     * side (the 32X bar offsets skulls +3 px; our card art is 7 wide
-     * so skulls sit at +8). tryopen flashes on a locked-door attempt
-     * (p_doors.c) — d32xr's ST_Ticker is a stub, so we own the
-     * blink-and-clear plus the itemup blip its ticker played. */
+    /* keys: one box per colour row, as in DOS — a skull key replaces
+     * the card of the same colour (st_stuff.c keyboxes[]). tryopen
+     * flashes on a locked-door attempt (p_doors.c) — d32xr's ST_Ticker
+     * is a stub, so we own the blink-and-clear plus the itemup blip its
+     * ticker played. */
     {
         int key_y[3] = { ST_KEY0Y, ST_KEY1Y, ST_KEY2Y };
         static int open_left[6];
@@ -800,9 +700,12 @@ void Saturn_HUD_Draw(void)
         for (i = 0; i < 6; i++)
         {
             int flash = (stbar && stbar->tryopen[i]) != 0;
-            int x     = ST_KEY0X + (i / 3) * 8;
+            int x     = ST_KEY0X;
 
             if (!p->cards[i] && !flash)
+                continue;
+            /* card hidden by the owned skull of the same colour */
+            if (i < 3 && p->cards[i + 3] && !flash)
                 continue;
 
             if (flash)
@@ -821,22 +724,18 @@ void Saturn_HUD_Draw(void)
             else
                 open_left[i] = 0;
 
-            if (hud_keys[i])
-                Saturn_DrawPatchFS(x, key_y[i % 3], hud_keys[i]);
+            hud_patch(x, key_y[i % 3], hud_keys[i]);
         }
     }
 
-    /* per-type ammo counts + maxes, yellow STYSNUM like the rerelease
-     * bar. This WAD's AMMNUM is palette 103 = 87-gray and vanishes
-     * into the bar metal; STGNUM's body is 131-gray with a dark-red
-     * shadow that reads as garbage at this size. STYSNUM (yellow body,
-     * red shadow) is what the reference bar uses for both columns. */
+    /* per-type ammo counts + maxes, yellow STYSNUM (st_stuff.c w_ammo /
+     * w_maxammo use shortnum[] = STYSNUM for both columns). */
     for (i = 0; i < NUMAMMO; i++)
     {
         int y = ST_BAR_Y + hud_ammo_offset[i];
 
-        hud_small_num(ST_AMMO0X, y, p->ammo[i], "STYSNUM");
-        hud_small_num(ST_MAXAMMOX, y, p->maxammo[i], "STYSNUM");
+        hud_drawnum(ST_AMMO0X, y, p->ammo[i], hud_ylwnum);
+        hud_drawnum(ST_MAXAMMOX, y, p->maxammo[i], hud_ylwnum);
     }
 
     hud_face(health);
