@@ -103,6 +103,9 @@ int  Saturn_Vdp1FlatQuad_Add(int x0, int y0,
                              int x3, int y3,
                              int flatnum, int shade);
 int  Saturn_Vdp1_GetFlatSrca(int flatnum);
+/* Lazily uploaded flat variants: 1 = transposed pyramid, 2 = LOD1 2x2 tile
+ * pyramid. Same layout as the base flat pyramid. 0 = unavailable. */
+int  Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant);
 void Saturn_Vdp1_PreloadFlat(int flatnum);
 void Saturn_Vdp1_ClearPages(void);
 int  Saturn_Vdp1_GetTexSrca(int texnum, int *tw, int *th);

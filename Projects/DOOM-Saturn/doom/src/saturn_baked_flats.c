@@ -67,7 +67,48 @@ const saturn_flat_bbox_t            *saturn_baked_flat_bboxes    = NULL;
 const saturn_flat_vert_t            *saturn_baked_flat_verts     = NULL;
 const saturn_flat_quad_idx_t        *saturn_baked_flat_quads     = NULL;
 const uint8_t                       *saturn_baked_flat_vfrac     = NULL;
+const uint16_t                      *saturn_baked_flat_quv       = NULL;
+const uint8_t                       *saturn_baked_flat_subflags  = NULL;
 int                                  saturn_baked_flat_numsubsectors = 0;
+
+/* QUV1 extension block (tools/bake_flats.py quad_uv): sits at
+ * align4(ofs_vert_frac + numvertexes). Layout: "QUV1", u32 numquads,
+ * u32 numsubsectors, u16 quv[numquads], pad4, u8 subflags[numsubsectors]. */
+static void Saturn_BakedFlats_FindQuv(uint32_t len)
+{
+    const saturn_flt2_header_t *h = cur_hdr2;
+    uint32_t of = h->reserved[0];
+    uint32_t nq = h->numquads;
+    uint32_t ns = h->numsubsectors;
+    uint32_t qo, so;
+    const byte *b;
+
+    saturn_baked_flat_quv      = NULL;
+    saturn_baked_flat_subflags = NULL;
+    if (of < 64 || of + h->numvertexes > len)
+        return;
+    qo = (of + h->numvertexes + 3u) & ~3u;
+    if (qo + 12u > len)
+        return;
+    b = cur_blob + qo;
+    if (b[0] != 'Q' || b[1] != 'U' || b[2] != 'V' || b[3] != '1')
+        return;
+    if ((((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7]) != nq ||
+        (((uint32_t)b[8] << 24) | ((uint32_t)b[9] << 16) | ((uint32_t)b[10] << 8) | b[11]) != ns)
+        return;
+    so = (qo + 12u + nq * 2u + 3u) & ~3u;
+    if (so + ns > len)
+        return;
+#ifdef SATURN_WIN32
+    {
+        uint16_t *q = (uint16_t *)(cur_blob + qo + 12u);
+        for (uint32_t i = 0; i < nq; i++)
+            q[i] = _byteswap_ushort(q[i]);
+    }
+#endif
+    saturn_baked_flat_quv      = (const uint16_t *)(cur_blob + qo + 12u);
+    saturn_baked_flat_subflags = cur_blob + so;
+}
 
 #define cur_sub_q_first saturn_baked_flat_q_first
 #define cur_sub_q_count saturn_baked_flat_q_count
@@ -270,6 +311,7 @@ int Saturn_BakedFlats_Parse(void *data, unsigned len)
         saturn_wram_l_seg_addr = (uint8_t *)(((uint32_t)cur_blob + end + 15u) & ~15u);
         saturn_wram_l_geom_end = saturn_wram_l_seg_addr;
     }
+    Saturn_BakedFlats_FindQuv(len);
     dbg_parse_err     = 99;
     return 1;
 

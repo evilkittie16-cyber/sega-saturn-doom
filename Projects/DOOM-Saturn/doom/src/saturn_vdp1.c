@@ -1047,8 +1047,10 @@ static int v1_tex_get(int texnum, int *w, int *h)
         }
 #endif
         tag->srca = (unsigned short)(off / 8u);
-        tag->srca_mono = (unsigned short)(tag->srca + 512u);
-        tag->srca_64   = (unsigned short)(tag->srca + 640u);
+        /* For flats these two fields hold the lazily uploaded variants
+         * (Saturn_Vdp1_GetFlatSrcaVariant): 0 = not resident yet. */
+        tag->srca_mono = 0;    /* transposed pyramid */
+        tag->srca_64   = 0;    /* LOD1 2x2-tile pyramid */
     }
     else if (texnum > 0 && tw == 8)
     {
@@ -1413,6 +1415,18 @@ void Saturn_Vdp1Wall_Reset(void)
             if (v1_tag_n > v1_tag_spr0)
                 D_memset(&v1_tag[0][v1_tag_spr0], 0,
                          (size_t)(v1_tag_n - v1_tag_spr0) * sizeof(v1_tag_t));
+            /* The flats' lazily uploaded variants (transposed / LOD1 tile,
+             * Saturn_Vdp1_GetFlatSrcaVariant) live in this flushable arena,
+             * unlike the preloaded base pyramids: forget them so they are
+             * re-uploaded instead of pointing at reused VRAM. */
+            {
+                int i;
+                for (i = v1_tag_flat0; i < v1_tag_spr0; i++)
+                {
+                    v1_tag[0][i].srca_mono = 0;
+                    v1_tag[0][i].srca_64   = 0;
+                }
+            }
         }
         v1_page_off[0] = v1_page_base[0];
         v1_page_off[1] = v1_page_base[0];
@@ -1628,6 +1642,79 @@ int Saturn_Vdp1_GetFlatSrca(int flatnum)
     s_mru_flat_srca = v1_tex_get(-(flatnum + 1), &tw, &th);
     s_mru_flat = flatnum;
     return s_mru_flat_srca;
+}
+
+/* Flat texture variants for the baked QUV mapping (tools/bake_flats.py).
+ * Both use the same 5,440-byte pyramid layout as the normal flat
+ * (64x64 @+0, 32x32 @+4096, 16x16 @+5120, 8x8 @+5376) so HW_FlatSizeLOD
+ * picks levels from them unchanged:
+ *   variant 1  transposed: T[u][v] = F[v][u], so quads trimmed in X can
+ *              select texture COLUMNS as rows (VDP1 can only slice rows)
+ *   variant 2  LOD1 tile: level n = 2x2 tiling of the flat's next-smaller
+ *              mip, so one 64-texel texture covers a 128-unit LOD1 cell
+ * Point sampling matches the normal pyramid (centre texel of each block).
+ * Uploaded on first use only, row by row (no large staging buffer). */
+static int v1_flat_sample(const byte *src, int variant, int level, int y, int x)
+{
+    int step = 1 << level, half = step >> 1;
+
+    if (variant == 1)
+    {
+        int t = x; x = y; y = t;
+    }
+    else if (variant == 2)
+    {
+        int m = (64 >> level) >> 1;
+        step <<= 1;
+        half = step >> 1;
+        y %= m;
+        x %= m;
+    }
+    return src[(y * step + half) * 64 + x * step + half];
+}
+
+int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
+{
+    static const unsigned short lvl_ofs[4] = { 0, 4096, 5120, 5376 };
+    static unsigned int rowbuf[16];        /* 64 bytes, 4-aligned */
+    v1_tag_t       *tag;
+    unsigned short *field;
+    const byte     *src;
+    unsigned int    off;
+    int             f, level;
+
+    if (flatnum < 0 || flatnum >= (int)numflats || (variant != 1 && variant != 2))
+        return 0;
+    if (!Saturn_Vdp1_GetFlatSrca(flatnum))     /* base pyramid + tag table */
+        return 0;
+    f = flattranslation ? (int)flattranslation[flatnum] : flatnum;
+    if (f < 0 || f >= (int)numflats)
+        f = flatnum;
+    tag   = &v1_tag[v1_tex_page][v1_tag_flat0 + f];
+    field = (variant == 1) ? &tag->srca_mono : &tag->srca_64;
+    if (*field)
+        return (*field == V1_TAG_BAD) ? 0 : (int)*field;
+
+    src = Saturn_FlatData(flatnum);
+    if (!src)
+        return 0;
+    off = v1_arena_alloc(5440);
+    if (off == 0)
+        return 0;
+    for (level = 0; level < 4; level++)
+    {
+        int   n = 64 >> level, y, x;
+        byte *row = (byte *)rowbuf;
+
+        for (y = 0; y < n; y++)
+        {
+            for (x = 0; x < n; x++)
+                row[x] = (byte)v1_flat_sample(src, variant, level, y, x);
+            v1_copy_block(off + lvl_ofs[level] + (unsigned int)(y * n), row, n);
+        }
+    }
+    *field = (unsigned short)(off / 8u);
+    return (int)*field;
 }
 
 void Saturn_Vdp1_ClearPages(void)

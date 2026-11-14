@@ -51,6 +51,16 @@ extern const uint32_t               *saturn_baked_flat_lod1_v_first;
 extern const saturn_flat_vert_t     *saturn_baked_flat_verts;
 extern const saturn_flat_quad_idx_t *saturn_baked_flat_quads;
 extern const uint8_t                *saturn_baked_flat_vfrac;
+/* Per-quad texture mapping from the QUV1 block (NULL for older .FLT files):
+ * bits 15-14 mode (1 normal, 2 transposed, 3 LOD1 tile), bits 13-8 first
+ * texture row, bits 6-0 row count. Rows run from the quad's v3-v2 edge to its
+ * v0-v1 edge. */
+extern const uint16_t               *saturn_baked_flat_quv;
+extern const uint8_t                *saturn_baked_flat_subflags; /* bit0: LOD0 uses transposed */
+#define SATURN_QUV_NORMAL      1
+#define SATURN_QUV_TRANSPOSED  2
+#define SATURN_QUV_TILE        3
+#define SATURN_SUBFLAG_TRANSPOSED 1
 extern int                           saturn_baked_flat_numsubsectors;
 
 #endif /* SATURN_BAKED_FLATS_H */

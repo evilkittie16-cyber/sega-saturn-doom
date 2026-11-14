@@ -170,6 +170,63 @@ def quant16(v):
     """Float/Fraction coordinate -> integer count of 1/16 units."""
     return int(round(float(v) * FRAC_ONE))
 
+# --- Per-quad texture mapping (QUV) ------------------------------------------
+# VDP1 maps a texture rectangle onto a quad's 4 corners and can only select a
+# range of texture ROWS (SRCA offset + SIZE.Y), never a range of columns. The
+# renderer convention (V-flip on every flat quad): texture column 0 at p0 and
+# the last column at p1; row `start` on the p3-p2 edge, increasing towards the
+# p0-p1 edge. Each baked quad gets a 16-bit QUV word telling the runtime which
+# texture and which rows to use, and its vertices are reordered so that
+# convention lines up with the world:
+#   QUV_NORMAL     flat as stored (rows = DOOM v = -y & 63, columns = u = x & 63)
+#                  exact when the piece spans the full 64 units in X
+#   QUV_TRANSPOSED 90-degree copy (rows = u, columns = v): exact when the piece
+#                  spans the full 64 units in Y, so trimmed-in-X pieces stop
+#                  squashing the whole texture into their width
+#   QUV_TILE       LOD1 128-unit cells: 2x2 tiling of the 32x32 mip (64 texels
+#                  per 128 units), rows in tile texels
+# Encoding: bits 15-14 mode, bits 13-8 start row, bits 6-0 row count (1..64).
+QUV_NORMAL, QUV_TRANSPOSED, QUV_TILE = 1, 2, 3
+SUBFLAG_TRANSPOSED = 1      # subsector's LOD0 list uses the transposed texture
+
+def _match_corners(q, targets):
+    """Reorder quad q (4 points, may repeat one) to best fit target corners,
+    keeping the polygon's cyclic adjacency (any rotation, either direction)."""
+    best, best_cost = q, None
+    for seq in (q, q[::-1]):
+        for r in range(4):
+            cand = seq[r:] + seq[:r]
+            cost = sum((cand[i][0] - targets[i][0]) ** 2 + (cand[i][1] - targets[i][1]) ** 2 for i in range(4))
+            if best_cost is None or cost < best_cost - 1e-9:
+                best, best_cost = cand, cost
+    return best
+
+def _row_range(lo, hi, limit):
+    """Texel rows covering [lo, hi) clamped to [0, limit] -> (start, count)."""
+    start = max(0, min(limit - 1, int(math.floor(lo + 1e-6))))
+    end = max(start + 1, min(limit, int(math.ceil(hi - 1e-6))))
+    return start, end - start
+
+def quad_uv(q, gx, gy, cell):
+    """Return (reordered quad, QUV word) for quad q inside grid cell (gx, gy)."""
+    lx = [min(cell, max(0.0, p[0] - gx)) for p in q]
+    ly = [min(cell, max(0.0, p[1] - gy)) for p in q]
+    xa, xb, yb, yt = min(lx), max(lx), min(ly), max(ly)
+    if cell == 128:
+        # LOD1: tile texture, 2 world units per texel, normal orientation
+        start, count = _row_range((128 - yt) / 2.0, (128 - yb) / 2.0, 64)
+        targets = [(gx + xa, gy + yb), (gx + xb, gy + yb), (gx + xb, gy + yt), (gx + xa, gy + yt)]
+        return _match_corners(q, targets), (QUV_TILE << 14) | (start << 8) | count
+    if (64 - (xb - xa)) <= (64 - (yt - yb)):
+        start, count = _row_range(64 - yt, 64 - yb, 64)
+        targets = [(gx + xa, gy + yb), (gx + xb, gy + yb), (gx + xb, gy + yt), (gx + xa, gy + yt)]
+        mode = QUV_NORMAL
+    else:
+        start, count = _row_range(xa, xb, 64)
+        targets = [(gx + xb, gy + yt), (gx + xb, gy + yb), (gx + xa, gy + yb), (gx + xa, gy + yt)]
+        mode = QUV_TRANSPOSED
+    return _match_corners(q, targets), (mode << 14) | (start << 8) | count
+
 def clip_plane(poly, nx, ny, c):
     """Keep the part of convex poly with nx*x + ny*y <= c (exact)."""
     out = []
@@ -372,6 +429,7 @@ def bake_map_adaptive(wad_data, directory, map_name):
     walk(len(NODES) - 1, [])
 
     all_quads   = []
+    all_quv     = []
     all_verts   = []
     sub_q_first = []
     sub_q_count = []
@@ -531,12 +589,12 @@ def bake_map_adaptive(wad_data, directory, map_name):
                         if a >= 4096.0 - 0.5:
                             # Interior cell: 100% enclosed within this subsector.
                             corners = [(gx, gy), (gx + grid_size, gy), (gx + grid_size, gy + grid_size), (gx, gy + grid_size)]
-                            sub_quads.append(corners)
+                            sub_quads.append((corners, gx, gy))
                         else:
                             # Boundary or BSP-split cell: clip strictly to this subsector's polygon
                             # so every subsector covers 100% of its own area across LOD0, LOD1, and frustum/occlusion culling.
                             cp_sk = skirt_cell(cp, sub_skirt_segs[ss])
-                            sub_quads.extend(orient_cell_quads(cp_sk, gx, gy))
+                            sub_quads.extend((oq, gx, gy) for oq in orient_cell_quads(cp_sk, gx, gy))
 
         # Build subsector bounding box from poly, seg vertices, AND emitted flat quads
         xs_all = [int(round(float(p[0]))) for p in poly]
@@ -548,7 +606,7 @@ def bake_map_adaptive(wad_data, directory, map_name):
             v2 = VERTEXES[seg[1]]
             xs_all.extend([v1[0], v2[0]])
             ys_all.extend([v1[1], v2[1]])
-        for q in sub_quads:
+        for q, _gx, _gy in sub_quads:
             for p in q:
                 xs_all.append(int(round(float(p[0]))))
                 ys_all.append(int(round(float(p[1]))))
@@ -571,7 +629,9 @@ def bake_map_adaptive(wad_data, directory, map_name):
         vert_map = {}
         sub_verts = []
         sub_q_indices = []
-        for q in sub_quads:
+        sub_quv = []
+        for q, qgx, qgy in sub_quads:
+            q, quv = quad_uv([(float(p[0]), float(p[1])) for p in q], qgx, qgy, grid_size)
             q_idx = []
             for p in q:
                 pt = (quant16(p[0]), quant16(p[1]))
@@ -590,6 +650,7 @@ def bake_map_adaptive(wad_data, directory, map_name):
                         p3[0]*p0[1] - p0[0]*p3[1])
                 if area != 0:
                     sub_q_indices.append(q_idx)
+                    sub_quv.append(quv)
 
         if not sub_q_indices:
             sub_q_first.append(len(all_quads))
@@ -611,6 +672,7 @@ def bake_map_adaptive(wad_data, directory, map_name):
         # Generate coarse 128x128 grid quads for LOD1 when distant (>= 384 units)
         lod1_verts = []
         lod1_q_indices = []
+        lod1_quv = []
         if len(sub_q_indices) > 1 and poly and len(poly) >= 3:
             grid_l1 = 128
             l1_gx0 = int(min(xs) // grid_l1) * grid_l1
@@ -627,13 +689,14 @@ def bake_map_adaptive(wad_data, directory, map_name):
                         la = float(abs(poly_area2(lcp)) / 2)
                         if len(lcp) >= 3 and la > 0:
                             if la >= float(grid_l1 * grid_l1) - 0.5:
-                                raw_lod1.append([(lgx, lgy), (lgx + grid_l1, lgy),
-                                                 (lgx + grid_l1, lgy + grid_l1), (lgx, lgy + grid_l1)])
+                                raw_lod1.append(([(lgx, lgy), (lgx + grid_l1, lgy),
+                                                  (lgx + grid_l1, lgy + grid_l1), (lgx, lgy + grid_l1)], lgx, lgy))
                             else:
                                 lcp_sk = skirt_cell(lcp, sub_skirt_segs[ss])
-                                raw_lod1.extend(orient_cell_quads(lcp_sk, lgx, lgy))
+                                raw_lod1.extend((oq, lgx, lgy) for oq in orient_cell_quads(lcp_sk, lgx, lgy))
             lod1_vmap = {}
-            for q in raw_lod1:
+            for q, qgx, qgy in raw_lod1:
+                q, quv = quad_uv([(float(p[0]), float(p[1])) for p in q], qgx, qgy, grid_l1)
                 q_idx = []
                 for p in q:
                     pt = (quant16(p[0]), quant16(p[1]))
@@ -652,16 +715,19 @@ def bake_map_adaptive(wad_data, directory, map_name):
                             p3[0]*p0[1] - p0[0]*p3[1])
                     if area != 0:
                         lod1_q_indices.append(q_idx)
+                        lod1_quv.append(quv)
 
         # Only activate LOD1 if it offers genuine quad reduction
         if len(lod1_q_indices) > 0 and len(lod1_q_indices) < len(sub_q_indices):
             all_quads.extend(sub_q_indices)
+            all_quv.extend(sub_quv)
             all_verts.extend(sub_verts)
             lod1_sub_q_first.append(len(all_quads))
             lod1_sub_q_count.append(len(lod1_q_indices))
             lod1_sub_v_first.append(len(all_verts))
             lod1_sub_v_count.append(len(lod1_verts))
             all_quads.extend(lod1_q_indices)
+            all_quv.extend(lod1_quv)
             all_verts.extend(lod1_verts)
         else:
             lod1_sub_q_first.append(0)
@@ -669,9 +735,19 @@ def bake_map_adaptive(wad_data, directory, map_name):
             lod1_sub_v_first.append(0)
             lod1_sub_v_count.append(0)
             all_quads.extend(sub_q_indices)
+            all_quv.extend(sub_quv)
             all_verts.extend(sub_verts)
 
+    assert len(all_quv) == len(all_quads), "QUV table out of step with quads"
+    subflags = []
+    for ss in range(nsssec):
+        qf, qc = sub_q_first[ss], sub_q_count[ss]
+        has_t = any((all_quv[i] >> 14) == QUV_TRANSPOSED for i in range(qf, qf + qc))
+        subflags.append(SUBFLAG_TRANSPOSED if has_t else 0)
+
     return {
+        "quv": all_quv,
+        "subflags": subflags,
         "name": map_name,
         "nsssec": nsssec,
         "sub_q_first": sub_q_first,
@@ -775,10 +851,20 @@ def write_flt_file(bm, out_path):
         ofs_lod1_v_count
     )
 
+    # QUV1 extension block (per-quad texture mapping, see quad_uv). Located by
+    # loaders at align4(ofs_vert_frac + numverts) == right after frac_bytes;
+    # older loaders never look there.
+    quv_block = bytearray(b"QUV1")
+    quv_block += struct.pack(">II", numquads, nsssec)
+    quv_block += struct.pack(f">{numquads}H", *bm['quv'])
+    quv_block += b'\x00' * ((4 - (len(quv_block) % 4)) % 4)
+    quv_block += bytes(bm['subflags'])
+    quv_block += b'\x00' * ((4 - (len(quv_block) % 4)) % 4)
+
     data = (header + q_first_bytes + q_count_bytes + v_first_bytes + v_count_bytes +
             bbox_bytes + lod1_q_first_bytes + lod1_q_count_bytes +
             lod1_v_first_bytes + lod1_v_count_bytes +
-            verts_bytes + quads_bytes + frac_bytes)
+            verts_bytes + quads_bytes + frac_bytes + quv_block)
     with open(out_path, "wb") as f:
         f.write(data)
     lod1_active_subs = sum(1 for c in bm['lod1_sub_q_count'] if c > 0)

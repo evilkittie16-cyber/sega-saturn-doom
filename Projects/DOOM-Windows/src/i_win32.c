@@ -1126,7 +1126,13 @@ void I_FinishUpdate(void)
                 Win32_RequestLevelWarp(1, st->map);
                 s_t9_step = 0;
             } else {
-                if (s_t9_step == 0) {
+                /* Re-pin the camera every tic until the screenshot so the
+                 * capture is deterministic (momentum, lifts and monsters
+                 * pushing the player used to move it between runs). */
+                {
+                    players[0].mo->momx = 0;
+                    players[0].mo->momy = 0;
+                    players[0].mo->momz = 0;
                     P_UnsetThingPosition(players[0].mo);
                     players[0].mo->x = st->x * FRACUNIT;
                     players[0].mo->y = st->y * FRACUNIT;

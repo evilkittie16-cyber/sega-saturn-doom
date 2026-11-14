@@ -580,7 +580,21 @@ typedef struct {
     uint8_t                 ap_ytop;
     uint8_t                 ap_ybot;
     int                     clip_xy[8];
+    /* Baked QUV mapping (saturn_baked_flats.h). base_* = normal pyramid,
+     * alt_* = transposed (LOD0 jobs) or 2x2-tile (LOD1 jobs) pyramid, 0 if
+     * not resident. floor_srca/ceil_srca above are switched per quad. */
+    const uint16_t         *quv;
+    uint16_t                base_floor_srca;
+    uint16_t                base_ceil_srca;
+    uint16_t                alt_floor_srca;
+    uint16_t                alt_ceil_srca;
+    int32_t                 near_size;      /* (base_v0 << 16) | rows for ClipNearQuad, -1 = derive */
 } hw_flat_emit_ctx_t;
+
+#if HW_JOB_PAD_WORDS < 1
+#error "hw_flat_job_t needs a spare word for the alternate flat SRCA pack"
+#endif
+#define HW_JOB_ALT_SRCA_WORD HW_JOB_WORDS_BEFORE_PAD   /* align_pad[0] */
 
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_master;
 #ifndef SATURN_WIN32
@@ -1021,7 +1035,12 @@ static HW_NOINLINE HW_COLD_OS int HW_Worker_ClipNearQuad(
 
     int base_v0 = 0;
     int quad_rows = 64;
-    if (!(fctx->fully_inside & HW_FLAT_USE_LOD1))
+    if (fctx->near_size >= 0)
+    {
+        base_v0   = (int)((uint32_t)fctx->near_size >> 16);
+        quad_rows = (int)(fctx->near_size & 0xFFFF);
+    }
+    else if (!(fctx->fully_inside & HW_FLAT_USE_LOD1))
     {
         int wy0 = pv0->wy, wy1 = pv1->wy;
         int wy2 = pv2->wy, wy3 = pv3->wy;
@@ -1329,13 +1348,24 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     uint32_t w10           = jw[10];
     int solid_count        = (int)(int16_t)(w10 >> 16);
     uint16_t solid_dirty   = (uint16_t)(w10 & 0xFFFFu);
+    uint32_t alt_pack      = jw[HW_JOB_ALT_SRCA_WORD];
 #else
     fixed_t y_floor_w      = job->y_floor_w;
     const uint8_t *raw_vf  = job->vfrac;
     fixed_t y_ceil_w       = job->y_ceil_w;
     int solid_count        = (int)job->solid_count;
     uint16_t solid_dirty   = (uint16_t)job->pad;
+    uint32_t alt_pack      = job->align_pad[0];
 #endif
+    /* Per-quad QUV words parallel to the quad array (same index). */
+    fctx->quv = (saturn_baked_flat_quv && saturn_baked_flat_quads)
+        ? saturn_baked_flat_quv + (quads - saturn_baked_flat_quads)
+        : NULL;
+    fctx->base_floor_srca = floor_srca;
+    fctx->base_ceil_srca  = ceil_srca;
+    fctx->alt_floor_srca  = (uint16_t)(alt_pack >> 16);
+    fctx->alt_ceil_srca   = (uint16_t)alt_pack;
+    fctx->near_size       = -1;
 
     static const uint8_t hw_zero_vfrac_byte = 0;
     const uint8_t * __restrict vfrac = raw_vf ? raw_vf : &hw_zero_vfrac_byte;
@@ -1564,6 +1594,12 @@ vert_behind:
     }
 
     const saturn_flat_quad_idx_t * __restrict q_ptr = quads;
+    const uint16_t *quv_ptr = fctx->quv;
+    const uint16_t base_floor_srca = fctx->base_floor_srca;
+    const uint16_t base_ceil_srca  = fctx->base_ceil_srca;
+    const uint16_t alt_floor_srca  = fctx->alt_floor_srca;
+    const uint16_t alt_ceil_srca   = fctx->alt_ceil_srca;
+    const int alt_ok = (!emit_floor || alt_floor_srca != 0) && (!emit_ceil || alt_ceil_srca != 0);
 
     /* Phase 2: Assemble & emit quads using cached projected vertices */
     for (int q = 0; q < q_count; q++, q_ptr++)
@@ -1577,6 +1613,45 @@ vert_behind:
                              (unsigned)qv2 >= (unsigned)v_count ||
                              (unsigned)qv3 >= (unsigned)v_count, 0))
             continue;
+
+        /* Baked texture mapping: pick the pyramid and the texture rows. */
+        const saturn_flat_quad_idx_t *qp = q_ptr;
+        saturn_flat_quad_idx_t q_perm;
+        uint32_t qpack_quv = 0;
+        if (quv_ptr)
+        {
+            uint32_t w    = quv_ptr[q];
+            uint32_t mode = w >> 14;
+            if (__builtin_expect(mode == SATURN_QUV_NORMAL || mode == 0, 1))
+            {
+                fctx->floor_srca = base_floor_srca;
+                fctx->ceil_srca  = base_ceil_srca;
+                if (mode)
+                    qpack_quv = (((w >> 8) & 63u) << 24) | ((w & 127u) << 16);
+            }
+            else if (alt_ok)
+            {
+                fctx->floor_srca = alt_floor_srca;
+                fctx->ceil_srca  = alt_ceil_srca;
+                qpack_quv = (((w >> 8) & 63u) << 24) | ((w & 127u) << 16);
+            }
+            else
+            {
+                /* Variant not resident (VRAM page full): draw with the normal
+                 * pyramid and the pre-QUV row derivation (qpack_quv = 0). A
+                 * transposed quad's corners are re-ordered back to the normal
+                 * orientation (v2, v1, v0, v3). */
+                fctx->floor_srca = base_floor_srca;
+                fctx->ceil_srca  = base_ceil_srca;
+                if (mode == SATURN_QUV_TRANSPOSED)
+                {
+                    q_perm.v[0] = (uint16_t)qv2; q_perm.v[1] = (uint16_t)qv1;
+                    q_perm.v[2] = (uint16_t)qv0; q_perm.v[3] = (uint16_t)qv3;
+                    qp = &q_perm;
+                    int t = qv0; qv0 = qv2; qv2 = t;
+                }
+            }
+        }
         const saturn_proj_v_t *pv0 = &proj_v[qv0];
         const saturn_proj_v_t *pv1 = &proj_v[qv1];
         const saturn_proj_v_t *pv2 = &proj_v[qv2];
@@ -1590,7 +1665,10 @@ vert_behind:
         if (__builtin_expect(min_x == -32768, 0))
         {
             if (max_x > -32768)
-                local_q = HW_Worker_ClipNearQuad(fctx, q_ptr, local_q);
+            {
+                fctx->near_size = qpack_quv ? (int32_t)(((qpack_quv >> 24) << 16) | ((qpack_quv >> 16) & 0xFFu)) : -1;
+                local_q = HW_Worker_ClipNearQuad(fctx, qp, local_q);
+            }
             continue;
         }
 
@@ -1633,7 +1711,9 @@ vert_behind:
             continue;
 
         uint32_t qpack_base = 64u << 16;
-        if (__builtin_expect(!(fully_inside & HW_FLAT_USE_LOD1), 1))
+        if (qpack_quv)
+            qpack_base = qpack_quv;
+        else if (__builtin_expect(!(fully_inside & HW_FLAT_USE_LOD1), 1))
         {
             int wy0 = pv0->wy, wy1 = pv1->wy;
             int wy2 = pv2->wy, wy3 = pv3->wy;
@@ -1653,11 +1733,11 @@ vert_behind:
 
         if (cw_c != 0)
         {
-            local_q = HW_EmitFlatBands(fctx, q_ptr, cw_c, qpack_base | 0x80000000u | (uint32_t)local_q);
+            local_q = HW_EmitFlatBands(fctx, qp, cw_c, qpack_base | 0x80000000u | (uint32_t)local_q);
         }
         if (cw_f != 0)
         {
-            local_q = HW_EmitFlatBands(fctx, q_ptr, cw_f, qpack_base | (uint32_t)local_q);
+            local_q = HW_EmitFlatBands(fctx, qp, cw_f, qpack_base | (uint32_t)local_q);
         }
     }
 
@@ -1765,7 +1845,37 @@ typedef struct
     uint8_t         pad;
     fixed_t         y_floor_w;
     fixed_t         y_ceil_w;
+    uint32_t        trans_pack;   /* transposed pyramids (floor << 16 | ceil) */
+    uint32_t        tile_pack;    /* LOD1 tile pyramids  (floor << 16 | ceil) */
+    uint8_t         alt_have;     /* bit0 trans_pack valid, bit1 tile_pack valid */
 } hw_flat_sec_cache_t;
+
+/* Alternate flat pyramids for the baked QUV mapping (variant 1 transposed,
+ * 2 LOD1 tile). Master only: may upload to VDP1 VRAM. */
+static HW_NOINLINE HW_COLD_OS uint32_t HW_FlatAltPack(const sector_t *sec, int variant,
+                                                     int emit_floor, int emit_ceil)
+{
+    uint32_t f = emit_floor ? (uint32_t)Saturn_Vdp1_GetFlatSrcaVariant(sec->floorpic, variant) : 0u;
+    uint32_t c = emit_ceil  ? (uint32_t)Saturn_Vdp1_GetFlatSrcaVariant(sec->ceilingpic, variant) : 0u;
+    return ((f & 0xFFFFu) << 16) | (c & 0xFFFFu);
+}
+
+/* Which alternate pyramid a job needs: LOD1 jobs use the tile, LOD0 jobs the
+ * transposed copy only if the subsector has transposed quads. */
+HW_ALWAYS_INLINE int HW_FlatAltVariant(int use_lod1, int subnum)
+{
+    if (!saturn_baked_flat_quv)
+        return 0;
+    if (use_lod1)
+        return 2;
+    if (saturn_baked_flat_subflags && (saturn_baked_flat_subflags[subnum] & SATURN_SUBFLAG_TRANSPOSED))
+        return 1;
+    return 0;
+}
+
+#ifndef SATURN_WIN32
+static uint32_t hw_def_alt_pack = 0;    /* alt pack for HW_DeferMasterFlatJob */
+#endif
 
 static hw_flat_sec_cache_t hw_flat_sec_cache = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -1804,6 +1914,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_CacheFlatSectorInfo(const sector_t *sec)
     fc->is_sky     = (uint8_t)is_sky;
     fc->y_floor_w  = HW_DZQ(sec->floorheight, vz);
     fc->y_ceil_w   = HW_DZQ(sec->ceilingheight, vz);
+    fc->alt_have   = 0;
 }
 
 #ifndef SATURN_WIN32
@@ -1826,6 +1937,7 @@ static HW_NOINLINE HW_COLD_OS void HW_DeferMasterFlatJob(
              (uint32_t)fc->light_bits | (sub_idx & 0x0FFFu);
     mw[9]  = hw_solid_summary;
     mw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)s_any;
+    mw[HW_JOB_ALT_SRCA_WORD] = hw_def_alt_pack;
     if (s_any != 0)
     {
         const uint32_t *sm = hw_solid_mask;
@@ -1865,6 +1977,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     uint32_t v_first, q_first;
     int l_qcount = (int)fi->lod1_q_count;
     int l_vcount = (int)fi->lod1_v_count;
+    int use_lod1 = 0;
     if ((u_flags & 16u) && l_qcount > 0 && l_vcount > 0)
     {
         if (q_count > l_qcount)
@@ -1874,6 +1987,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
         v_first = fi->lod1_v_first;
         v_count = l_vcount;
         saturn_hw_flat_lod1_subs++;
+        use_lod1 = 1;
     }
     else
     {
@@ -1881,6 +1995,23 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
         q_first = fi->q_first;
         saturn_hw_flat_lod0_subs++;
     }
+
+    uint32_t alt_pack = 0;
+    {
+        int variant = HW_FlatAltVariant(use_lod1, subnum);
+        if (variant)
+        {
+            uint8_t bit = (uint8_t)variant;   /* 1 = trans, 2 = tile */
+            if (!(fc->alt_have & bit))
+            {
+                uint32_t p = HW_FlatAltPack(sec, variant, fc->emit_floor, fc->emit_ceil);
+                if (variant == 1) fc->trans_pack = p; else fc->tile_pack = p;
+                fc->alt_have |= bit;
+            }
+            alt_pack = (variant == 1) ? fc->trans_pack : fc->tile_pack;
+        }
+    }
+    hw_def_alt_pack = alt_pack;
 
     uint32_t sky_flags = (uint32_t)fc->is_sky & allow_sky;
     uint32_t w3_pack = (emit_floor << 24) | (emit_ceil << 16) | ((u_flags & 19u) << 8) | sky_flags;
@@ -1922,6 +2053,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     jw[8] = ((uint32_t)(*(const uint16_t *)&HW_APERTURE->cur_sub_ytop) << 16) |
             (uint32_t)fc->light_bits | ((uint32_t)sub_idx & 0x0FFFu);
     jw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)dirty;
+    jw[HW_JOB_ALT_SRCA_WORD] = alt_pack;
 
     if (__builtin_expect(dirty != 0, 0))
     {
@@ -2015,6 +2147,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
 #if HW_JOB_PAD_WORDS > 0
     for (int p = 0; p < HW_JOB_PAD_WORDS; p++) job.align_pad[p] = 0;
 #endif
+    {
+        int variant = HW_FlatAltVariant(use_lod1 && l_qcount > 0 && l_vcount > 0, subnum);
+        if (variant)
+            job.align_pad[0] = HW_FlatAltPack(sec, variant, emit_floor, emit_ceil);
+    }
 
     volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
     HW_Master_ProcessJob(ipc, &job);
