@@ -27,7 +27,7 @@ volatile int dbg_pak_stage = 0;
 volatile int saturn_wall_dbg = 0;
 static byte pak_scratch[2048] __attribute__((aligned(16)));
 
-static int pak_read_stream(GfsHn gfs, uint32_t target_sec, uint32_t *p_cur_sec, void *buf, uint32_t bytes)
+static int pak_read_stream(void *gfs, uint32_t target_sec, uint32_t *p_cur_sec, void *buf, uint32_t bytes)
 {
     byte *dst = (byte *)buf;
     uint32_t remaining = bytes;
@@ -36,44 +36,18 @@ static int pak_read_stream(GfsHn gfs, uint32_t target_sec, uint32_t *p_cur_sec, 
     if (!buf || bytes == 0)
         return 1;
 
-    if (target_sec > *p_cur_sec)
+    if (target_sec != *p_cur_sec)
     {
-        Sint32 delta = (Sint32)(target_sec - *p_cur_sec);
-        int seek_ok = 0;
-        for (retry = 5; retry > 0; --retry)
-        {
-            if (GFS_Seek(gfs, delta, GFS_SEEK_CUR) >= 0)
-            {
-                seek_ok = 1;
-                break;
-            }
-            jo_spin_wait(16);
-        }
-        if (!seek_ok)
-        {
-            /* If relative seek is refused, walk forward with sequential reads */
-            while (*p_cur_sec < target_sec)
-            {
-                for (retry = 10; GFS_Fread(gfs, 1, (void *)pak_scratch, 2048) <= 0; --retry)
-                {
-                    if (!retry)
-                        return 0;
-                    jo_spin_wait(16);
-                }
-                (*p_cur_sec)++;
-            }
-        }
-        else
-        {
-            *p_cur_sec = target_sec;
-        }
+        if (!__jo_fs_seek_sector(gfs, (int)target_sec))
+            return 0;
+        *p_cur_sec = target_sec;
     }
 
     while (remaining > 0)
     {
         uint32_t chunk = (remaining > 2048u) ? 2048u : remaining;
 
-        for (retry = 10; GFS_Fread(gfs, 1, (void *)pak_scratch, 2048) <= 0; --retry)
+        for (retry = 10; __jo_fs_read_sectors(gfs, 1, (void *)pak_scratch, 2048) <= 0; --retry)
         {
             if (!retry)
                 return 0;
@@ -92,7 +66,7 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
 {
     char fname[16];
     int fid, k, i, nsec;
-    GfsHn gfs;
+    void *gfs;
     uint32_t cur_sec = 0;
     byte *scratch = pak_scratch;
     saturn_pak_section_t secs[SATURN_PAK_MAX_SECS];
@@ -120,28 +94,24 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
     fname[k]   = '\0';
 
     dbg_pak_stage = 1;
-    fid = GFS_NameToId((Sint8 *)fname);
+    fid = __jo_fs_get_file_id(fname);
     if (fid < 0)
     {
         dbg_pak_stage = 2;
         return 0;
     }
 
-    gfs = GFS_Open(fid);
+    gfs = __jo_fs_open(fid);
     if (gfs == JO_NULL)
     {
         dbg_pak_stage = 3;
         return 0;
     }
 
-    GFS_SetTmode(gfs, GFS_TMODE_CPU);
-    GFS_SetReadPara(gfs, 8);
-    GFS_SetTransPara(gfs, 8);
-
     /* Read Sector 0 (Header + TOC) into dedicated staging buffer */
     if (!pak_read_stream(gfs, 0, &cur_sec, scratch, 2048))
     {
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_pak_stage = 4;
         return 0;
     }
@@ -149,13 +119,13 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
     /* Validate Magic "MPAK" and Version 1 */
     if (scratch[0] != 'M' || scratch[1] != 'P' || scratch[2] != 'A' || scratch[3] != 'K')
     {
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_pak_stage = 5;
         return 0;
     }
     if ((((unsigned)scratch[4] << 8) | scratch[5]) != 1)
     {
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_pak_stage = 6;
         return 0;
     }
@@ -163,7 +133,7 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
     nsec = (int)(((unsigned)scratch[6] << 8) | scratch[7]);
     if (nsec <= 0 || nsec > SATURN_PAK_MAX_SECS)
     {
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_pak_stage = 7;
         return 0;
     }
@@ -193,8 +163,7 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
     /* 1. Stream FLAT quads directly into WRAM-L (SATURN_WRAM_L_FLAT_ADDR) */
     if (sec_flat && sec_flat->byte_size > SATURN_WRAM_L_FLAT_CAP)
     {
-        /* Would overrun the SEG region (E1M8 did before the cap was raised) */
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_pak_stage = 14;
         return 0;
     }
@@ -203,16 +172,16 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
         dbg_pak_stage = 9;
         if (!pak_read_stream(gfs, sec_flat->sec_offset, &cur_sec, WRAM_L_FLAT_ADDR, sec_flat->byte_size))
         {
-            GFS_Close(gfs);
+            __jo_fs_close(gfs);
             dbg_pak_stage = 10;
-            return 0; /* Fall back to loose files if PAK flat load fails */
+            return 0;
         }
         dbg_pak_stage = 11;
         if (!Saturn_BakedFlats_Parse(WRAM_L_FLAT_ADDR, sec_flat->byte_size))
         {
-            GFS_Close(gfs);
+            __jo_fs_close(gfs);
             dbg_pak_stage = 12;
-            return 0; /* Fall back to loose files if PAK flat load fails */
+            return 0;
         }
         dbg_pak_stage = 13;
     }
@@ -330,6 +299,6 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
         }
     }
 
-    GFS_Close(gfs);
+    __jo_fs_close(gfs);
     return 1;
 }

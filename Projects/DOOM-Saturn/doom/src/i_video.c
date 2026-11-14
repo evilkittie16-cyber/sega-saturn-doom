@@ -55,9 +55,8 @@
  * drives VDP1 frame changes via slSynch(), which waits for the next
  * VBlank and flushes the SGL command table. We use that as our
  * per-frame "advance VDP1" primitive. */
-#if JO_COMPILE_USING_SGL
-extern void slSynch(void);
-extern void slSmpcCashSend(void);
+#if 1
+/* SGL removed in Jo Engine v2026.1 */
 /* Round-54: slSynch() is GONE from the commit. Under SATURN_VDP2_FB the
  * VDP1 sprite surfaces are never created (saturn_gfx_l == NULL, both
  * saturn_draw_half calls return), so SGL's command table is always
@@ -71,14 +70,6 @@ extern void slSmpcCashSend(void);
  * machine misses slSynch, the symptom will be a picture/slave-job
  * regression, not a hang â€” revert then. */
 # define SATURN_VDP1_FLUSH()          do { saturn_draw_sprite(); } while (0)
-#else
-extern void jo_vdp1_buffer_reset(void);
-extern void jo_vdp1_flush(void);
-# define SATURN_VDP1_FLUSH()          do { jo_vdp1_buffer_reset();           \
-                                          saturn_draw_sprite();              \
-                                          jo_vdp1_flush();                   \
-                                          JO_VDP1_PTMR = 0x3;                \
-                                     } while (0)
 #endif
 
 /* d32xr's renderer expects these symbols. */
@@ -590,6 +581,12 @@ static void saturn_vdp2_init_display(void)
     volatile unsigned int   *a1  = (volatile unsigned int *)SATURN_FB_PAGE_B;
     int i;
 
+    /* Flush Jo Engine v2026.1's initial __jo_vdp2_dirty[] shadow registers
+     * on the first VBlank BEFORE we program VDP2 hardware registers directly;
+     * otherwise the first VBlank-IN ISR's jo_vdp2_commit() overwrites our
+     * BKTAU/BKTAL, RAMCTL, CHCTLA, MPOFN, and zoom registers. */
+    __jo_core_synch();
+
     /* CRAM bank 0 (entries 0..255) is unused by Jo (its palettes start
      * at bank 1); NBG0 256-color reads it via color-RAM offset 0. Seed
      * with the same grayscale palette the expand path used. */
@@ -623,21 +620,37 @@ static void saturn_vdp2_init_display(void)
      * display teal. slBack1ColSet re-points the VDP2 register at our
      * dead address AND writes the color through SGL's shadow. */
     *(volatile unsigned short *)SATURN_FB_BACKCOL = 0x0000;
-    slBack1ColSet((void *)SATURN_FB_BACKCOL, 0x0000);
+    {
+        unsigned int bk_addr = (((unsigned int)SATURN_FB_BACKCOL) & 0x7FFFFu) >> 1;
+        JO_VDP2_BKTAU = (unsigned short)((bk_addr >> 16) & 0x0007u);
+        JO_VDP2_BKTAL = (unsigned short)(bk_addr & 0xFFFFu);
+    }
 
-    /* NBG0 = 256-color bitmap at page A; zoom 1.0/1.0 — the fb is
-     * 320 columns wide since 2026-09-05 (full-width render) and maps
-     * 1:1 onto the 320-wide screen. (The half-width era used 0.5
-     * horizontal to stretch 160 fb columns across 320 screen px.) */
-    slBitMapNbg0(COL_TYPE_256, BM_512x256, (void *)SATURN_FB_PAGE_A);
-    slZoomNbg0(toFIXED(1.0), toFIXED(1.0));
-    slColRAMOffsetNbg0(0);
-    /* 2026-09-06: no scroll — the fb is now the full 224-line window
-     * (DOOM_FBHEIGHT): the 3D view spans rows 0..191 and the status
-     * bar 192..223, so nothing needs shifting (the earlier -24 scroll
-     * experiment moved the view down with the bar; the fb itself grew
-     * instead). */
-    slScrMoveNbg0(toFIXED(0), toFIXED(0));
+    /* NBG0 = 256-color 512x256 bitmap at page A (Bank A0 = offset 0):
+     * - RAMCTL: Bank A split into A0/A1 (bit 8 = 1), RDBSA0/A1 = 0 (non-rotated)
+     * - CHCTLA: NBG0 256-color (bits 6:4 = 001), 512x256 bitmap (bits 3:2 = 00), BM enable (bit 1 = 1) -> 0x0012
+     * - MPOFN: NBG0 map/bitmap offset = 0 (Page A at 0x25E00000)
+     * - CYCA0L/U, CYCA1L/U: 2 slots of NBG0 bitmap read (0x4) + 6 slots CPU read/write (0xE) */
+    JO_VDP2_RAMCTL = (JO_VDP2_RAMCTL & ~0x000Fu) | 0x0100u;
+    JO_VDP2_CHCTLA = (JO_VDP2_CHCTLA & 0xFF00u) | 0x0012u;
+    JO_VDP2_MPOFN  = (JO_VDP2_MPOFN & ~0x0007u) | 0x0000u;
+    JO_VDP2_CYCA0L = 0x44EEu;
+    JO_VDP2_CYCA0U = 0xEEEEu;
+    JO_VDP2_CYCA1L = 0x44EEu;
+    JO_VDP2_CYCA1U = 0xEEEEu;
+
+    /* Zoom 1.0/1.0 and scroll (0, 0) */
+    JO_VDP2_ZMXIN0 = 1;
+    JO_VDP2_ZMXDN0 = 0;
+    JO_VDP2_ZMYIN0 = 1;
+    JO_VDP2_ZMYDN0 = 0;
+    JO_VDP2_ZMCTL &= ~0x0003u;
+    JO_VDP2_CRAOFA &= ~0x0007u;
+    JO_VDP2_BMPNA &= ~0x0037u;
+    JO_VDP2_SCXIN0 = 0;
+    JO_VDP2_SCXDN0 = 0;
+    JO_VDP2_SCYIN0 = 0;
+    JO_VDP2_SCYDN0 = 0;
 
     saturn_fb_live = 1;
 }
@@ -942,17 +955,7 @@ static void saturn_vblank_callback(void)
         ((unsigned int)&saturn_vbl_count + 0x20000000u)
         = saturn_vbl_count;
 
-    /* Continuous 60Hz SMPC peripheral cashier polling.
-     * SGL normally only calls slSmpcCashSend() during _BlankIn when _SynchCount == 0.
-     * Since DOOM does not use slSynch(), _SynchCount only hits 0 once every 256 VBlanks (4.26s).
-     * By calling slSmpcCashSend() here whenever _SynchCount != 0, we ensure SMPC INTBACK
-     * results are fetched and new INTBACK commands are queued on EVERY vertical blank (60 Hz),
-     * while avoiding duplicate calls if SGL's _BlankIn already ran it this frame. */
-    *(volatile unsigned char *)0x060FFFBAu |= 0x02u;
-    if (*(volatile signed char *)0x060FFC13u != 0)
-    {
-        slSmpcCashSend();
-    }
+    /* Jo Engine v2026.1 polls SMPC INTBACK on every VBlank-OUT automatically. */
 
     /* r82 A/B: INSTRUMENTATION STRIPPED FROM THE ISR. The user
      * recalled the real-HW freeze family beginning right after the
@@ -4193,17 +4196,23 @@ void I_FinishUpdate(void)
             }
         saturn_frt_syn_syn = (int)Saturn_ProfSpan(tf, t0);
         saturn_master_site = 0xD;   /* r53: flip-write entered */
-        slBitMapNbg0(COL_TYPE_256, BM_512x256,
-                     (void *)(saturn_fb_front ? SATURN_FB_PAGE_A
-                                              : SATURN_FB_PAGE_B));
         {
-            extern int saturn_v1w_spr;
             extern int saturn_vdp2_plane_active;
+            unsigned int fb_addr = saturn_fb_front ? SATURN_FB_PAGE_A : SATURN_FB_PAGE_B;
+            unsigned short mpofn_bits = (unsigned short)(((fb_addr & 0x7FFFFu) >> 17) & 0x0007u);
+            unsigned int bk_addr = (((unsigned int)SATURN_FB_BACKCOL) & 0x7FFFFu) >> 1;
 
-            jo_set_displayed_screens((jo_scroll_screen)
-                (JO_NBG0_SCREEN
-                 | (saturn_v1w_spr ? JO_SPRITE_SCREEN : 0)
-                 | (saturn_vdp2_plane_active ? JO_RBG0_SCREEN : 0)));
+            JO_VDP2_BKTAU  = (unsigned short)((bk_addr >> 16) & 0x0007u);
+            JO_VDP2_BKTAL  = (unsigned short)(bk_addr & 0xFFFFu);
+            JO_VDP2_RAMCTL = (JO_VDP2_RAMCTL & ~0x000Fu) | 0x0100u;
+            JO_VDP2_CHCTLA = (JO_VDP2_CHCTLA & 0xFF00u) | 0x0012u;
+            JO_VDP2_MPOFN  = (JO_VDP2_MPOFN & ~0x0007u) | mpofn_bits;
+            JO_VDP2_CYCA0L = 0x44EEu;
+            JO_VDP2_CYCA0U = 0xEEEEu;
+            JO_VDP2_CYCA1L = 0x44EEu;
+            JO_VDP2_CYCA1U = 0xEEEEu;
+            JO_VDP2_BGON   = (unsigned short)(JO_NBG0_SCREEN
+                             | (saturn_vdp2_plane_active ? JO_RBG0_SCREEN : 0));
         }
         saturn_fb_front ^= 1;
         saturn_prof_syn = (int)(saturn_vbl_count - t0);

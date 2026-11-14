@@ -10,12 +10,8 @@
 #include "r_local.h"
 #include "saturn_segs.h"
 
-/* Keep LIBCPK.A(slavesh.o) archive resolution order identical for SGL slave dispatch */
-extern volatile unsigned int SlaveCommand;
-
 void Saturn_RenderInvalidateLevel(void)
 {
-    (void)SlaveCommand;
 }
 
 /* --- Frame & Watchdog Telemetry Globals (referenced by d_main.c / g_game.c / i_video.c) --- */

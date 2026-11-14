@@ -79,6 +79,9 @@ int                                  saturn_baked_flat_numsubsectors = 0;
 #define cur_vert_frac   saturn_baked_flat_vfrac
 #define cur_numsubsectors saturn_baked_flat_numsubsectors
 
+#define SATURN_MAX_WRAM_H_FLAT_SUBS 608
+static __attribute__((aligned(16))) saturn_flat_bbox_t hw_wram_h_flat_bboxes[SATURN_MAX_WRAM_H_FLAT_SUBS];
+
 /* Version 1 fallback support if loaded */
 static const saturn_flt_header_t    *cur_header1       = NULL;
 static const uint16_t               *cur_first1        = NULL;
@@ -225,6 +228,11 @@ int Saturn_BakedFlats_Parse(void *data, unsigned len)
     cur_sub_v_first   = (const uint32_t *)(cur_blob + cur_hdr2->ofs_sub_v_first);
     cur_sub_v_count   = (const uint16_t *)(cur_blob + cur_hdr2->ofs_sub_v_count);
     cur_bbox          = (const saturn_flat_bbox_t *)(cur_blob + cur_hdr2->ofs_sub_bbox);
+    if (cur_numsubsectors > 0 && cur_numsubsectors <= SATURN_MAX_WRAM_H_FLAT_SUBS)
+    {
+        memcpy(hw_wram_h_flat_bboxes, cur_bbox, (size_t)cur_numsubsectors * sizeof(saturn_flat_bbox_t));
+        cur_bbox = hw_wram_h_flat_bboxes;
+    }
     cur_verts         = (const saturn_flat_vert_t *)(cur_blob + cur_hdr2->ofs_verts);
     cur_quads_idx     = (const saturn_flat_quad_idx_t *)(cur_blob + cur_hdr2->ofs_quads);
 

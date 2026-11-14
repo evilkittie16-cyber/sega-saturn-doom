@@ -41,7 +41,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
 #if HW_PROF_SUBTIMERS
     unsigned short ts0 = SAT_FRT();
 #endif
-    int flat_flags = HW_CheckSubsectorAperture(subnum, sf, (secnum << 8) | (fully_inside & 3));
+    int flat_flags = HW_CheckSubsectorAperture(subnum, sf, fully_inside & 3);
 #if HW_PROF_SUBTIMERS
     unsigned short ts1 = SAT_FRT();
     hw_prof_ap_acc += HW_ProfDelta(ts0, ts1);
@@ -182,18 +182,37 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderBSPNode(int root_bspnum, const byte *
                 break;
             }
 
+            int side, c0, c1;
+#ifndef SATURN_WIN32
+            const int16_t *np = (const int16_t *)&local_nodes[bspnum];
+            int t0;
+            __asm__(
+                "mov.w @%4+, %0 \n\t"   /* %0 = bsp->x */
+                "mov.w @%4+, %1 \n\t"   /* %1 = bsp->y */
+                "sub   %5, %0   \n\t"   /* %0 = bsp->x - cam_x */
+                "sub   %6, %1   \n\t"   /* %1 = bsp->y - cam_y */
+                "mov.w @%4+, %2 \n\t"   /* %2 = bsp->dx */
+                "muls.w %1, %2  \n\t"   /* macl = (bsp->y - cam_y) * bsp->dx */
+                "mov.w @%4+, %3 \n\t"   /* %3 = bsp->dy */
+                "add   #4, %4   \n\t"   /* skip children[0..1], point at encbbox[0] */
+                "sts   macl, %1 \n\t"   /* %1 = (bsp->y - cam_y) * bsp->dx */
+                "muls.w %0, %3  \n\t"   /* macl = (bsp->x - cam_x) * bsp->dy */
+                "mov.w @%4+, %2 \n\t"   /* %2 = c0 = (int16_t)bsp->encbbox[0] (fills muls.w latency!) */
+                "mov.w @%4+, %3 \n\t"   /* %3 = c1 = (int16_t)bsp->encbbox[1] (fills muls.w latency!) */
+                "sts   macl, %0 \n\t"   /* %0 = (bsp->x - cam_x) * bsp->dy */
+                "cmp/ge %1, %0  \n\t"   /* T = ((bsp->x - cam_x)*dy >= (bsp->y - cam_y)*dx) */
+                "movt  %0       \n\t"   /* %0 = side (0 or 1) */
+                : "=&r"(side), "=&r"(t0), "=&r"(c0), "=&r"(c1), "+r"(np)
+                : "r"(cam_x), "r"(cam_y)
+                : "macl", "t"
+            );
+#else
             const node_t *bsp = &local_nodes[bspnum];
-
-            /* Fast 2x muls.w point-on-side using integer camera coordinates (cam_x, cam_y). */
-            int side = (HW_MulsW_PairAdd(cam_y - (int)bsp->y, (int)bsp->dx,
-                                         (int)bsp->x - cam_x, (int)bsp->dy, 0) >= 0);
-#ifdef __GNUC__
-            __asm__("" : "+r"(side));
+            side = (HW_MulsW_PairAdd(cam_y - (int)bsp->y, (int)bsp->dx,
+                                     (int)bsp->x - cam_x, (int)bsp->dy, 0) >= 0);
+            c0 = (int)(int16_t)bsp->encbbox[0];
+            c1 = (int)(int16_t)bsp->encbbox[1];
 #endif
-
-            /* Read PVS-pruned children directly from node_t.encbbox (same 16B L1 cache line as x,y,dx,dy!) */
-            int c0 = (int)(int16_t)bsp->encbbox[0];
-            int c1 = (int)(int16_t)bsp->encbbox[1];
             int child_front = side ? c1 : c0;
             int child_back  = side ? c0 : c1;
 

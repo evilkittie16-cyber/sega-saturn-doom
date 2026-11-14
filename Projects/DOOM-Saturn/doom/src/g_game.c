@@ -330,10 +330,9 @@ void Saturn_WarpToLevel(int episode, int map)
     extern void Telemetry_ResetSpike(void);
 #endif
 
+#ifdef SATURN_WIN32
     printf("[Engine] Level Warp requested -> Episode %d, Map %d\n", episode, map);
     fflush(stdout);
-
-#ifdef SATURN_WIN32
     Telemetry_StopJourney();
     Telemetry_ResetSpike();
 #endif
@@ -356,11 +355,104 @@ void Saturn_WarpToLevel(int episode, int map)
     saturn_level_done = 0;
     gameaction = ga_nothing;
 
+#ifdef SATURN_WIN32
     printf("[Engine] Level Warp to E%dM%d complete!\n", episode, map);
     fflush(stdout);
+#endif
 }
 
 void Saturn_P_Ticker(void)
 {
     P_Ticker();
+}
+
+typedef struct
+{
+    int         map;
+    int         x;
+    int         y;
+    angle_t     ang;
+    const char *label;
+} saturn_tour_stop_t;
+
+static const saturn_tour_stop_t s_tour_stops[] = {
+    { 1,  1056, -3616, ANG90,            "E1M1 START"     },
+    { 1,  1856, -2912, ANG270,           "E1M1 ARENA"     },
+    { 1,  3408, -3504, ANG90 + ANG45,    "E1M1 COURTYARD" },
+    { 2,   -32,  -240, ANG90,            "E1M2 START"     },
+    { 2,  -224,   512, 0,                "E1M2 ARENA"     },
+    { 3, -1472, -3344, ANG90,            "E1M3 START"     },
+    { 3, -1088, -1264, ANG90,            "E1M3 ARENA"     },
+    { 4,  2032,  1120, ANG180,           "E1M4 START"     },
+    { 4,   736,  1824, 0,                "E1M4 ARENA"     },
+    { 5,  -224,  -624, ANG90,            "E1M5 START"     },
+    { 5,  -160,  1600, ANG90,            "E1M5 ARENA"     },
+    { 6,    32, -1376, ANG90,            "E1M6 START"     },
+    { 6,   512,  1424, 0,                "E1M6 ARENA"     },
+    { 7,    96,   528, ANG270,           "E1M7 START"     },
+    { 7,  -896,   -64, ANG90,            "E1M7 ARENA"     },
+    { 8,  -128,  -224, 0,                "E1M8 START"     },
+    { 8,   416,  4080, ANG270,           "E1M8 ARENA"     },
+    { 9,    96,  -272, 0,                "E1M9 START"     },
+    { 9,  1504,  -960, 0,                "E1M9 ARENA"     },
+};
+
+#define NUM_TOUR_STOPS ((int)(sizeof(s_tour_stops) / sizeof(s_tour_stops[0])))
+
+int Saturn_AutoTour_Step(void)
+{
+    extern int saturn_map;
+    static int tour_idx = 0;
+    static int tour_frames = 0;
+
+    if (tour_idx >= NUM_TOUR_STOPS)
+        tour_idx = 0;
+
+    const saturn_tour_stop_t *s = &s_tour_stops[tour_idx];
+    if (saturn_map != s->map)
+    {
+        tour_frames = 0;
+        Saturn_WarpToLevel(1, s->map);
+        return 1;
+    }
+
+    if (players[0].mo)
+    {
+        mobj_t *mo = players[0].mo;
+        fixed_t tx = s->x << FRACBITS;
+        fixed_t ty = s->y << FRACBITS;
+        if (mo->x != tx || mo->y != ty)
+        {
+            P_UnsetThingPosition(mo);
+            mo->x = tx;
+            mo->y = ty;
+            P_SetThingPosition(mo);
+            if (mo->subsector)
+            {
+                sector_t *sec = SSEC_SECTOR(mo->subsector);
+                mo->floorz = sec->floorheight;
+                mo->ceilingz = sec->ceilingheight;
+                mo->z = mo->floorz;
+            }
+        }
+        mo->angle = s->ang;
+        mo->momx = 0;
+        mo->momy = 0;
+        mo->momz = 0;
+        players[0].viewz = mo->z + VIEWHEIGHT;
+        players[0].viewheight = VIEWHEIGHT;
+        players[0].deltaviewheight = 0;
+        players[0].cheats |= CF_GODMODE;
+        players[0].health = 100;
+        mo->health = 100;
+        players[0].message = (char *)s->label;
+    }
+
+    tour_frames++;
+    if (tour_frames >= 48)
+    {
+        tour_frames = 0;
+        tour_idx++;
+    }
+    return 0;
 }

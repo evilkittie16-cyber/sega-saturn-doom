@@ -159,7 +159,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_BuildSectorThings(sector_t *sec)
     }
 }
 
-HW_ALWAYS_INLINE int HW_SubsectorHasThings(sector_t *sec, uint32_t secnum, int subnum)
+static HW_NOINLINE HW_HOT_O2 int HW_SubsectorHasThings(sector_t *sec, uint32_t secnum, int subnum)
 {
     if (!sec->thinglist || secnum >= 512u)
         return 0;

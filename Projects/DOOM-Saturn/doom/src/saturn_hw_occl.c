@@ -216,20 +216,18 @@ typedef struct {
 typedef struct {
     int16_t x0;
     int16_t y0;
-    int16_t x1;
-    int16_t y1;
     int16_t dx;
     int16_t dy;
     int16_t back_sec_idx;
     uint8_t chain_prev;
     uint8_t pad;
-} hw_portal_seg_t;
+} hw_portal_seg_t; /* 12 bytes */
 
 #define HW_NODE_PVS_WORDS     32
 #define HW_MAX_PORTAL_SPANS   32
 #define HW_MAX_AP_SECTORS     256
-#define HW_MAX_AP_SUBSECTORS  1024
-#define HW_MAX_PORTAL_SEGS    510
+#define HW_MAX_AP_SUBSECTORS  608
+#define HW_MAX_PORTAL_SEGS    336
 
 /* Subsector Flat Evaluation & LOD Bitmask Flags */
 #define HW_FLAT_INSIDE_MASK   0x03u
@@ -251,15 +249,6 @@ typedef struct {
     uint16_t lod1_q_count;
     uint16_t lod1_v_count;
 } HW_ALIGN16 hw_sub_flat_info_t;
-
-/* Unified Low Work RAM Scratch Layout at SATURN_WRAM_L_PILLARS_ADDR (32 KB capacity).
- * All tables placed into a single C struct so the compiler enforces non-overlapping
- * offsets and bounds-checks total size via _Static_assert. */
-typedef struct {
-    hw_sub_flat_info_t sub_flat_info[HW_MAX_AP_SUBSECTORS]; /* 16,384 B (0x0000..0x3FFF) */
-    hw_portal_seg_t    portal_segs[HW_MAX_PORTAL_SEGS];     /*  8,160 B (0x4000..0x5FDF) */
-    int32_t            sky_col_bam[HW_MAX_SCREEN_W];        /*  1,408 B (0x5FE0..0x655F) */
-} hw_wram_l_scratch_t;
 
 /* Per-frame 16-byte sector fast table (indexed by secnum << 4, 1 SH-2 L1 cache line):
  * Replaces non-power-of-two sector_t (36-byte multiply) + HW_DZQ(z, hw_viewz) +
@@ -294,29 +283,37 @@ typedef struct {
     uint8_t          ybot[HW_MAX_SCREEN_W];
 } hw_aperture_state_t;
 
+typedef struct {
+    hw_sub_flat_info_t sub_flat_info[HW_MAX_AP_SUBSECTORS];
+    hw_portal_seg_t    portal_segs[HW_MAX_PORTAL_SEGS];
+    int32_t            sky_col_bam[HW_MAX_SCREEN_W];
+} hw_wram_l_scratch_t;
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(hw_wram_l_scratch_t) <= 32768,
+               "hw_wram_l_scratch_t exceeds 32 KB Low Work RAM budget");
 _Static_assert(sizeof(hw_sub_flat_info_t) == 16,
                "hw_sub_flat_info_t must be 16 bytes (1 SH-2 cache line)");
 _Static_assert(sizeof(hw_sec_fast_t) == 16,
                "hw_sec_fast_t must be 16 bytes (1 SH-2 cache line)");
-_Static_assert(sizeof(hw_wram_l_scratch_t) <= SATURN_WRAM_L_PILLARS_SIZE,
-               "hw_wram_l_scratch_t must fit inside 32 KB SATURN_WRAM_L_PILLARS_ADDR region");
 #elif defined(_MSC_VER)
+static_assert(sizeof(hw_wram_l_scratch_t) <= 32768,
+              "hw_wram_l_scratch_t exceeds 32 KB Low Work RAM budget");
 static_assert(sizeof(hw_sub_flat_info_t) == 16,
               "hw_sub_flat_info_t must be 16 bytes (1 SH-2 cache line)");
 static_assert(sizeof(hw_sec_fast_t) == 16,
               "hw_sec_fast_t must be 16 bytes (1 SH-2 cache line)");
-static_assert(sizeof(hw_wram_l_scratch_t) <= SATURN_WRAM_L_PILLARS_SIZE,
-              "hw_wram_l_scratch_t must fit inside 32 KB SATURN_WRAM_L_PILLARS_ADDR region");
 #endif
 
 static HW_ALIGN16 hw_aperture_state_t hw_aperture_state;
 static HW_ALIGN16 hw_ap_word_t hw_ap_words[HW_SOLID_WORDS];
 static HW_ALIGN16 hw_sec_fast_t hw_sec_fast[HW_MAX_AP_SECTORS];
-#define HW_APERTURE       (&hw_aperture_state)
+extern uint32_t hw_wram_h_sub_flat_info[HW_MAX_AP_SUBSECTORS * 4];
+extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_WRAM_L_SCRATCH ((hw_wram_l_scratch_t *)SATURN_WRAM_L_PILLARS_ADDR)
-#define HW_SUB_FLAT_INFO  (HW_WRAM_L_SCRATCH->sub_flat_info)
-#define HW_PORTAL_SEGS    (HW_WRAM_L_SCRATCH->portal_segs)
+#define HW_APERTURE       (&hw_aperture_state)
+#define HW_SUB_FLAT_INFO  ((hw_sub_flat_info_t *)hw_wram_h_sub_flat_info)
+#define HW_PORTAL_SEGS    ((hw_portal_seg_t *)hw_wram_h_portal_segs)
 #define HW_SKY_COL_BAM    (HW_WRAM_L_SCRATCH->sky_col_bam)
 
 static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
@@ -381,7 +378,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
         const hw_ap_word_t *aw = &hw_ap_words[w0];
         int yt_min = aw->yt_min;
         int yb_max = aw->yb_max;
-        if (__builtin_expect(yt_min < aw->yt_max || yb_max > aw->yb_min, 0))
+        if (__builtin_expect((aw->yt_max - yt_min) > 4 || (yb_max - aw->yb_min) > 4, 0))
         {
             const uint8_t *ytop = ap->ytop;
             const uint8_t *ybot = ap->ybot;
@@ -434,7 +431,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
         const hw_ap_word_t *aw0 = &hw_ap_words[w0];
         if (aw0->yt_min < yt_min || aw0->yb_max > yb_max)
         {
-            if (aw0->yt_min == aw0->yt_max && aw0->yb_min == aw0->yb_max)
+            if ((aw0->yt_max - aw0->yt_min) <= 4 && (aw0->yb_max - aw0->yb_min) <= 4)
             {
                 if (aw0->yt_min < yt_min) yt_min = aw0->yt_min;
                 if (aw0->yb_max > yb_max) yb_max = aw0->yb_max;
@@ -462,7 +459,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
         const hw_ap_word_t *aw1 = &hw_ap_words[w1];
         if (aw1->yt_min < yt_min || aw1->yb_max > yb_max)
         {
-            if (aw1->yt_min == aw1->yt_max && aw1->yb_min == aw1->yb_max)
+            if ((aw1->yt_max - aw1->yt_min) <= 4 && (aw1->yb_max - aw1->yb_min) <= 4)
             {
                 if (aw1->yt_min < yt_min) yt_min = aw1->yt_min;
                 if (aw1->yb_max > yb_max) yb_max = aw1->yb_max;
@@ -635,8 +632,8 @@ static HW_NOINLINE HW_COLD_OS int HW_CommitPortalClosedWord(int w, uint32_t newl
     return 0;
 }
 
-static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
-    int w_and_flags, const hw_portal_span_t *ps)
+static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
+    int w_and_flags, const hw_portal_span_t *ps, int touch_ret)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     int w      = (int)((unsigned int)w_and_flags >> 8);
@@ -655,74 +652,6 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
     int new_yb = ps->ybot;
     int yt_att = ps->yt_att;
     int yb_att = ps->yb_att;
-    int touch_ret = 0;
-
-    if (w_and_flags & 4)
-    {
-        hw_ap_word_t *aw = &hw_ap_words[w];
-        int full_yt = do_yt && (yt_att <= aw->yt_min + 2) && (new_yt >= aw->yt_max);
-        int full_yb = do_yb && (yb_att >= aw->yb_max - 2) && (new_yb <= aw->yb_min);
-        if (full_yt || full_yb)
-        {
-            int next_yt_max = full_yt ? new_yt : aw->yt_max;
-            int next_yb_min = full_yb ? new_yb : aw->yb_min;
-            if (next_yt_max < next_yb_min)
-            {
-                uint32_t wbit = hw_bit_lut[w];
-                int is_full_word = (x_s == x_w0 && x_e == x_w1);
-                if (full_yt)
-                {
-                    uint8_t * __restrict ytop = ap->ytop;
-                    if (is_full_word)
-                    {
-                        uint32_t yt4 = (uint32_t)(uint8_t)new_yt * 0x01010101u;
-                        aliased_uint32_t *yt32 = (aliased_uint32_t *)&ytop[x_w0];
-                        yt32[0] = yt4; yt32[1] = yt4; yt32[2] = yt4; yt32[3] = yt4;
-                        yt32[4] = yt4; yt32[5] = yt4; yt32[6] = yt4; yt32[7] = yt4;
-                        aw->yt_min = aw->yt_max = (int16_t)new_yt;
-                    }
-                    else
-                    {
-                        for (int x = x_s; x < x_e; x++)
-                            ytop[x] = (uint8_t)new_yt;
-                        if (aw->yt_min == aw->yt_max)
-                            aw->yt_max = (int16_t)new_yt;
-                        else
-                            touch_ret = 1;
-                    }
-                    ap->dirty_words |= wbit;
-                    ap->aperture_active = 1;
-                    do_yt = 0;
-                }
-                if (full_yb)
-                {
-                    uint8_t * __restrict ybot = ap->ybot;
-                    if (is_full_word)
-                    {
-                        uint32_t yb4 = (uint32_t)(uint8_t)new_yb * 0x01010101u;
-                        aliased_uint32_t *yb32 = (aliased_uint32_t *)&ybot[x_w0];
-                        yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
-                        yb32[4] = yb4; yb32[5] = yb4; yb32[6] = yb4; yb32[7] = yb4;
-                        aw->yb_min = aw->yb_max = (int16_t)new_yb;
-                    }
-                    else
-                    {
-                        for (int x = x_s; x < x_e; x++)
-                            ybot[x] = (uint8_t)new_yb;
-                        if (aw->yb_min == aw->yb_max)
-                            aw->yb_min = (int16_t)new_yb;
-                        else
-                            touch_ret = 1;
-                    }
-                    ap->dirty_words |= wbit;
-                    ap->aperture_active = 1;
-                    do_yb = 0;
-                }
-                if (!do_yt && !do_yb)
-                    return touch_ret;
-            }
-        }
-    }
 
     uint8_t * __restrict ytop = ap->ytop;
     uint8_t * __restrict ybot = ap->ybot;
@@ -808,6 +737,95 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
         }
     }
     return w_mod;
+}
+
+static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
+    int w_and_flags, const hw_portal_span_t *ps)
+{
+    int touch_ret = 0;
+    if (w_and_flags & 4)
+    {
+        int w      = (int)((unsigned int)w_and_flags >> 8);
+        int do_yt  = w_and_flags & 1;
+        int do_yb  = (w_and_flags >> 1) & 1;
+        int new_yt = ps->ytop;
+        int new_yb = ps->ybot;
+        int yt_att = ps->yt_att;
+        int yb_att = ps->yb_att;
+        hw_ap_word_t *aw = &hw_ap_words[w];
+        int full_yt = do_yt && (yt_att <= aw->yt_min + 2) && (new_yt >= aw->yt_max);
+        int full_yb = do_yb && (yb_att >= aw->yb_max - 2) && (new_yb <= aw->yb_min);
+        if (full_yt || full_yb)
+        {
+            int next_yt_max = full_yt ? new_yt : aw->yt_max;
+            int next_yb_min = full_yb ? new_yb : aw->yb_min;
+            if (next_yt_max < next_yb_min)
+            {
+                hw_aperture_state_t *ap = HW_APERTURE;
+                int vw   = HW_VIEW_W;
+                int x_w0 = w << 5;
+                int x_w1 = x_w0 + 32;
+                if (x_w1 > vw) x_w1 = vw;
+                int sx   = ps->sx;
+                int ex   = ps->ex;
+                int x_s  = (sx > x_w0) ? sx : x_w0;
+                int x_e  = (ex < x_w1) ? ex : x_w1;
+                uint32_t wbit = hw_bit_lut[w];
+                int is_full_word = (x_s == x_w0 && x_e == x_w1);
+                if (full_yt)
+                {
+                    uint8_t * __restrict ytop = ap->ytop;
+                    if (is_full_word)
+                    {
+                        uint32_t yt4 = (uint32_t)(uint8_t)new_yt * 0x01010101u;
+                        aliased_uint32_t *yt32 = (aliased_uint32_t *)&ytop[x_w0];
+                        yt32[0] = yt4; yt32[1] = yt4; yt32[2] = yt4; yt32[3] = yt4;
+                        yt32[4] = yt4; yt32[5] = yt4; yt32[6] = yt4; yt32[7] = yt4;
+                        aw->yt_min = aw->yt_max = (int16_t)new_yt;
+                    }
+                    else
+                    {
+                        for (int x = x_s; x < x_e; x++)
+                            ytop[x] = (uint8_t)new_yt;
+                        if (aw->yt_min == aw->yt_max)
+                            aw->yt_max = (int16_t)new_yt;
+                        else
+                            touch_ret = 1;
+                    }
+                    ap->dirty_words |= wbit;
+                    ap->aperture_active = 1;
+                    w_and_flags &= ~1;
+                }
+                if (full_yb)
+                {
+                    uint8_t * __restrict ybot = ap->ybot;
+                    if (is_full_word)
+                    {
+                        uint32_t yb4 = (uint32_t)(uint8_t)new_yb * 0x01010101u;
+                        aliased_uint32_t *yb32 = (aliased_uint32_t *)&ybot[x_w0];
+                        yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
+                        yb32[4] = yb4; yb32[5] = yb4; yb32[6] = yb4; yb32[7] = yb4;
+                        aw->yb_min = aw->yb_max = (int16_t)new_yb;
+                    }
+                    else
+                    {
+                        for (int x = x_s; x < x_e; x++)
+                            ybot[x] = (uint8_t)new_yb;
+                        if (aw->yb_min == aw->yb_max)
+                            aw->yb_min = (int16_t)new_yb;
+                        else
+                            touch_ret = 1;
+                    }
+                    ap->dirty_words |= wbit;
+                    ap->aperture_active = 1;
+                    w_and_flags &= ~2;
+                }
+                if (!(w_and_flags & 3))
+                    return touch_ret;
+            }
+        }
+    }
+    return HW_UpdatePortalWordCols(w_and_flags, ps, touch_ret);
 }
 
 static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(

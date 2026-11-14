@@ -716,7 +716,12 @@ int main(int argc, char **argv)
     }
     SetUnhandledExceptionFilter(CrashHandler);
     for (int i = 1; i < argc; i++) {
-        if (strstr(argv[i], "-journey")) {
+        if (strstr(argv[i], "-tour9")) {
+            g_win32_test_mode = 21;
+            extern int saturn_map;
+            saturn_map = 1;
+        }
+        else if (strstr(argv[i], "-journey")) {
             g_win32_test_mode = 20;
             extern int saturn_map;
             saturn_map = 1;

@@ -235,7 +235,7 @@ void *Saturn_RtblAlloc(int size)
 static void hram_probe(void)
 {
     volatile byte *lo = (volatile byte *)SATURN_HRAM_BASE;
-    volatile byte *hi = (volatile byte *)(SATURN_HRAM_BASE + SATURN_HRAM_SIZE - 8);
+    volatile byte *hi = (volatile byte *)(SATURN_HRAM_BASE + SATURN_HRAM_SIZE - SATURN_RTBL_SIZE - 8);
     unsigned int   want = SATURN_HWRAM_WANT;
 
     hram_used = 0;

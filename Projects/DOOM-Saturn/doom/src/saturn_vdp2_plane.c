@@ -18,14 +18,27 @@ fixed_t saturn_vdp2_plane_floorz = -136 * FRACUNIT;
 int saturn_vdp2_plane_checker = 1; /* 1 = High-contrast test checkerboard, 0 = regular flat */
 
 #ifndef SATURN_WIN32
-static int v2_inited = 0;
-static unsigned short *v2_map = NULL;
-static unsigned char  *v2_cell = NULL;
-static unsigned short *v2_kt = NULL;
-static ROTSCROLL      *v2_rtable = NULL;
-static ROTSCROLL       v2_rs;
+typedef struct
+{
+    fixed_t        XST, YST, ZST;
+    fixed_t        DXST, DYST;
+    fixed_t        DX, DY;
+    fixed_t        MATA, MATB, MATC, MATD, MATE, MATF;
+    short          PX, PY, PZ, pad0;
+    short          CX, CY, CZ, pad1;
+    fixed_t        MX, MY;
+    fixed_t        KX, KY;
+    unsigned int   KAST;
+    int            DKAST, DKA;
+    unsigned int   pad2[8];
+} saturn_rotscroll_t;
 
-#define V2_SGL_RPARA_A  ((volatile ROTSCROLL *)0x060FFE1Cu)
+static int v2_inited = 0;
+static unsigned short     *v2_map = NULL;
+static unsigned char      *v2_cell = NULL;
+static unsigned short     *v2_kt = NULL;
+static saturn_rotscroll_t *v2_rtable = NULL;
+static saturn_rotscroll_t  v2_rs;
 
 void Saturn_VDP2_Plane_Init(void)
 {
@@ -38,29 +51,67 @@ void Saturn_VDP2_Plane_Init(void)
     v2_map = (unsigned short *)jo_vdp2_malloc(JO_VDP2_RAM_MAP_RBG0, 8192);
     v2_cell = (unsigned char *)jo_vdp2_malloc(JO_VDP2_RAM_MAP_RBG0, 4096);
     v2_kt = (unsigned short *)jo_vdp2_malloc(JO_VDP2_RAM_MAP_RBG0, 1024);
-    v2_rtable = (ROTSCROLL *)jo_vdp2_malloc(JO_VDP2_RAM_MAP_RBG0, 128);
+    v2_rtable = (saturn_rotscroll_t *)jo_vdp2_malloc(JO_VDP2_RAM_MAP_RBG0, 128);
 
     if (!v2_map || !v2_cell || !v2_kt || !v2_rtable)
         return;
 
-    /* SGL RBG0 configuration */
-    sl1MapRA(v2_map);
-    slOverRA(0);                            /* Over mode 0: REPEAT character pattern */
-    slPageRbg0(v2_cell, 0, PNB_1WORD | CN_12BIT);
-    slRparaInitSet(v2_rtable);
-    slKtableRA(v2_kt, K_FIX | K_2WORD | K_ON | K_MODE0);
-    slKtableRB(v2_kt, K_FIX | K_2WORD | K_ON | K_MODE0);
-    slCharRbg0(COL_TYPE_256, CHAR_SIZE_1x1);
-    slRparaMode(RA);                        /* Parameter A only */
-    slPlaneRA(PL_SIZE_1x1);
-    slPlaneRB(PL_SIZE_1x1);
-    slPriorityRbg0(4);                      /* Priority 4: above NBG0 (3), below VDP1 (5) */
+    /* Direct hardware VDP2 RBG0 configuration in Bank B0:
+     * Bank B0 (RDBSB0 = bits 5:4 = 11 for RBG0 character/pattern, bits 7:6 = 01 for RBG0 pattern name/coeff) */
+    JO_VDP2_RAMCTL = (JO_VDP2_RAMCTL & ~0x00F0u) | 0x0050u;
 
-    /* Restore Bank A0/A1 NBG0 bitmap cycle patterns that SGL may have touched */
-    JO_VDP2_CYCA0L = 0x5555;
-    JO_VDP2_CYCA0U = 0xFEEE;
-    JO_VDP2_CYCA1L = 0x5555;
-    JO_VDP2_CYCA1U = 0xFEEE;
+    /* RBG0 character control: 256 colors (bits 14:12 = 001), 1x1 cell size (bit 8 = 0) */
+    JO_VDP2_CHCTLB = (JO_VDP2_CHCTLB & 0x00FFu) | 0x1000u;
+
+    /* Pattern Name Control for RBG0: 1-word (bit 15 = 1), 12-bit char number (bit 14 = 1),
+     * supplementary character bits (bits 4:2) = top 3 bits of 15-bit cell number for Bank B0 */
+    JO_VDP2_PNCR = 0xC000u | (unsigned short)(((((unsigned int)v2_cell & 0x7FFFFu) >> 17) & 0x7u) << 2);
+
+    /* Plane Size: 1x1H for RA and RB (bits 9:8 = 00, bits 13:12 = 00) & Over mode 0 (repeat) */
+    JO_VDP2_PLSZ &= 0x00FFu;
+
+    /* Map offset & planes A..P for Parameter A all pointing to v2_map in Bank B0 */
+    {
+        unsigned int map_addr = ((unsigned int)v2_map) & 0x7FFFFu;
+        unsigned short plane = (unsigned short)((map_addr >> 13) & 0x3Fu);
+        unsigned short pair = (unsigned short)(plane | (plane << 8));
+        JO_VDP2_MPOFR = (JO_VDP2_MPOFR & ~0x0007u) | (unsigned short)((map_addr >> 19) & 0x7u);
+        JO_VDP2_MPABRA = pair;
+        JO_VDP2_MPCDRA = pair;
+        JO_VDP2_MPEFRA = pair;
+        JO_VDP2_MPGHRA = pair;
+        JO_VDP2_MPIJRA = pair;
+        JO_VDP2_MPKLRA = pair;
+        JO_VDP2_MPMNRA = pair;
+        JO_VDP2_MPOPRA = pair;
+    }
+
+    /* Rotation Parameter Mode: 0 (Parameter A only) */
+    JO_VDP2_RPMD = 0;
+
+    /* Coefficient table control for Parameter A & B:
+     * bit 0 = KTE (enable), bit 1 = KLCE (0 = 2-word), bits 3:2 = KMD (0 = scale XY), bit 4 = CTA (0) */
+    JO_VDP2_KTCTL = 0x0101u;
+    {
+        unsigned int kt_off = ((((unsigned int)v2_kt) & 0x7FFFFu) >> 18) & 0x7u;
+        JO_VDP2_KTAOF = (unsigned short)(kt_off | (kt_off << 8));
+    }
+
+    /* Rotation Parameter Table Address (in 2-byte word address units across 512 KB VDP2 VRAM) */
+    {
+        unsigned int rta = (((unsigned int)v2_rtable) & 0x7FFFFu) >> 1;
+        JO_VDP2_RPTAU = (unsigned short)((rta >> 16) & 0x7u);
+        JO_VDP2_RPTAL = (unsigned short)(rta & 0xFFFEu);
+    }
+
+    /* Priority 4: above NBG0 (3), below VDP1 (5) */
+    JO_VDP2_PRIR = 0x0004u;
+
+    /* Keep Bank A0/A1 NBG0 256-color bitmap cycle patterns active */
+    JO_VDP2_CYCA0L = 0x44EEu;
+    JO_VDP2_CYCA0U = 0xEEEEu;
+    JO_VDP2_CYCA1L = 0x44EEu;
+    JO_VDP2_CYCA1U = 0xEEEEu;
 
     /* Disable RBG0 color calculation (bit 4 of CCCTL) */
     JO_VDP2_CCCTL &= ~(1u << 4);
@@ -102,14 +153,6 @@ void Saturn_VDP2_Plane_LoadFlat(const char *flatname)
 
     if (saturn_vdp2_plane_checker)
     {
-        /* High-contrast test checkerboard (64x64 world units):
-         * - Border (2px): Bright Yellow (PLAYPAL 231) around edges of 64x64 tile
-         * - Center Crosshair (2px): Bright Yellow (PLAYPAL 231) at x,y = 31..32
-         * - Top-Left: Pure White (PLAYPAL 4) with bold Black 'N' (North/+Y)
-         * - Top-Right: Pure Red (PLAYPAL 176)
-         * - Bottom-Left: Pure Green (PLAYPAL 112)
-         * - Bottom-Right: Pure Magenta (PLAYPAL 251)
-         */
         for (int cy = 0; cy < 8; cy++)
         {
             for (int cx = 0; cx < 8; cx++)
@@ -173,10 +216,6 @@ void Saturn_VDP2_Plane_LoadFlat(const char *flatname)
     if (!src)
         return;
 
-    /* Convert 64x64 flat texture into 64 (8x8) VDP2 character cells (256-color mode).
-     * Flat texture is row-major: byte at (y*64 + x).
-     * Character m = cy*8 + cx (where cy, cx in 0..7).
-     * Inside each 8x8 character cell: py in 0..7, px in 0..7. */
     for (int cy = 0; cy < 8; cy++)
     {
         for (int cx = 0; cx < 8; cx++)
@@ -278,8 +317,7 @@ void Saturn_VDP2_Plane_Frame(fixed_t camx, fixed_t camy, fixed_t camz, angle_t c
         v2_kt[y * 2 + 1] = 0x0000;
     }
 
-    /* Deliver to SGL shadow buffer and direct VRAM rotation table */
-    *V2_SGL_RPARA_A = v2_rs;
+    /* Deliver directly to VDP2 VRAM rotation parameter table */
     *v2_rtable = v2_rs;
 }
 
@@ -288,12 +326,12 @@ void Saturn_VDP2_Plane_VBlank(void)
     if (!saturn_vdp2_plane_active)
         return;
 
-    /* SGL shadow RPTA pair at 0x060FFD7C delivery repair:
-     * SGL ch1 DMA swaps halfwords on delivery; writing to hardware registers
-     * in the vblank callback guarantees hardware sees correct pointer. */
-    volatile unsigned short *pair = (volatile unsigned short *)0x060FFD7Cu;
-    JO_VDP2_RPTAU = pair[0];
-    JO_VDP2_RPTAL = pair[1];
+    if (v2_rtable)
+    {
+        unsigned int rta = (((unsigned int)v2_rtable) & 0x7FFFFu) >> 1;
+        JO_VDP2_RPTAU = (unsigned short)((rta >> 16) & 0x7u);
+        JO_VDP2_RPTAL = (unsigned short)(rta & 0xFFFEu);
+    }
 
     /* Keep RBG0 color calc off and priority at 4 */
     JO_VDP2_CCCTL &= ~(1u << 4);
@@ -303,8 +341,8 @@ void Saturn_VDP2_Plane_VBlank(void)
     JO_VDP2_BGON |= (1u << 0) | (1u << 4);
 
     /* Guarantee Bank A0 and A1 cycle patterns allow NBG0 bitmap reads */
-    JO_VDP2_CYCA0L = 0x5555;
-    JO_VDP2_CYCA1L = 0x5555;
+    JO_VDP2_CYCA0L = 0x44EEu;
+    JO_VDP2_CYCA1L = 0x44EEu;
 }
 #else /* SATURN_WIN32 */
 void Saturn_VDP2_Plane_Init(void) { }

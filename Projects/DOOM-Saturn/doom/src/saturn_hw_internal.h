@@ -272,11 +272,10 @@ unsigned int saturn_hw_tex_miss = 0;   /* wall pieces with no texture */
 typedef struct {
     fixed_t cx;      /* 4 bytes */
     fixed_t cz;      /* 4 bytes */
-    int16_t px;      /* 2 bytes */
+    int16_t px;      /* 2 bytes: -32768 if cz < HW_NEAR_Z */
     int16_t py_c;    /* 2 bytes */
     int16_t py_f;    /* 2 bytes */
-    uint8_t valid;   /* 1 byte: 1 if cz >= HW_NEAR_Z */
-    uint8_t pad;     /* 1 byte */
+    int16_t wy;      /* 2 bytes: cached world/grid Y from saturn_flat_vert_t */
 } saturn_proj_v_t;   /* Exactly 16 bytes */
 
 #ifndef _MSC_VER

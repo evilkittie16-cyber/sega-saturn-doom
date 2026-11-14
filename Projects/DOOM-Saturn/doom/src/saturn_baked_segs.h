@@ -23,6 +23,7 @@
 #define SEG_FLAG_MID      0x08
 #define SEG_PEG_BOTTOM         0x10  /* Bottom-anchored: v_bot = th + rowoff, v_top = v_bot - wall_h */
 #define SEG_PEG_LOWER_UNPEGGED 0x20  /* Lower unpegged: v_top = (front.ceil - back.floor) + rowoff */
+#define SEG_FLAG_STATIC        0x40  /* Static sector heights: mid_static_v_offset holds pre-wrapped v_top */
 #define SEG_FLAG_PORTAL_DONE   0x80  /* Portal aperture already recorded by earlier seg on same line */
 
 /* Disc Header: 32 bytes (Big-endian) */

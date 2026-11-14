@@ -6,9 +6,9 @@ REM Replace it with one that uses sane flags.
 setlocal
 cd /d "%~dp0"
 set MKISOFS=..\..\Compiler\WINDOWS\Other Utilities\mkisofs.exe
-if not exist "%MKISOFS%" set MKISOFS=C:\Users\charl\Desktop\joengine-master\Compiler\WINDOWS\Other Utilities\mkisofs.exe
-set IPBIN=..\..\Compiler\COMMON\IP.BIN
-if not exist "%IPBIN%" set IPBIN=C:\Users\charl\Desktop\joengine-master\Compiler\COMMON\IP.BIN
+set IPBIN=game.ip.bin
+if not exist "%IPBIN%" set IPBIN=..\..\Compiler\COMMON\IP.BIN
+powershell -NoProfile -Command "Dismount-DiskImage -ImagePath '%~dp0game.iso' -ErrorAction SilentlyContinue" >nul 2>&1
 "%MKISOFS%" ^
   -V "SaturnApp" ^
   -volset 1 ^
@@ -24,5 +24,6 @@ if errorlevel 1 (
     echo mkisofs failed
     exit /b 1
 )
+"..\..\Compiler\WINDOWS\Other Utilities\JoEngineCueMaker.exe"
 echo ISO built: game.iso
 endlocal

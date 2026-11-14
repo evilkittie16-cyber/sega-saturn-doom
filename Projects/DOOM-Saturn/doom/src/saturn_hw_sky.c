@@ -539,7 +539,8 @@ void Saturn_HW_RenderInit(void)
                         if (sub_cnt > 0)
                         {
                             hw_portal_seg_t *prev = &portal_segs[p_total - 1];
-                            if (prev->x1 == vx0 && prev->y1 == vy0)
+                            if ((int)prev->x0 + (int)prev->dx == (int)vx0 &&
+                                (int)prev->y0 + (int)prev->dy == (int)vy0)
                             {
                                 if (prev->back_sec_idx == bsec_idx)
                                 {
@@ -549,8 +550,6 @@ void Saturn_HW_RenderInit(void)
                                     int dy1 = (int)vy1 - (int)vy0;
                                     if (dx0 * dy1 == dy0 * dx1 && (dx0 * dx1 + dy0 * dy1) >= 0)
                                     {
-                                        prev->x1 = vx1;
-                                        prev->y1 = vy1;
                                         prev->dx = (int16_t)((int)vx1 - (int)prev->x0);
                                         prev->dy = (int16_t)((int)vy1 - (int)prev->y0);
                                         continue;
@@ -561,8 +560,6 @@ void Saturn_HW_RenderInit(void)
                         }
                         portal_segs[p_total].x0 = vx0;
                         portal_segs[p_total].y0 = vy0;
-                        portal_segs[p_total].x1 = vx1;
-                        portal_segs[p_total].y1 = vy1;
                         portal_segs[p_total].dx = (int16_t)((int)vx1 - (int)vx0);
                         portal_segs[p_total].dy = (int16_t)((int)vy1 - (int)vy0);
                         portal_segs[p_total].back_sec_idx = (int16_t)bsec_idx;
@@ -593,6 +590,18 @@ void Saturn_HW_RenderInit(void)
                     {
                         baked_seg_t s = segs_base[i];
                         s.flags &= (uint8_t)~SEG_FLAG_PORTAL_DONE;
+                        s.baked_light &= 0xF0u;
+                        if (s.u_span == 0)
+                        {
+                            s.u_span     = 64;
+                            s.inv_u_span = 1024;
+                        }
+                        if (s.tex_64 > 0)
+                        {
+                            int tw = Saturn_TexWidth(s.tex_64);
+                            if ((tw & (tw - 1)) == 0 && tw > 0)
+                                s.u_start &= (uint16_t)(tw - 1);
+                        }
                         if (s.flags & SEG_FLAG_MID)
                         {
                             uint8_t p0 = s.pillar_idx[0];
@@ -788,6 +797,109 @@ void Saturn_HW_RenderInit(void)
                         }
                         nsegs = keep_n;
                         wss->num_segs = (uint16_t)nsegs;
+                    }
+
+                    /* 3c. Pre-bake static v_top (SEG_FLAG_STATIC) and collinear backface skip counts (baked_light & 0x0F) */
+                    for (int i = 0; i < nsegs; i++)
+                    {
+                        baked_seg_t s = segs_base[i];
+                        uint8_t fl = s.flags & (uint8_t)~(SEG_FLAG_PORTAL_DONE | SEG_FLAG_STATIC);
+                        if (!(s.flags & SEG_FLAG_STATIC) &&
+                            (unsigned)fsec_idx < 256u && !sec_can_move[fsec_idx] &&
+                            s.tex_64 > 0)
+                        {
+                            int th = Saturn_TexHeight(s.tex_64);
+                            if (th > 0)
+                            {
+                                fixed_t f_ceil  = sectors[fsec_idx].ceilingheight;
+                                fixed_t f_floor = sectors[fsec_idx].floorheight;
+                                if (!(fl & (SEG_FLAG_UPPER | SEG_FLAG_LOWER | SEG_FLAG_MID)))
+                                {
+                                    if (f_ceil > f_floor)
+                                    {
+                                        int wall_h = (f_ceil - f_floor) >> FRACBITS;
+                                        int v_off  = s.mid_static_v_offset;
+                                        int v_top  = (fl & SEG_PEG_BOTTOM) ? (v_off - wall_h + th) : v_off;
+                                        if ((th & (th - 1)) == 0)
+                                            v_top &= (th - 1);
+                                        else
+                                        {
+                                            v_top %= th;
+                                            if (v_top < 0) v_top += th;
+                                        }
+                                        if (!(th >= 64 && (v_top + wall_h) > th))
+                                        {
+                                            s.mid_static_v_offset = (int16_t)v_top;
+                                            s.flags |= SEG_FLAG_STATIC;
+                                        }
+                                    }
+                                }
+                                else if (!(fl & SEG_FLAG_MID))
+                                {
+                                    int bsec_idx = s.back_sec_idx;
+                                    if ((unsigned)bsec_idx < 256u && !sec_can_move[bsec_idx])
+                                    {
+                                        fixed_t b_ceil  = sectors[bsec_idx].ceilingheight;
+                                        fixed_t b_floor = sectors[bsec_idx].floorheight;
+                                        fixed_t mbot    = (f_floor > b_floor) ? f_floor : b_floor;
+                                        fixed_t mtop    = (f_ceil < b_ceil) ? f_ceil : b_ceil;
+                                        int is_fsky     = ((int16_t)sectors[fsec_idx].ceilingpic == -1);
+                                        int is_bsky     = ((int16_t)sectors[bsec_idx].ceilingpic == -1);
+                                        int is_solid    = (!is_fsky && !is_bsky && mtop <= mbot);
+                                        fixed_t top_z   = (fl & SEG_FLAG_UPPER) ? f_ceil : b_floor;
+                                        fixed_t bot_z   = (fl & SEG_FLAG_UPPER) ? b_ceil : f_floor;
+                                        if (!is_solid && top_z > bot_z && top_z <= f_ceil && bot_z >= f_floor)
+                                        {
+                                            int wall_h = (top_z - bot_z) >> FRACBITS;
+                                            int v_off  = s.mid_static_v_offset;
+                                            int v_top;
+                                            if (fl & SEG_PEG_LOWER_UNPEGGED)
+                                                v_top = ((f_ceil - top_z) >> FRACBITS) + v_off;
+                                            else if (fl & SEG_PEG_BOTTOM)
+                                                v_top = v_off - wall_h + th;
+                                            else
+                                                v_top = v_off;
+                                            if ((th & (th - 1)) == 0)
+                                                v_top &= (th - 1);
+                                            else
+                                            {
+                                                v_top %= th;
+                                                if (v_top < 0) v_top += th;
+                                            }
+                                            if (!(th >= 64 && (v_top + wall_h) > th))
+                                            {
+                                                s.mid_static_v_offset = (int16_t)v_top;
+                                                s.flags |= SEG_FLAG_STATIC;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        int p0 = s.pillar_idx[0];
+                        int p1 = s.pillar_idx[1];
+                        int x0 = (int)pillars[p0].x, z0 = (int)pillars[p0].z;
+                        int dx0 = (int)pillars[p1].x - x0, dz0 = (int)pillars[p1].z - z0;
+                        int skip = 0;
+                        if (dx0 != 0 || dz0 != 0)
+                        {
+                            for (int k = i + 1; k < nsegs && skip < 15; k++)
+                            {
+                                int pk0 = segs_base[k].pillar_idx[0];
+                                int pk1 = segs_base[k].pillar_idx[1];
+                                int xk0 = (int)pillars[pk0].x, zk0 = (int)pillars[pk0].z;
+                                int dxk = (int)pillars[pk1].x - xk0, dzk = (int)pillars[pk1].z - zk0;
+                                if ((dxk == 0 && dzk == 0) ||
+                                    dx0 * dzk != dz0 * dxk ||
+                                    dx0 * dxk + dz0 * dzk <= 0 ||
+                                    (xk0 - x0) * dz0 != (zk0 - z0) * dx0)
+                                    break;
+                                skip++;
+                            }
+                        }
+                        s.baked_light = (uint8_t)((s.baked_light & 0xF0u) | (uint8_t)skip);
+                        segs_base[i] = s;
                     }
 
                     /* 4. Record max floor & min ceiling backsectors for non-solid/non-mid subsectors */

@@ -39,6 +39,14 @@ int                                  saturn_baked_wall_num_segs    = 0;
 #define cur_wl_num_pillars    saturn_baked_wall_num_pillars
 #define cur_wl_num_segs       saturn_baked_wall_num_segs
 
+#define SATURN_MAX_WRAM_H_WL_SUBS    608
+#define SATURN_MAX_WRAM_H_WL_PILLARS 3408
+#define SATURN_MAX_WRAM_H_WL_SEGS    3344
+static __attribute__((aligned(16))) saturn_wl_subsector_t hw_wram_h_wl_subsectors[SATURN_MAX_WRAM_H_WL_SUBS];
+static __attribute__((aligned(16))) saturn_wl_pillar_t    hw_wram_h_wl_pillars[SATURN_MAX_WRAM_H_WL_PILLARS];
+static __attribute__((aligned(16))) uint8_t               hw_wram_h_wl_pfrac[SATURN_MAX_WRAM_H_WL_PILLARS];
+static __attribute__((aligned(16))) baked_seg_t           hw_wram_h_wl_segs[SATURN_MAX_WRAM_H_WL_SEGS];
+
 #ifdef SATURN_WIN32
 #include <stdlib.h> /* For _byteswap macros */
 #endif
@@ -239,8 +247,10 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
     num_segs = (hdr->total_size - hdr->ofs_segs) / sizeof(packed_seg_disc_t);
     cur_wl_num_segs = (int)num_segs;
 
-    /* Swizzle 32-byte disc segs in-place into 16-byte runtime segs at ofs_segs */
-    dst_segs = (baked_seg_t *)((byte *)data + hdr->ofs_segs);
+    /* Swizzle 32-byte disc segs into 16-byte runtime segs (in 32-bit WRAM-H if <= 1264 segs) */
+    dst_segs = (num_segs <= SATURN_MAX_WRAM_H_WL_SEGS)
+               ? hw_wram_h_wl_segs
+               : (baked_seg_t *)((byte *)data + hdr->ofs_segs);
     cur_swizzled_segs = dst_segs;
 
     /* Seam fix: 1/16-unit pillar fractions live between pillars and segs */
@@ -248,7 +258,7 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
         uint32_t of = hdr->reserved[0];
         uint32_t pil_end = (of > hdr->ofs_pillars && of < hdr->ofs_segs) ? of : hdr->ofs_segs;
         cur_wl_num_pillars = (int)((pil_end - hdr->ofs_pillars) / sizeof(saturn_wl_pillar_t));
-        uint8_t *zend = (uint8_t *)(((uintptr_t)(dst_segs + num_segs) + 15u) & ~(uintptr_t)15u);
+        uint8_t *zend = (uint8_t *)(((uintptr_t)((baked_seg_t *)((byte *)data + hdr->ofs_segs) + num_segs) + 15u) & ~(uintptr_t)15u);
         if (of > hdr->ofs_pillars && of < hdr->ofs_segs)
             cur_wl_pillar_frac = (const uint8_t *)data + of;
         else
@@ -273,6 +283,19 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
             return 0;
         }
         saturn_wram_l_geom_end = zend;   /* texture tier starts above this */
+
+        if (cur_wl_num_subsectors > 0 && cur_wl_num_subsectors <= SATURN_MAX_WRAM_H_WL_SUBS)
+        {
+            memcpy(hw_wram_h_wl_subsectors, cur_wl_subsectors, (size_t)cur_wl_num_subsectors * sizeof(saturn_wl_subsector_t));
+            cur_wl_subsectors = hw_wram_h_wl_subsectors;
+        }
+        if (cur_wl_num_pillars > 0 && cur_wl_num_pillars <= SATURN_MAX_WRAM_H_WL_PILLARS)
+        {
+            memcpy(hw_wram_h_wl_pillars, cur_wl_pillars, (size_t)cur_wl_num_pillars * sizeof(saturn_wl_pillar_t));
+            memcpy(hw_wram_h_wl_pfrac, cur_wl_pillar_frac, (size_t)cur_wl_num_pillars);
+            cur_wl_pillars     = hw_wram_h_wl_pillars;
+            cur_wl_pillar_frac = hw_wram_h_wl_pfrac;
+        }
     }
 
     /* Swizzle 32-byte disc segs into compact 16-byte single-cache-line runtime segs */
@@ -327,6 +350,17 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
                                    (us > 0)   ? (uint16_t)(65536u / us) : 0;
         dst->back_sec_idx        = bsec_idx;
     }
+
+#ifndef SATURN_WIN32
+    /* If all baked wall arrays were promoted into 32-bit WRAM-H, reclaim the
+     * temporary WRAM-L .WL blob space for the level texture cache! */
+    if (cur_wl_subsectors == hw_wram_h_wl_subsectors &&
+        cur_wl_pillars == hw_wram_h_wl_pillars &&
+        cur_swizzled_segs == hw_wram_h_wl_segs)
+    {
+        saturn_wram_l_geom_end = (uint8_t *)data;
+    }
+#endif
 
     saturn_baked_walls_active = 1;
     saturn_wall_parse_dbg = 100 + (int)num_segs;

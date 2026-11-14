@@ -705,9 +705,12 @@ void D_DoomMain(void)
         int demo_num  = 0;
 
         saturn_map = SATURN_BOOT_MAP;
+#ifndef SATURN_AUTO_TOUR
+#define SATURN_AUTO_TOUR 0
+#endif
 #if !defined(SATURN_UI_MENU) || SATURN_UI_MENU != 0
         {
-            int skip_menu = 0;
+            int skip_menu = SATURN_AUTO_TOUR;
 #ifdef SATURN_WIN32
             extern int g_win32_test_mode;
             FILE *f_cmd = fopen("agent_cmd.txt", "r");
@@ -1079,6 +1082,13 @@ void D_DoomLoop(void)
             Saturn_WarpToLevel(wep, wmap);
             continue;
         }
+#if SATURN_AUTO_TOUR
+        {
+            extern int Saturn_AutoTour_Step(void);
+            if (Saturn_AutoTour_Step())
+                continue;
+        }
+#endif
 
         extern volatile unsigned int saturn_master_beat;
         extern volatile unsigned int saturn_iter_count;

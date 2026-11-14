@@ -66,13 +66,21 @@ typedef struct {
     int sector_idx;
 } dos_sync_mobj_t;
 
+typedef struct {
+    int floorheight;
+    int ceilingheight;
+    short lightlevel;
+} dos_sync_sector_t;
+
 typedef void (*fn_DOS_SyncMobjs)(const dos_sync_mobj_t *mobjs, int count);
+typedef void (*fn_DOS_SyncSectors)(const dos_sync_sector_t *sec_list, int count);
 
 static HMODULE            s_dos_dll = NULL;
 static fn_DOS_Init        pDOS_Init = NULL;
 static fn_DOS_SetCamera   pDOS_SetCamera = NULL;
 static fn_DOS_SetWeapon   pDOS_SetWeapon = NULL;
 static fn_DOS_SyncMobjs   pDOS_SyncMobjs = NULL;
+static fn_DOS_SyncSectors pDOS_SyncSectors = NULL;
 static fn_DOS_RenderFrame pDOS_RenderFrame = NULL;
 static fn_DOS_GetPalette  pDOS_GetPalette = NULL;
 static int                s_dos_ready = 0;
@@ -122,6 +130,7 @@ static void InitDosRefDll(void)
     pDOS_SetCamera   = (fn_DOS_SetCamera)GetProcAddress(s_dos_dll, "DOS_SetCamera");
     pDOS_SetWeapon   = (fn_DOS_SetWeapon)GetProcAddress(s_dos_dll, "DOS_SetWeapon");
     pDOS_SyncMobjs   = (fn_DOS_SyncMobjs)GetProcAddress(s_dos_dll, "DOS_SyncMobjs");
+    pDOS_SyncSectors = (fn_DOS_SyncSectors)GetProcAddress(s_dos_dll, "DOS_SyncSectors");
     pDOS_RenderFrame = (fn_DOS_RenderFrame)GetProcAddress(s_dos_dll, "DOS_RenderFrame");
     pDOS_GetPalette  = (fn_DOS_GetPalette)GetProcAddress(s_dos_dll, "DOS_GetPalette");
 
@@ -720,6 +729,16 @@ void I_FinishUpdate(void)
             }
             pDOS_SyncMobjs(s_sync_list, sync_count);
         }
+        if (pDOS_SyncSectors && sectors && numsectors > 0) {
+            static dos_sync_sector_t s_sync_secs[1024];
+            int sec_cnt = (numsectors < 1024) ? numsectors : 1024;
+            for (int s = 0; s < sec_cnt; s++) {
+                s_sync_secs[s].floorheight   = sectors[s].floorheight;
+                s_sync_secs[s].ceilingheight = sectors[s].ceilingheight;
+                s_sync_secs[s].lightlevel    = sectors[s].lightlevel;
+            }
+            pDOS_SyncSectors(s_sync_secs, sec_cnt);
+        }
         pDOS_RenderFrame(s_dos_fb);
     } else {
         /* If DOS ref not ready or level not loaded, paint dark gray in Pane 2 */
@@ -1008,6 +1027,98 @@ void I_FinishUpdate(void)
 
     /* 10. Automated Regression Test Modes */
     int is_test = g_win32_test_mode;
+
+    /* 9-Level Automated Audit Mode (-tour9) */
+    if (is_test == 21 && players && players[0].mo) {
+        typedef struct {
+            int map;
+            int wp;
+            int x, y;
+            unsigned int angle;
+            const char *desc;
+        } tour9_stop_t;
+        static const tour9_stop_t s_tour9[] = {
+            { 1, 0,  1056, -3616, 0x40000000u, "E1M1 Start" },
+            { 1, 1,  1800, -2800, 0x30000000u, "E1M1 Zigzag" },
+            { 1, 2,  2056, -3264, 0xC0000000u, "E1M1 Courtyard" },
+            { 2, 0,   -32,  -240, 0x40000000u, "E1M2 Start" },
+            { 2, 1,  -224,   512, 0x00000000u, "E1M2 Central" },
+            { 2, 2, -1888,  1120, 0xA0000000u, "E1M2 West" },
+            { 3, 0, -1472, -3344, 0x40000000u, "E1M3 Start" },
+            { 3, 1, -1088, -1264, 0x40000000u, "E1M3 Hub" },
+            { 3, 2,   384, -2176, 0xC0000000u, "E1M3 East" },
+            { 4, 0,  2032,  1120, 0x80000000u, "E1M4 Start" },
+            { 4, 1,   736,  1824, 0x00000000u, "E1M4 Center" },
+            { 4, 2, -1088,   768, 0xC0000000u, "E1M4 Maze" },
+            { 5, 0,  -224,  -624, 0x40000000u, "E1M5 Start" },
+            { 5, 1,  -160,  1600, 0x40000000u, "E1M5 North" },
+            { 5, 2,   576,   768, 0x80000000u, "E1M5 Courtyard" },
+            { 6, 0,    32, -1376, 0x40000000u, "E1M6 Start" },
+            { 6, 1,   512,  1424, 0x00000000u, "E1M6 North" },
+            { 6, 2,  2256,  -256, 0x60000000u, "E1M6 East" },
+            { 7, 0,    96,   528, 0xC0000000u, "E1M7 Start" },
+            { 7, 1,  -896,   -64, 0x40000000u, "E1M7 Hub" },
+            { 7, 2,   320, -2336, 0x80000000u, "E1M7 South" },
+            { 8, 0,  -128,  -224, 0x00000000u, "E1M8 Start" },
+            { 8, 1,   416,  2520, 0x40000000u, "E1M8 Ledge" },
+            { 8, 2,   416,  4080, 0xC0000000u, "E1M8 Arena" },
+            { 9, 0,    96,  -272, 0x00000000u, "E1M9 Start" },
+            { 9, 1,  1504,  -960, 0x00000000u, "E1M9 East" },
+            { 9, 2,   736,   672, 0xC0000000u, "E1M9 North" }
+        };
+        static int s_t9_idx = 0;
+        static int s_t9_step = 0;
+        extern subsector_t *R_PointInSubsector2(fixed_t x, fixed_t y, int node);
+        extern void Win32_RequestLevelWarp(int episode, int map);
+
+        if (gametic >= 8 && saturn_warp_map == 0) {
+            const tour9_stop_t *st = &s_tour9[s_t9_idx];
+            if (saturn_map != st->map) {
+                Win32_RequestLevelWarp(1, st->map);
+                s_t9_step = 0;
+            } else {
+                if (s_t9_step == 0) {
+                    P_UnsetThingPosition(players[0].mo);
+                    players[0].mo->x = st->x * FRACUNIT;
+                    players[0].mo->y = st->y * FRACUNIT;
+                    players[0].mo->angle = st->angle;
+                    subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
+                    if (ss) {
+                        sector_t *sec = SSEC_SECTOR(ss);
+                        players[0].mo->subsector = ss;
+                        players[0].mo->floorz = sec->floorheight;
+                        players[0].mo->ceilingz = sec->ceilingheight;
+                        players[0].mo->z = sec->floorheight;
+                        players[0].viewz = sec->floorheight + 41 * FRACUNIT;
+                    }
+                    Saturn_HW_ForceSkyRepaint();
+                    P_SetThingPosition(players[0].mo);
+                }
+                s_t9_step++;
+                if (s_t9_step == 6) {
+                    char fn[128];
+                    sprintf(fn, "tour9_e1m%d_wp%d_triple.bmp", st->map, st->wp);
+                    SaveFramebufferBMP(fn, s_combined_fb, COMBINED_W, COMBINED_H);
+                    printf("[TOUR9] %-16s | AvgErr:%6.2f%% MaxErr:%6.2f%% <0.1%%:%5.1f%% <1%%:%5.1f%% >=1%%:%5.1f%% | FPS:%4.1f VDP1:%5.1f%% Quads:%3d (W:%3d F:%3d Drop:%d Ref:%d) Bus:%3dKB\n",
+                           st->desc,
+                           g_telemetry.avg_err_pct, g_telemetry.max_err_pct,
+                           g_telemetry.ratio_lt_01, g_telemetry.ratio_lt_1, g_telemetry.ratio_gte_1,
+                           g_telemetry.fps, g_telemetry.vdp1_load_pct,
+                           g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads,
+                           g_telemetry.hud_diag.quads_dropped, g_telemetry.hud_diag.tex_refused,
+                           g_telemetry.bus_kb);
+                    fflush(stdout);
+                    s_t9_idx++;
+                    s_t9_step = 0;
+                    if (s_t9_idx >= (int)(sizeof(s_tour9) / sizeof(s_tour9[0]))) {
+                        printf("[TOUR9] Completed all 27 viewpoints across E1M1..E1M9!\n");
+                        fflush(stdout);
+                        exit(0);
+                    }
+                }
+            }
+        }
+    }
 
     /* Automated Level Journey Flight Tour */
     if (is_test == 20 && gametic >= 10 && !s_journey_active && s_journey_frame_count == 0) {

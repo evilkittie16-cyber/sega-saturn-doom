@@ -1,11 +1,17 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
+if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" (
+    call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x86
+) else (
+    call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
+)
 if errorlevel 1 (
     echo Error: Failed to init MSVC x86.
     exit /b 1
 )
+cd /d "%~dp0"
 
 set DOOM_DIR=C:\Users\charl\Desktop\DOOM-master\DOOM-master\linuxdoom-1.10
 set CFLAGS=/nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DWIN32=1 /D_WIN32=1 /D__WIN32__=1 /DNORMALUNIX /I. /I%DOOM_DIR% /FI dos_ref_compat.h /wd4244 /wd4267 /wd4018 /wd4146 /wd4005

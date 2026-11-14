@@ -108,19 +108,8 @@ extern byte *Saturn_SpritePatch(int s, int *w, int *h, int *lofs,
  * macros over slPriority(screen, n); the screen codes are #defines
  * (scnNBG0 = 1, scnSPR0..7 = -7..-2). Declared with plain short —
  * doomdef.h doesn't pull SGL's typedefs and the ABI is identical. */
-extern void slPriority(short screen, unsigned short num);
-/* SGL sprite-mode + synch APIs (SL_DEF.H:1047/1049/1835/1838). */
-extern void slSpriteColMode(unsigned short mode);
-extern void slSpriteType(unsigned short type);
-extern void slInitSynch(void);
-extern void slSynchFunction(void (*func)(void));
-#define SPR_PAL_RGB 1u                  /* SL_DEF.H:609 — mixed mode  */
-
-#define SCN_NBG0      1
-/* SGL's real sprite screen codes (SL_DEF.H:661-668) — scattered, not
- * a contiguous run. All 8 set to priority 5 so every sprite-type
- * pixel routes above NBG0 (3) whichever screen it lands on. */
-static const short scn_spr[8] = { -7, -8, -5, -6, -3, -4, -1, -2 };
+/* VDP2 priority + sprite control registers are written directly in
+ * v1_write_priority_regs() on every VBlank. */
 
 /* Set by Init: i_video.c's flip path then ORs JO_SPRITE_SCREEN into
  * its per-frame jo_set_displayed_screens — without it the SPR display
@@ -232,7 +221,7 @@ static int             v1_page_flush[2] = { 1, 1 };
 /* Preemptive flush: re-start a page whose free space dropped under this
  * when it comes back into use, so a growing working set doesn't hit a
  * mid-frame refusal (= missing walls/sprites for a frame). */
-#define V1_PAGE_LOWWATER  (48u * 1024u)
+#define V1_PAGE_LOWWATER  (96u * 1024u)
 /* diagnostics for the HUD row */
 int saturn_v1w_modr;            /* MODR readback (TVM/FCM/VBE bits)   */
 int saturn_v1w_edsr = 3;        /* EDSR at HUD paint time             */
@@ -528,7 +517,14 @@ static int v1_have_frame;
 static void v1_patch_slot3(void)
 {
     if (!v1_have_frame)
-        return;                 /* no list yet — leave SGL's END */
+        return;                 /* no list yet — leave END */
+    V1_VRAM(0x0000u + 0x02) = 0x0000u;      /* slot 0 LINK = 0 */
+    V1_VRAM(0x0000u + 0x00) = V1_CMD_SYSCLIP; /* slot 0 CTRL: sys clip (overwrite Jo's 0x9000 jump) */
+    V1_VRAM(0x0020u + 0x02) = 0x0000u;      /* slot 1 LINK = 0 */
+    V1_VRAM(0x0020u + 0x00) = V1_CMD_USERCLIP; /* slot 1 CTRL: user clip (overwrite Jo's 0x8000 END) */
+    V1_VRAM(0x0040u + 0x02) = 0x0000u;      /* slot 2 LINK = 0 */
+    V1_VRAM(0x0040u + 0x00) = 0x000Au;      /* slot 2 CTRL: local coord */
+    V1_VRAM(V1_SLOT3 + 0x02) = 0x0000u;     /* slot 3 LINK = 0 */
     V1_VRAM(V1_SLOT3 + 0x0C) = 16;          /* local XA = 16 (centered 320 view in 352 screen) */
     V1_VRAM(V1_SLOT3 + 0x0E) = 0;           /* local YA */
     V1_VRAM(V1_SLOT3 + 0x00) = 0x000Au;     /* CTRL: local coord */
@@ -553,25 +549,16 @@ static void v1_write_priority_regs(void)
      * the game has always displayed (these vblank writes never reached
      * the real registers before the 2026-09-07 base-address fix, so
      * Jo's init value is the known-good config). */
+    *(volatile unsigned short *)0x25F800E0u = 0x0020u;  /* SPCTL: Sprite Type 0 + Mixed Palette/RGB (bit 5) */
     *(volatile unsigned short *)0x25F800F0u = 0x0506u;  /* PRISA */
     *(volatile unsigned short *)0x25F800F2u = 0x0506u;  /* PRISB */
     *(volatile unsigned short *)0x25F800F4u = 0x0506u;  /* PRISC */
     *(volatile unsigned short *)0x25F800F6u = 0x0506u;  /* PRISD */
     /* PRINA (0x25F800F8, NBG0 = low byte / NBG1 = high — jo/sega_saturn.h:370):
      * NBG0 priority MUST DROP BELOW the sprite layer or the sprite screen
-     * sits UNDER the opaque NBG0 bitmap and no VDP1 pixel is ever visible.
-     * The slPriority(SCN_NBG0, 3) call cannot be trusted for this — the
-     * 2026-09-07 root cause proved SGL commits nothing in this config
-     * (no frame flow, no register rebuild), so Jo's init value PRINA =
-     * 0x607 (NBG0 = 7) would stay live forever: priority 7 over sprite
-     * 5 = the VDP1-FB canary rasterized (G/I rows nonzero) but never
-     * reached the screen. NBG1 = 6 keeps Jo's boot-stage layer above
-     * NBG0 while it is still displayed. (First attempt wrote 0x25F80080
-     * — the wrong register, jo header PRINA = 0x25F800F8.) */
+     * sits UNDER the opaque NBG0 bitmap and no VDP1 pixel is ever visible. */
     *(volatile unsigned short *)0x25F800F8u = 0x0603u;  /* PRINA  */
     *(volatile unsigned short *)0x25F800FCu = 0x0004u;  /* PRIR: RBG0 = 4 */
-    /* No VDP1 register writes here (2026-09-09): EWDR included — SGL
-     * owns the VDP1 register state end to end. */
 }
 
 extern void Saturn_VDP2_Plane_VBlank(void);
@@ -645,29 +632,11 @@ void Saturn_Vdp1Wall_Init(void)
         saturn_quiet_hud = 1;
     }
 
-    /* Sprite layer ABOVE NBG0 (NBG0 opaque since the letterbox fix).
-     * NBG1 is hidden every frame; its priority is irrelevant. */
-    slPriority(SCN_NBG0, 3);
-    {
-        int s;
-
-        for (s = 0; s < 8; s++)
-            slPriority(scn_spr[s], 5);
-    }
     saturn_v1w_spr = 1;
 
-    /* SGL sprite mode + the vblank slot-3 patch (saturn-libs pattern,
-     * 2026-09-07). slInitSynch arms SGL's synch-callback mechanism
-     * (Jo Engine never registers one — the slot is free);
-     * slSynchFunction then installs our callback, which re-patches
-     * slot 3 and refreshes the priority registers every vblank, after
-     * SGL's rebuild and before the auto-draw walks the list.
-     * Sprite type 0 + mixed palette/RGB: our palette pixels (MSB=0)
-     * take PR bits 15-14 = 0 -> sprite register 0 -> priority 5. */
-    slInitSynch();
-    slSynchFunction(v1_vblank_callback);
-    slSpriteType(0u);
-    slSpriteColMode(SPR_PAL_RGB);
+    /* Register v1_vblank_callback to re-patch VDP1 slot 3 and refresh VDP2
+     * priority/sprite registers on every VBlank. */
+    jo_core_add_vblank_callback(v1_vblank_callback);
     v1_write_priority_regs();
     /* Option A (168 lines default): X2 = 351 (44*8-1), Y2 = 167 (0x00A7), EWRR = 0x58A7.
      * Reclaims ~0.3 ms of VDP1 hardware auto-erase rasterizer time. */
@@ -687,6 +656,9 @@ void Saturn_Vdp1Wall_Init(void)
     {
         unsigned short base;
 
+        /* ARM THE STOP FIRST before enabling slots 0..3 walk into V1_USER0 */
+        V1_VRAM(V1_USER0 + 0x00) = 0x8000u;  /* CTRL: END            */
+        V1_VRAM(V1_USER0 + 0x02) = 0x0000;   /* LINK                 */
         /* slot 0: system clip (0,0)-(511,255) — the full VDP1 canvas.
          * FIXED 2026-09-09: was CTRL 0x0008 = USER clipping (low-nibble
          * types!) with the rect read from XC/YC = (0,0) — combined with
@@ -694,7 +666,6 @@ void Saturn_Vdp1Wall_Init(void)
          * drew into zero clip rects. System clip = 0x0009, rect
          * (0,0) .. XC/YC, bottom-right written at C (and B, harmless). */
         base = 0x0000u;
-        V1_VRAM(base + 0x00) = V1_CMD_SYSCLIP;
         V1_VRAM(base + 0x02) = 0x0000;
         V1_VRAM(base + 0x0C) = 0;
         V1_VRAM(base + 0x0E) = 0;
@@ -702,37 +673,21 @@ void Saturn_Vdp1Wall_Init(void)
         V1_VRAM(base + 0x12) = 255;
         V1_VRAM(base + 0x14) = 511;     /* XC: system clip rect      */
         V1_VRAM(base + 0x16) = 255;     /*  = (0,0)..(511,255)       */
+        V1_VRAM(base + 0x00) = V1_CMD_SYSCLIP;
         /* slot 1: user clip = full 3D view (rows 0..191, cols 16..335) */
         v1_write_clip(0x0020u, 16, 0, 319 + 16, 191);
         /* slot 2: local coord (16,0) — 320 view centered in 352 screen */
         base = 0x0040u;
+        V1_VRAM(base + 0x02) = 0x0000;
         V1_VRAM(base + 0x0C) = 16;
         V1_VRAM(base + 0x0E) = 0;
         V1_VRAM(base + 0x00) = 0x000Au;
         /* slot 3: local coord too (the callback re-patches it)      */
         base = 0x0060u;
+        V1_VRAM(base + 0x02) = 0x0000;
         V1_VRAM(base + 0x0C) = 16;
         V1_VRAM(base + 0x0E) = 0;
         V1_VRAM(base + 0x00) = 0x000Au;
-        /* REAL-HW BOOT WEDGE ROOT CAUSE (2026-09-09): v1_have_frame=1
-         * below means from the FIRST vblank after this Init the
-         * callback patches SGL's slot-3 END into LOCAL_COORD and the
-         * auto-draw walk runs PAST slot 3 into our user region — which
-         * on the title/menu path is EMPTY (quads never commit there;
-         * v1_write_commands only runs when v1q_count > 0, so its END
-         * marker at slot 4+N is never written either). The VDP1 then
-         * executed UNWRITTEN power-up VRAM as commands: real HW drew
-         * random polygons over the cyan STARTING fill (the dithered
-         * curved garbage, photo 20260909_072106 — the sprite layer
-         * shows the VDP1 FB at priority 5 above NBG0); Kronos
-         * zero-fills VRAM so the same walk executed degenerate
-         * zero-size draws and looked innocent. ARM THE STOP: write the
-         * END marker at V1_USER0 now, so the walk terminates at an
-         * empty list until the first quad commit overwrites slot 4
-         * (v1_write_commands then writes its own END after the quads,
-         * as always). */
-        V1_VRAM(V1_USER0 + 0x00) = 0x8000u;  /* CTRL: END            */
-        V1_VRAM(V1_USER0 + 0x02) = 0x0000;   /* LINK                 */
         v1_have_frame = 1;
     }
 

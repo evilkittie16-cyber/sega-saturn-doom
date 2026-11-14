@@ -372,6 +372,23 @@ DOS_EXPORT void DOS_SyncMobjs(const dos_sync_mobj_t *mobjs, int count)
     }
 }
 
+typedef struct {
+    int floorheight;
+    int ceilingheight;
+    short lightlevel;
+} dos_sync_sector_t;
+
+DOS_EXPORT void DOS_SyncSectors(const dos_sync_sector_t *sec_list, int count)
+{
+    if (!s_initialized || !sectors || numsectors <= 0 || !sec_list) return;
+    if (count > numsectors) count = numsectors;
+    for (int i = 0; i < count; i++) {
+        sectors[i].floorheight   = sec_list[i].floorheight;
+        sectors[i].ceilingheight = sec_list[i].ceilingheight;
+        sectors[i].lightlevel    = sec_list[i].lightlevel;
+    }
+}
+
 DOS_EXPORT void DOS_RenderFrame(uint32_t *out_rgba_352x224)
 {
     if (!s_initialized || !s_playpal || !out_rgba_352x224) return;

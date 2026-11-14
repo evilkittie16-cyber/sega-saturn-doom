@@ -7,7 +7,11 @@ echo  Building SEGA SATURN DOOM - Standalone Windows Port
 echo  (Hardware-Accurate VDP1 Quad Rasterizer via 5thPlanet)
 echo =========================================================
 
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
+if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" (
+    call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x86
+) else (
+    call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
+)
 if errorlevel 1 (
     echo Error: Failed to initialize MSVC x86 environment.
     exit /b 1

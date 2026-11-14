@@ -89,11 +89,13 @@ HW_ALWAYS_INLINE int32_t HW_MulsW_PairAdd(int a, int b, int c, int d, int32_t e)
 #endif
 }
 
-#define SATURN_OCLUT_ENTRIES     2048u
-#define SATURN_OCLUT_FAR_OFFSET  5120u
-#define SATURN_OCLUT_FAR_ENTRIES 1024u
+#define SATURN_OCLUT_ENTRIES       2048u
+#define SATURN_OCLUT_FAR_OFFSET    2048u
+#define SATURN_OCLUT_FAR_ENTRIES   1024u
+#define SATURN_OCLUT_TOTAL_ENTRIES (SATURN_OCLUT_ENTRIES + SATURN_OCLUT_FAR_ENTRIES)
 #define SATURN_DIVLUT_ADDR SATURN_WRAM_L_DIVLUT_ADDR
-#define SATURN_OCLUT ((const unsigned int *)SATURN_WRAM_L_DIVLUT_ADDR)
+extern unsigned int saturn_master_oclut[SATURN_OCLUT_TOTAL_ENTRIES];
+#define SATURN_OCLUT ((const unsigned int *)saturn_master_oclut)
 #define HW_FAST_SKY_ADDR   ((uint8_t *)SATURN_WRAM_L_SKY_ADDR)
 static unsigned int hw_last_sky_angle = 0xFFFFFFFFu;
 static int          hw_last_sky_cy    = -1;
@@ -107,20 +109,19 @@ static void HW_Divlut_Init(void)
         return;
     initialized = 1;
 
-    /* SATURN_WRAM_L_DIVLUT_ADDR layout (32 KB = 0x00238000..0x0023FFFF):
-     * - [0x0000..0x1FFF] Tier 1 [0..2047]:     exact 1-unit reciprocal 10485760 / d for d in [0..2047]
-     * - [0x2000..0x4FFF] subsectors:           up to 1536 subsectors (12 KB)
-     * - [0x5000..0x5FFF] Tier 2 [5120..6143]:  8-unit step reciprocal 10485760 / (k << 3) covering d up to 8191
-     * - [0x6000..0x7FFF] validcount:           line validcount table (8 KB)
-     * Eliminates all HW_FastDiv_Slow function calls and register clobbers across the engine! */
-    volatile unsigned int *lut = (volatile unsigned int *)SATURN_WRAM_L_DIVLUT_UNCACHED;
-    lut[0] = 10485760u / HW_NEAR_Z_UNITS;
-    lut[1] = 10485760u / HW_NEAR_Z_UNITS;
+    /* 32-bit WRAM-H reciprocal LUT (shared by Master and Slave SH-2 with 4-cycle SDRAM burst fills) */
+    unsigned int r_near = 10485760u / HW_NEAR_Z_UNITS;
+    saturn_master_oclut[0] = r_near;
+    saturn_master_oclut[1] = r_near;
     for (unsigned int d = 2; d < SATURN_OCLUT_ENTRIES; d++)
-        lut[d] = 10485760u / d;
-    lut[SATURN_OCLUT_FAR_OFFSET] = 10485760u / HW_NEAR_Z_UNITS;
+    {
+        saturn_master_oclut[d] = 10485760u / d;
+    }
+    saturn_master_oclut[SATURN_OCLUT_FAR_OFFSET] = r_near;
     for (unsigned int k = 1; k < SATURN_OCLUT_FAR_ENTRIES; k++)
-        lut[SATURN_OCLUT_FAR_OFFSET + k] = 10485760u / (k << 3);
+    {
+        saturn_master_oclut[SATURN_OCLUT_FAR_OFFSET + k] = 10485760u / (k << 3);
+    }
 }
 
 /* SH-2 Hardware 32x32->64 bit MAC multiplier with 16.16 fixed-point extraction:
@@ -215,13 +216,13 @@ HW_ALWAYS_INLINE void HW_ProjXPair(int cx1, int s1, int cx2, int s2, int view_cx
     int r1 = view_cx, r2, tmp;
     __asm__(
         "dmuls.l %3, %4 \n\t"   /* Start m1 = cx1 * s1 */
-        "sts     mach, %2 \n\t" /* tmp = hi(m1) */
+        "mov     %0, %1 \n\t"   /* px2 = view_cx (hides latency of m1!) */
+        "sts     mach, %2 \n\t" /* tmp = hi(m1) (0 STALLS!) */
         "dmuls.l %5, %6 \n\t"   /* Start m2 = cx2 * s2 */
-        "mov     %0, %1 \n\t"   /* px2 = view_cx (hides 1st cycle latency of m2!) */
-        "add     %2, %0 \n\t"   /* px1 = view_cx + tmp (hides 2nd cycle latency of m2!) */
+        "add     %2, %0 \n\t"   /* px1 = view_cx + tmp (hides latency of m2!) */
         "sts     mach, %2 \n\t" /* tmp = hi(m2) */
         "add     %2, %1 \n\t"   /* px2 = view_cx + tmp */
-        : "+r"(r1), "=r"(r2), "=&r"(tmp)
+        : "+r"(r1), "=&r"(r2), "=&r"(tmp)
         : "r"(cx1), "r"(s1), "r"(cx2), "r"(s2)
         : "mach", "macl"
     );
@@ -320,39 +321,76 @@ HW_ALWAYS_INLINE void ProjectPillar_2D_16(int dx, int dy, int vcos, int vsin,
 #endif
 }
 
-/* 1-cycle 16x16->32 muls.w projection for integer map-space offsets (obj_dx, obj_dy in [-16384, 16384]) */
-HW_ALWAYS_INLINE void ProjectMapVertex_2D(int obj_dx, int obj_dy, int vcos, int vsin,
-                                          fixed_t cz_orig, fixed_t cx_orig,
-                                          fixed_t *out_cz, fixed_t *out_cx)
+/* Zero-push, 6-register, 0-stall 16x16->32 muls.w pillar transform reading hw_frust directly via @f_ptr+ */
+HW_ALWAYS_INLINE void ProjectPillar_2D_16_Frust(int pdx, int pdy, fixed_t *out_cz, fixed_t *out_cx)
 {
 #ifndef SATURN_WIN32
-    int cz, cx, tmp;
+    int cz, cx = pdx, vcos_tmp, vsin_tmp;
+    const char *f_ptr = (const char *)&hw_frust.Nx;
     __asm__(
-        "muls.w  %3, %6 \n\t"   /* MAC = obj_dx * vsin */
-        "sts     macl, %0 \n\t"
-        "muls.w  %4, %5 \n\t"   /* MAC = obj_dy * vcos */
-        "sts     macl, %2 \n\t"
-        "muls.w  %3, %5 \n\t"   /* MAC = obj_dx * vcos */
-        "sub     %2, %0 \n\t"   /* cx = obj_dx*vsin - obj_dy*vcos */
-        "sts     macl, %2 \n\t"
-        "muls.w  %4, %6 \n\t"   /* MAC = obj_dy * vsin */
-        "shll2   %0     \n\t"
-        "sts     macl, %1 \n\t"
-        "shll2   %0     \n\t"   /* cx <<= 4 */
-        "add     %2, %1 \n\t"   /* cz = obj_dx*vcos + obj_dy*vsin */
-        "sub     %8, %0 \n\t"   /* cx -= cx_orig */
-        "shll2   %1     \n\t"
-        "shll2   %1     \n\t"   /* cz <<= 4 */
-        "sub     %7, %1 \n\t"   /* cz -= cz_orig */
-        : "=&r"(cx), "=&r"(cz), "=&r"(tmp)
-        : "r"(obj_dx), "r"(obj_dy), "r"(vcos), "r"(vsin), "r"(cz_orig), "r"(cx_orig)
+        "mov.w  @%4+, %2 \n\t"      /* %2 = Nx (vcos), %4 = &Ny */
+        "muls.w %1, %2 \n\t"        /* 1. MAC = pdx * vcos */
+        "mov.w  @%4+, %3 \n\t"      /*    [slot] %3 = Ny (vsin), %4 = &Lx (offset 16) */
+        "sts    macl, %0 \n\t"      /* %0 = pdx * vcos (0 stall!) */
+        "muls.w %1, %3 \n\t"        /* 2. MAC = pdx * vsin (%1 pdx is now DEAD!) */
+        "mov.l  @(28,%4), %1 \n\t"  /*    [slot] %1 = cz_origin */
+        "sub    %1, %0 \n\t"        /*    [slot] %0 = pdx * vcos - cz_origin */
+        "sts    macl, %1 \n\t"      /* %1 = pdx * vsin (0 stall!) */
+        "muls.w %5, %2 \n\t"        /* 3. MAC = pdy * vcos (%2 vcos is now DEAD!) */
+        "mov.l  @(32,%4), %2 \n\t"  /*    [slot] %2 = cx_origin */
+        "sub    %2, %1 \n\t"        /*    [slot] %1 = pdx * vsin - cx_origin */
+        "sts    macl, %2 \n\t"      /* %2 = pdy * vcos (0 stall!) */
+        "muls.w %5, %3 \n\t"        /* 4. MAC = pdy * vsin */
+        "sub    %2, %1 \n\t"        /*    [slot] %1 = pdx * vsin - cx_origin - pdy * vcos = cx */
+        "sts    macl, %2 \n\t"      /* %2 = pdy * vsin (0 stall!) */
+        "add    %2, %0 \n\t"        /* %0 = pdx * vcos - cz_origin + pdy * vsin = cz */
+        : "=&r"(cz), "+r"(cx), "=&r"(vcos_tmp), "=&r"(vsin_tmp), "+r"(f_ptr)
+        : "r"(pdy)
         : "macl"
     );
     *out_cz = cz;
     *out_cx = cx;
 #else
-    *out_cz = (fixed_t)((((int32_t)(int16_t)obj_dx * (int16_t)vcos + (int32_t)(int16_t)obj_dy * (int16_t)vsin) << 4) - cz_orig);
-    *out_cx = (fixed_t)((((int32_t)(int16_t)obj_dx * (int16_t)vsin - (int32_t)(int16_t)obj_dy * (int16_t)vcos) << 4) - cx_orig);
+    ProjectPillar_2D_16(pdx, pdy, hw_bbox_Nx, hw_bbox_Ny, hw_frust.cz_origin, hw_frust.cx_origin, out_cz, out_cx);
+#endif
+}
+
+/* 6-register 16x16->32 muls.w projection for integer map-space offsets (obj_dx, obj_dy in [-16384, 16384]) */
+HW_ALWAYS_INLINE void ProjectMapVertex_2D_Frust(int obj_dx, int obj_dy, fixed_t *out_cz, fixed_t *out_cx)
+{
+#ifndef SATURN_WIN32
+    int cz, cx = obj_dx, vcos_tmp, vsin_tmp;
+    const char *f_ptr = (const char *)&hw_frust.Nx;
+    __asm__(
+        "mov.w  @%4+, %2 \n\t"      /* %2 = Nx (vcos), %4 = &Ny */
+        "muls.w %1, %2 \n\t"        /* 1. MAC = dx * vcos */
+        "mov.w  @%4+, %3 \n\t"      /*    [slot] %3 = Ny (vsin), %4 = &Lx (offset 16) */
+        "sts    macl, %0 \n\t"      /* %0 = dx * vcos (0 stall!) */
+        "muls.w %1, %3 \n\t"        /* 2. MAC = dx * vsin (%1 dx is now DEAD!) */
+        "sts    macl, %1 \n\t"      /* %1 = dx * vsin */
+        "muls.w %5, %2 \n\t"        /* 3. MAC = dy * vcos (%2 vcos is now DEAD!) */
+        "sts    macl, %2 \n\t"      /* %2 = dy * vcos */
+        "muls.w %5, %3 \n\t"        /* 4. MAC = dy * vsin */
+        "sub    %2, %1 \n\t"        /*    [slot] %1 = dx * vsin - dy * vcos */
+        "shll2  %1 \n\t"            /*    [slot] */
+        "sts    macl, %2 \n\t"      /* %2 = dy * vsin (0 stall!) */
+        "shll2  %1 \n\t"            /* %1 = (dx * vsin - dy * vcos) << 4 */
+        "mov.l  @(32,%4), %3 \n\t"  /* %3 = cx_origin */
+        "add    %2, %0 \n\t"        /* %0 = dx * vcos + dy * vsin */
+        "sub    %3, %1 \n\t"        /* %1 = cx */
+        "shll2  %0 \n\t"
+        "mov.l  @(28,%4), %2 \n\t"  /* %2 = cz_origin */
+        "shll2  %0 \n\t"            /* %0 = (dx * vcos + dy * vsin) << 4 */
+        "sub    %2, %0 \n\t"        /* %0 = cz */
+        : "=&r"(cz), "+r"(cx), "=&r"(vcos_tmp), "=&r"(vsin_tmp), "+r"(f_ptr)
+        : "r"(obj_dy)
+        : "macl"
+    );
+    *out_cz = cz;
+    *out_cx = cx;
+#else
+    *out_cz = (fixed_t)((((int32_t)(int16_t)obj_dx * (int16_t)hw_bbox_Nx + (int32_t)(int16_t)obj_dy * (int16_t)hw_bbox_Ny) << 4) - hw_frust.cz_origin);
+    *out_cx = (fixed_t)((((int32_t)(int16_t)obj_dx * (int16_t)hw_bbox_Ny - (int32_t)(int16_t)obj_dy * (int16_t)hw_bbox_Nx) << 4) - hw_frust.cx_origin);
 #endif
 }
 
@@ -394,13 +432,13 @@ HW_ALWAYS_INLINE void HW_ProjYPair(int cy, int dz1, int s1, int dz2, int s2,
     int r1 = cy, r2, tmp;
     __asm__(
         "dmuls.l %3, %4 \n\t"   /* Start m1 = dz1 * s1 */
-        "sts     mach, %2 \n\t" /* tmp = mach(m1) */
+        "mov     %0, %1 \n\t"   /* %1 = cy (hides latency of m1!) */
+        "sts     mach, %2 \n\t" /* tmp = mach(m1) (0 STALLS!) */
         "dmuls.l %5, %6 \n\t"   /* Start m2 = dz2 * s2 */
-        "mov     %0, %1 \n\t"   /* %1 = cy (hides 1st cycle latency of m2) */
-        "sub     %2, %0 \n\t"   /* %0 = cy - tmp (hides 2nd cycle latency of m2!) */
-        "sts     mach, %2 \n\t" /* tmp = mach(m2) (0 STALLS!) */
+        "sub     %2, %0 \n\t"   /* %0 = cy - tmp (hides latency of m2!) */
+        "sts     mach, %2 \n\t" /* tmp = mach(m2) */
         "sub     %2, %1 \n\t"   /* %1 = cy - tmp */
-        : "+r"(r1), "=r"(r2), "=&r"(tmp)
+        : "+r"(r1), "=&r"(r2), "=&r"(tmp)
         : "r"(dz1), "r"(s1), "r"(dz2), "r"(s2)
         : "mach", "macl"
     );
@@ -409,6 +447,45 @@ HW_ALWAYS_INLINE void HW_ProjYPair(int cy, int dz1, int s1, int dz2, int s2,
 #else
     *out1 = cy - (int)(((int64_t)dz1 * (int64_t)s1) >> 32);
     *out2 = cy - (int)(((int64_t)dz2 * (int64_t)s2) >> 32);
+#endif
+}
+
+/* Four Y projections for wall seg top/bottom at endpoints A and B using only 6 registers */
+HW_ALWAYS_INLINE void HW_ProjYQuad(int cy, int dz_top, int dz_bot, int s_A, int s_B,
+                                   int *ya0, int *ya1, int *yb0, int *yb1)
+{
+#ifndef SATURN_WIN32
+    int r_ya0 = s_A, r_ya1 = dz_top, r_yb0 = s_B, r_yb1 = dz_bot, tmp;
+    __asm__(
+        "dmuls.l %1, %0 \n\t"   /* 1. m1 = dz_top * s_A */
+        "sts     mach, %4 \n\t" /* tmp = hi(dz_top * s_A) */
+        "dmuls.l %3, %0 \n\t"   /* 2. m2 = dz_bot * s_A (%0 s_A now dead) */
+        "mov     %5, %0 \n\t"   /*    [slot 1] r_ya0 = cy */
+        "sub     %4, %0 \n\t"   /*    [slot 2] r_ya0 = cy - hi(dz_top * s_A) */
+        "sts     mach, %4 \n\t" /* tmp = hi(dz_bot * s_A) (0 STALLS!) */
+        "dmuls.l %1, %2 \n\t"   /* 3. m3 = dz_top * s_B (%1 dz_top now dead) */
+        "mov     %5, %1 \n\t"   /*    [slot 1] r_ya1 = cy */
+        "sub     %4, %1 \n\t"   /*    [slot 2] r_ya1 = cy - hi(dz_bot * s_A) */
+        "sts     mach, %4 \n\t" /* tmp = hi(dz_top * s_B) (0 STALLS!) */
+        "dmuls.l %3, %2 \n\t"   /* 4. m4 = dz_bot * s_B (%2 s_B, %3 dz_bot now dead) */
+        "mov     %5, %2 \n\t"   /*    [slot 1] r_yb0 = cy */
+        "sub     %4, %2 \n\t"   /*    [slot 2] r_yb0 = cy - hi(dz_top * s_B) */
+        "sts     mach, %4 \n\t" /* tmp = hi(dz_bot * s_B) (0 STALLS!) */
+        "mov     %5, %3 \n\t"   /* r_yb1 = cy */
+        "sub     %4, %3 \n\t"   /* r_yb1 = cy - hi(dz_bot * s_B) */
+        : "+r"(r_ya0), "+r"(r_ya1), "+r"(r_yb0), "+r"(r_yb1), "=&r"(tmp)
+        : "r"(cy)
+        : "mach", "macl"
+    );
+    *ya0 = r_ya0;
+    *ya1 = r_ya1;
+    *yb0 = r_yb0;
+    *yb1 = r_yb1;
+#else
+    *ya0 = cy - (int)(((int64_t)dz_top * (int64_t)s_A) >> 32);
+    *ya1 = cy - (int)(((int64_t)dz_bot * (int64_t)s_A) >> 32);
+    *yb0 = cy - (int)(((int64_t)dz_top * (int64_t)s_B) >> 32);
+    *yb1 = cy - (int)(((int64_t)dz_bot * (int64_t)s_B) >> 32);
 #endif
 }
 
@@ -558,9 +635,10 @@ static HW_NOINLINE HW_COLD_OS void HW_WallXYClamp_Slow(int *c)
 
 #define HW_WALL_XYCLAMP(xa, xb, ya0, yb0, ya1, yb1)                                        \
     do {                                                                                   \
-        if (__builtin_expect(((xa) < -500) | ((xb) > 500) |                                \
-                             ((((unsigned int)((ya1) - (ya0)) |                            \
-                                (unsigned int)((yb1) - (yb0))) > 1023u) |                  \
+        if (__builtin_expect(((((unsigned int)((xa) + 500) |                               \
+                                (unsigned int)(500 - (xb)) |                               \
+                                (unsigned int)((ya1) - (ya0)) |                            \
+                                (unsigned int)((yb1) - (yb0))) > 1023u) ||                 \
                               HW_ANY_OUT1024(ya0, yb0, ya1, yb1)), 0))                     \
         {                                                                                  \
             hw_wall_coord_tmp[0] = (xa);  hw_wall_coord_tmp[1] = (xb);                     \
@@ -574,6 +652,14 @@ static HW_NOINLINE HW_COLD_OS void HW_WallXYClamp_Slow(int *c)
     } while (0)
 
 HW_ALWAYS_INLINE int HW_FastDiv(fixed_t cz)
+{
+    unsigned int dist = (unsigned int)cz >> FRACBITS;
+    if (__builtin_expect(dist >= SATURN_OCLUT_ENTRIES, 0))
+        dist = SATURN_OCLUT_FAR_OFFSET + ((dist >> 3) & (SATURN_OCLUT_FAR_ENTRIES - 1u));
+    return (int)saturn_master_oclut[dist];
+}
+
+HW_ALWAYS_INLINE int HW_SlaveFastDiv(fixed_t cz)
 {
     unsigned int dist = (unsigned int)cz >> FRACBITS;
     if (__builtin_expect(dist >= SATURN_OCLUT_ENTRIES, 0))
@@ -649,6 +735,49 @@ HW_ALWAYS_INLINE void HW_ProjPerspStrip_SH2(
     *out_px  = HW_ProjX(cx, scale, HW_VIEW_CX);
     *out_yb0 = vcy_top - HW_MulHigh(dz_top, scale);
     *out_yb1 = vcy_bot - HW_MulHigh(dz_bot, scale);
+#endif
+}
+
+/* Zero-stall 3-multiply SH-2 MAC projection + swap.w/xtrct VDP1 vertex packer for perspective wall strips */
+HW_ALWAYS_INLINE void HW_ProjPackPerspStripRight(
+    fixed_t cx, int dz_top, int dz_bot, int scale,
+    int vcy_top, int vcy_bot,
+    int *out_px, uint32_t *out_w4, uint32_t *out_w5)
+{
+#ifndef SATURN_WIN32
+    int px;
+    uint32_t w4, w5, tmp;
+    __asm__(
+        "dmuls.l %4, %7 \n\t"   /* M1: cx * scale */
+        "mov     %8, %1 \n\t"   /* [M1 slot 1] w4 = vcy_top */
+        "mov     %9, %2 \n\t"   /* [M1 slot 2] w5 = vcy_bot */
+        "sts     mach, %0 \n\t" /* px = M1_hi (0 STALLS) */
+        "dmuls.l %5, %7 \n\t"   /* M2: dz_top * scale */
+        "add     #80, %0 \n\t"  /* [M2 slot 1] px += 80 */
+        "add     #80, %0 \n\t"  /* [M2 slot 2] px += 80 (HW_VIEW_CX = 160) */
+        "sts     mach, %3 \n\t" /* tmp = M2_hi (0 STALLS) */
+        "dmuls.l %6, %7 \n\t"   /* M3: dz_bot * scale */
+        "sub     %3, %1 \n\t"   /* [M3 slot 1] yb0 = vcy_top - M2_hi */
+        "swap.w  %1, %1 \n\t"   /* [M3 slot 2] w4 = (yb0 << 16) | ... */
+        "sts     mach, %3 \n\t" /* tmp = M3_hi (0 STALLS) */
+        "xtrct   %0, %1 \n\t"   /* w4 = (px << 16) | (uint16_t)yb0 */
+        "sub     %3, %2 \n\t"   /* yb1 = vcy_bot - M3_hi */
+        "swap.w  %2, %2 \n\t"   /* w5 = (yb1 << 16) | ... */
+        "xtrct   %0, %2 \n\t"   /* w5 = (px << 16) | (uint16_t)yb1 */
+        : "=&r"(px), "=&r"(w4), "=&r"(w5), "=&r"(tmp)
+        : "r"(cx), "r"(dz_top), "r"(dz_bot), "r"(scale), "r"(vcy_top), "r"(vcy_bot)
+        : "mach", "macl"
+    );
+    *out_px = px;
+    *out_w4 = w4;
+    *out_w5 = w5;
+#else
+    int px  = HW_ProjX(cx, scale, HW_VIEW_CX);
+    int yb0 = vcy_top - HW_MulHigh(dz_top, scale);
+    int yb1 = vcy_bot - HW_MulHigh(dz_bot, scale);
+    *out_px = px;
+    *out_w4 = ((uint32_t)px << 16) | (uint16_t)yb0;
+    *out_w5 = ((uint32_t)px << 16) | (uint16_t)yb1;
 #endif
 }
 

@@ -321,9 +321,14 @@ void R_InitTextures (void)
 #endif
 
 /* */
-/* translation table for global animation */
+/* translation table for global animation (static 32-bit WRAM-H fast arrays avoid 16-bit CS0 Cart RAM stalls) */
 /* */
-	texturetranslation = Z_Malloc ((numtextures+1)*sizeof(*texturetranslation), PU_STATIC);
+	static __attribute__((aligned(16))) uint8_t hw_wram_h_textrans[256];
+
+	if (numtextures + 1 <= (int)sizeof(hw_wram_h_textrans))
+		texturetranslation = hw_wram_h_textrans;
+	else
+		texturetranslation = Z_Malloc ((numtextures+1)*sizeof(*texturetranslation), PU_STATIC);
 	for (i=0 ; i<numtextures ; i++)
 		texturetranslation[i] = i;	
 }
@@ -339,6 +344,7 @@ void R_InitTextures (void)
 
 void R_InitFlats (void)
 {
+	static __attribute__((aligned(16))) uint8_t hw_wram_h_flattrans[128];
 	int		i;
 	int 	lastflat;
 
@@ -347,7 +353,10 @@ void R_InitFlats (void)
 	numflats = lastflat - firstflat + 1;
 
 /* translation table for global animation */
-	flattranslation = Z_Malloc ((numflats+1)*sizeof(*flattranslation), PU_STATIC);
+	if (numflats + 1 <= (int)sizeof(hw_wram_h_flattrans))
+		flattranslation = hw_wram_h_flattrans;
+	else
+		flattranslation = Z_Malloc ((numflats+1)*sizeof(*flattranslation), PU_STATIC);
 	for (i=0 ; i<numflats ; i++)
 		flattranslation[i] = i;
 

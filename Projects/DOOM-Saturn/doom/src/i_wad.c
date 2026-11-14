@@ -51,6 +51,7 @@
 #include "i_wad.h"
 #include "saturn_cache.h"
 #include "saturn_dsp.h"
+#include "saturn_memmap.h"
 
 /* FRT tick read (SH-2 Free-Running Timer, TCNT @ 0xFFFFFE12, phi/8 â‰ˆ
  * 3.6 MHz) â€” bounds the per-frame background fill so the main loop
@@ -227,10 +228,9 @@ int            saturn_wad_open = 0;
 unsigned       saturn_wad_size = 0;
 int            saturn_cd_seek_pos = 0;
 
-/* The IWAD's GFS handle â€” ONE GFS_Open() at startup, kept for the whole
- * session. See the direct-GFS comment block above saturn_open_iwad() for
- * why the IWAD never goes through Jo's jo_fs_* wrapper. */
-static GfsHn   saturn_wad_gfs;
+/* The IWAD's file handle — opened once at startup, kept for the whole
+ * session. */
+static void *saturn_wad_gfs = JO_NULL;
 
 /* One aligned staging sector: every GFS_Fread lands here and is memcpy'd
  * to the caller's destination, so destinations never need DMA alignment
@@ -314,7 +314,7 @@ static void saturn_stage_trip_now(void)
 
 /* File id the IWAD handle was opened with â€” needed by the sequential-skip
  * fallback, which may re-open the file to rewind to position 0. */
-static Sint32 saturn_wad_fid = -1;
+static int saturn_wad_fid = -1;
 
 /* Sector count of the opened IWAD, straight from GFS_GetFileSize. */
 static unsigned int saturn_wad_nsct = 0;
@@ -353,8 +353,15 @@ static unsigned char *saturn_iwad_heap = NULL;
 static int            saturn_cd_pre_read_pos = 0;
 
 /* The 64 KB scratch buffer used by the CD streaming path. Returned by
- * I_GetCDFileBuffer when the requested lump is not in cart. */
-static byte saturn_cd_scratch[64 * 1024];
+ * I_GetCDFileBuffer when the requested lump is not in cart.
+ * Placed in the reserved top 64 KB of WRAM-L (0x002F0000..0x002FFFFF)
+ * on Saturn to free 64 KB of 32-bit WRAM-H .bss for hot level geometry. */
+#define SATURN_CD_SCRATCH_SIZE (64 * 1024u)
+#ifndef SATURN_WIN32
+#define saturn_cd_scratch ((byte *)(SATURN_WRAM_L_BASE + 0x000F0000u))
+#else
+static byte saturn_cd_scratch[SATURN_CD_SCRATCH_SIZE];
+#endif
 
 /* Background cart-fill queue. Each pending entry is (cd_offset,
  * cart_offset, lump_size, lump_index). The VBlank callback drains
@@ -987,26 +994,13 @@ void Saturn_GsubStamp(unsigned int sub)
     (void)sub;
 }
 
-static void saturn_gfs_setup(GfsHn gfs)
+static void saturn_gfs_setup(void *gfs)
 {
-    /* r65 site 8: these three SGL config calls were unstamped â€” a
-     * wedge inside one showed no P/W row at all.
-     * r80: site 8 SPLIT â€” 8 = GFS_SetTmode, 12 = GFS_SetReadPara,
-     * 13 = GFS_SetTransPara. Four boots of P=8 name the GROUP; the
-     * split names the primitive (P frozen at 8/12/13 = that call
-     * never returned). r81: GSUB stamps ride along (4/5/6). */
-    unsigned int t0 = saturn_vbl_count;
+    (void)gfs;
     Saturn_GsubStamp(4);
-    saturn_gfs_site = 8;
-    GFS_SetTmode(gfs, GFS_TMODE_CPU);
     Saturn_GsubStamp(5);
-    saturn_gfs_site = 12;
-    GFS_SetReadPara(gfs, 8);
     Saturn_GsubStamp(6);
-    saturn_gfs_site = 13;
-    GFS_SetTransPara(gfs, 8);
     Saturn_GsubStamp(7);
-    saturn_prof_gfs_vbl += saturn_vbl_count - t0;   /* r66 */
     saturn_gfs_site = 0;
 }
 
@@ -1019,19 +1013,13 @@ static int saturn_gfs_read_sector(void)
         saturn_io_diag_stage = 2;
         t0 = saturn_vbl_count;                          /* r66 */
         saturn_gfs_site = 1;
-        saturn_io_diag_fread = GFS_Fread(saturn_wad_gfs, 1,
+        saturn_io_diag_fread = __jo_fs_read_sectors(saturn_wad_gfs, 1,
                 saturn_sect_dest(), 2048);
         saturn_prof_gfs_vbl += saturn_vbl_count - t0;   /* r66 */
         saturn_gfs_site = 0;
         saturn_io_diag_freads++;
         if (saturn_io_diag_fread > 0)
         {
-            /* v5.13 staging tripwire (replaces the r71 purge â€”
-             * saturn_oc_purge is a permanent no-op): GFS_TMODE_CPU
-             * makes this an SH-2 CPU copy, so the cached stage should
-             * already be coherent; a cached-vs-uncached mismatch on
-             * word 0 means SGL DMA'd behind the cache â€” demote to the
-             * uncached mirrors permanently. */
             if (!saturn_stage_probe((unsigned int)saturn_sector_buf))
                 saturn_stage_trip_now();
             saturn_io_diag_oks++;
@@ -1043,17 +1031,11 @@ static int saturn_gfs_read_sector(void)
     return -1;
 }
 
-/* r71: saturn_gfs_fread_multi (multi-sector NwFread INTO the cart, the
- * G_InitNew-pread write-burst path) is deleted â€” under the SCU manual
- * no mechanism may write the A-bus except the DSP's own DMA, and
- * multi-sector reads now belong to the WRAM-H staged batch in
- * fill_txn_issue + the DSP engine. saturn_direct_reads_ok survives as
- * the async-Nw enable for the fill machinery (fill_txn_issue lands
- * every batch in the WRAM stage, never the cart). */
-static int saturn_direct_reads_ok = 1;   /* async Nw batch path enabled */
+/* Jo Engine v2026.1 uses synchronous sector reads via __jo_fs_read_sectors. */
+static int saturn_direct_reads_ok = 0;
 
 /* Walk forward to `sector` with staged sector reads (data discarded).
- * If `reopen` is set, first re-open the file (position 0) â€” used when
+ * If `reopen` is set, first re-open the file (position 0) — used when
  * the current position is past the target or the handle is suspected
  * wedged. Returns 0 / -1. */
 static int saturn_walk_to_sector(unsigned int sector, int reopen)
@@ -1062,8 +1044,8 @@ static int saturn_walk_to_sector(unsigned int sector, int reopen)
     if (reopen)
     {
         saturn_gfs_site = 6;
-        GFS_Close(saturn_wad_gfs);
-        saturn_wad_gfs = GFS_Open(saturn_wad_fid);
+        __jo_fs_close(saturn_wad_gfs);
+        saturn_wad_gfs = __jo_fs_open(saturn_wad_fid);
         saturn_gfs_site = 0;
         if (saturn_wad_gfs == JO_NULL)
             return -1;
@@ -1151,16 +1133,16 @@ static int saturn_open_iwad(void)
         int i;
         for (i = 0; candidates[i]; i++)
         {
-            Sint32 fid;
+            int fid;
             saturn_gfs_site = 7;
-            fid = GFS_NameToId((Sint8 *)candidates[i]);
-            saturn_open_diag_fid = (int)fid;
+            fid = __jo_fs_get_file_id(candidates[i]);
+            saturn_open_diag_fid = fid;
             if (fid < 0)
             {
                 saturn_gfs_site = 0;
                 continue;
             }
-            saturn_wad_gfs = GFS_Open(fid);
+            saturn_wad_gfs = __jo_fs_open(fid);
             saturn_gfs_site = 0;
             if (saturn_wad_gfs == JO_NULL)
             {
@@ -1170,13 +1152,10 @@ static int saturn_open_iwad(void)
             saturn_gfs_setup(saturn_wad_gfs);
             saturn_open_diag_open = 0;
             saturn_wad_fid   = fid;   /* for skip-to-sector's rewind re-open */
-            /* File geometry from GFS itself: nsct = sector count. Used by
-             * I_WadBase to reject a garbage header decode (an infotableofs
-             * past EOF) before it turns into a wild pread. */
             {
-                Sint32 ssz, nsct, lsz;
-                saturn_gfs_site = 9;   /* r65: was unstamped */
-                GFS_GetFileSize(saturn_wad_gfs, &ssz, &nsct, &lsz);
+                int nsct;
+                saturn_gfs_site = 9;
+                nsct = __jo_fs_get_sector_count(saturn_wad_gfs);
                 saturn_gfs_site = 0;
                 saturn_wad_nsct = (nsct > 0) ? (unsigned)nsct : 0u;
             }
@@ -1193,7 +1172,7 @@ static int saturn_open_iwad(void)
             return 1;
         }
     }
-    saturn_open_diag_font = (int)GFS_NameToId((Sint8 *)"FONT.TGA");
+    saturn_open_diag_font = __jo_fs_get_file_id("FONT.TGA");
     return 0;
 }
 
@@ -1600,9 +1579,7 @@ int saturn_iwad_pread(unsigned int pos, void *dest, unsigned int nbytes)
             saturn_io_diag_seeks++;
             t0 = saturn_vbl_count;                      /* r66 */
             saturn_gfs_site = 4;
-            saturn_io_diag_seek = GFS_Seek(saturn_wad_gfs,
-                                           (Sint32)(sector - saturn_gfs_pos),
-                                           GFS_SEEK_CUR);
+            saturn_io_diag_seek = __jo_fs_seek_sector(saturn_wad_gfs, (int)sector) ? 0 : -1;
             saturn_prof_gfs_vbl += saturn_vbl_count - t0;
             saturn_gfs_site = 0;
             if (saturn_io_diag_seek >= 0)
@@ -2146,12 +2123,11 @@ byte *I_WadBase(void)
 static void fill_txn_abort(void)
 {
     if (!fill_txn)
-        return;   /* nothing pending â€” do NOT touch the handle */
+        return;   /* nothing pending — do NOT touch the handle */
     saturn_gfs_site = 5;
-    GFS_NwStop(saturn_wad_gfs);
     fill_txn = 0;
-    GFS_Close(saturn_wad_gfs);
-    saturn_wad_gfs = GFS_Open(saturn_wad_fid);
+    __jo_fs_close(saturn_wad_gfs);
+    saturn_wad_gfs = __jo_fs_open(saturn_wad_fid);
     saturn_gfs_site = 0;
     if (saturn_wad_gfs == JO_NULL)
         return;   /* pread's entry check reports the dead handle */
@@ -2159,40 +2135,11 @@ static void fill_txn_abort(void)
     saturn_gfs_pos = 0;
 }
 
-/* Pump the pending async Nw batch. Returns bytes completed (> 0 â€” the
- * fill cursor is advanced), 0 = still pending (resume next call),
- * -1 = error (batch stopped; caller falls back to the sync path).
- * Never spins unbounded: FRT budget per call plus a hard round cap
- * since issue (same 4096-round guard as the old synchronous multi
- * path). The first round always runs so every call makes progress. */
 static int fill_txn_pump(unsigned int budget_ticks)
 {
-    unsigned int f0   = SAT_FRT();
-    Sint32       stat = 0, nbyte = 0;
-
-    for (;;)
-    {
-        saturn_gfs_site = 3;
-        GFS_NwExecOne(saturn_wad_gfs);
-        GFS_NwGetStat(saturn_wad_gfs, &stat, &nbyte);
-        saturn_gfs_site = 0;
-        if ((unsigned int)nbyte > fill_txn_last)
-        {
-            fill_txn_last      = (unsigned int)nbyte;
-            fill_txn_prog_vbl  = saturn_vbl_count;   /* progress */
-        }
-        if (nbyte >= (Sint32)fill_txn_bytes ||
-            stat == GFS_SVR_COMPLETED || stat == GFS_SVR_ERROR ||
-            (unsigned int)(saturn_vbl_count - fill_txn_prog_vbl) >= FILL_WEDGE_VBLS)
-            break;
-        if ((unsigned short)(SAT_FRT() - f0) >= budget_ticks)
-            return 0;   /* still pending â€” resume on the next call */
-    }
-    if (nbyte <= 0 || (stat != GFS_SVR_COMPLETED && nbyte < (Sint32)fill_txn_bytes))
-    {
-        fill_txn_abort();
-        return -1;
-    }
+    (void)budget_ticks;
+    if (!fill_txn)
+        return 0;
     saturn_gfs_pos += fill_txn_bytes >> 11;   /* sectors landed */
     fill_part_cd   += fill_txn_bytes;
     fill_part_cart += fill_txn_bytes;
@@ -2201,7 +2148,7 @@ static int fill_txn_pump(unsigned int budget_ticks)
     return (int)fill_txn_bytes;
 }
 
-/* r71: no shrink ladder â€” a batch is one 2 KB sector landed in the
+/* r71: no shrink ladder — a batch is one 2 KB sector landed in the
  * WRAM-H stage. Any Nw failure demotes the async path to the proven
  * sync path permanently. */
 static void fill_nw_shrink(void)
@@ -2209,27 +2156,12 @@ static void fill_nw_shrink(void)
     saturn_direct_reads_ok = 0;
 }
 
-/* r71: cart offset the in-flight staged batch was issued at â€” the
- * drain's pump-completion leg moves the stage there via the DSP
- * engine (SCU-DMA may never write the A-bus directly). */
 static unsigned int fill_txn_cart_off = 0;
 
-/* Issue one async Nw batch: `nbytes` (sector-aligned, 2 KB) from the
- * CURRENT handle position into the WRAM-H stage â€” NEVER the cart
- * ("Writing to A-Bus by SCU-DMA cannot be used", SCU manual 2.1; the
- * r63-69 boot wedge). The handle must already sit at the batch's
- * first sector â€” the drain positions it with a forward seek first. */
 static int fill_txn_issue(unsigned int nbytes)
 {
     saturn_gfs_site = 2;
-    /* v5.13: the batch lands in the stage view the tripwire currently
-     * trusts (cached while green). TMODE_CPU is a property of the
-     * GfsHn, and the transfer executes during GFS_NwExecOne polling on
-     * the main thread — expected to be an SH-2 CPU copy; the pump's
-     * tripwire below demotes staging permanently if it ever isn't. */
-    if (GFS_NwFread(saturn_wad_gfs, (Sint32)(nbytes >> 11),
-                    saturn_stage_dest(),
-                    (Sint32)nbytes) < 0)
+    if (__jo_fs_read_sectors(saturn_wad_gfs, (int)(nbytes >> 11), saturn_stage_dest(), (int)nbytes) <= 0)
     {
         saturn_gfs_site = 0;
         return -1;
@@ -2237,7 +2169,7 @@ static int fill_txn_issue(unsigned int nbytes)
     saturn_gfs_site = 0;
     fill_txn_cart_off  = fill_part_cart;
     fill_txn_bytes     = nbytes;
-    fill_txn_last      = 0;
+    fill_txn_last      = nbytes;
     fill_txn_prog_vbl  = saturn_vbl_count;
     fill_txn           = 1;
     return 0;
@@ -2464,9 +2396,7 @@ int saturn_iwad_background_fill(void)
                     async_ok = 0;
                 else if (saturn_gfs_pos != (fill_part_cd >> 11))
                 {
-                    if (GFS_Seek(saturn_wad_gfs,
-                                 (Sint32)((fill_part_cd >> 11) - saturn_gfs_pos),
-                                 GFS_SEEK_CUR) < 0)
+                    if (!__jo_fs_seek_sector(saturn_wad_gfs, (int)(fill_part_cd >> 11)))
                         async_ok = 0;
                     else
                         saturn_gfs_pos = (fill_part_cd >> 11);
@@ -2676,10 +2606,10 @@ int I_ReadCDFile(int length)
         return length;
     }
     saturn_wad_cold_reads++;    /* profile: this read hit the CD */
-    if ((unsigned)length > sizeof(saturn_cd_scratch))
+    if ((unsigned)length > SATURN_CD_SCRATCH_SIZE)
     {
         I_Error("I_ReadCDFile: lump of %d bytes exceeds %u-byte scratch",
-                length, (unsigned)sizeof(saturn_cd_scratch));
+                length, (unsigned)SATURN_CD_SCRATCH_SIZE);
         return -1;
     }
     if (saturn_iwad_pread(real_cd, saturn_cd_scratch, (unsigned)length) == length)
@@ -2763,208 +2693,110 @@ void *I_PointStableLump(int lump)
  * library expansion area + 8192-byte work area â€” both from the zone
  * at first use (BSS headroom is ~2.8 KB).
  * ==================================================================== */
-#include <SEGA_BUP.H>
-
-#define BUP_REC_NAME   "DSREC1"
-#define BUP_REC_WORDS  128u    /* 512 bytes, same layout as the cart stash */
-
-static int     saturn_bup_state = -1;  /* -1 untried, 0 dead, 1 ok */
-static Uint32 *saturn_bup_lib;         /* 16 KB library load area  */
-static Uint32 *saturn_bup_work;        /* 8 KB work area           */
-
-/* Round-34 REAL-HW FIX: allocation ONLY. The old Saturn_BupPrealloc
- * called the full Saturn_BupInit at boot â€” BUP_Init downloads a 16 KB
- * library to the CD-block SH-1 and BUP_Stat runs there, i.e. CD-block
- * traffic issued WHILE the boot's WAD reads stream. On real HW that
- * wedged the CD block: 2026-09-04, boot stuck forever on the cyan
- * LOADING WAD stage (Kronos emulates the block and never showed it).
- * The CD-block half stays in Saturn_BupInit, which now runs lazily
- * from Save/Load â€” every call site is behind a !Saturn_CdFillBusy()
- * gate. */
+/* Backup RAM (SEGA_BUP) is replaced by no-op stubs under Jo Engine v2026.1
+ * (cartridge stash remains the primary crash-recorder fallback). */
 void Saturn_BupPrealloc(void)
 {
-    if (saturn_bup_lib != 0 && saturn_bup_work != 0)
-        return;
-    saturn_bup_lib  = (Uint32 *)Z_Malloc(0x4000, PU_STATIC);
-    saturn_bup_work = (Uint32 *)Z_Malloc(0x2000, PU_STATIC);
-    if (!saturn_bup_lib || !saturn_bup_work)
-    {
-        if (saturn_bup_lib)
-            Z_Free(saturn_bup_lib);
-        if (saturn_bup_work)
-            Z_Free(saturn_bup_work);
-        saturn_bup_lib = saturn_bup_work = 0;
-        /* zone pressure is transient: the lazy path retries */
-    }
 }
 
-static int Saturn_BupInit(void)
-{
-    BupConfig cfg[3];
-    BupStat   st;
-
-    if (saturn_bup_state >= 0)
-        return saturn_bup_state;
-    saturn_bup_state = 0;
-    if (!saturn_bup_lib || !saturn_bup_work)
-        Saturn_BupPrealloc();      /* boot prealloc missed: try now */
-    if (!saturn_bup_lib || !saturn_bup_work)
-    {
-        saturn_bup_state = -1;     /* still no room: RETRY later */
-        return 0;
-    }
-    cfg[0].unit_id   = BUP_MAIN_UNIT;
-    cfg[0].partition = 1;
-    /* NO BUP_CURTRIDGE entry: the SAROO sits in the cart slot and is
-     * not a backup-RAM cart â€” probing it as one risks an CS2-bus hang
-     * (round-11c). Zero terminator right after the internal unit. */
-    cfg[1].unit_id   = 0;
-    cfg[1].partition = 0;
-    cfg[2].unit_id   = 0;
-    cfg[2].partition = 0;
-    BUP_Init(saturn_bup_lib, saturn_bup_work, cfg);
-    /* Device 0 = the cfg[0] entry = internal unit. A failed stat
-     * leaves the flag at 0 and the cart stash stays the fallback. */
-    if (BUP_Stat(0, 0, &st) < 0)
-        return 0;
-    saturn_bup_state = 1;
-    return 1;
-}
-
-/* Stash `nwords` little-endian words as backup-RAM file "DSREC1"
- * (512-byte record, zero-padded â€” same layout as the cart stash).
- * Returns 0 written / negative on any failure. */
 int Saturn_BupSave(const unsigned int *words, int nwords)
 {
-    static unsigned int buf[BUP_REC_WORDS];  /* shared save/load scratch */
-    BupDir dir;
-    unsigned int k;
-
-    if (!Saturn_BupInit())
-        return -1;
-    for (k = 0; k < BUP_REC_WORDS; k++)
-        buf[k] = 0;
-    for (k = 0; k < (unsigned)nwords && k < BUP_REC_WORDS; k++)
-        buf[k] = words[k];
-
-    D_memset(&dir, 0, sizeof(dir));
-    D_memcpy(dir.filename, BUP_REC_NAME, 6);
-    D_memcpy(dir.comment, "redscreen", 9);
-    dir.language = BUP_ENGLISH;
-    dir.date     = 0;
-    dir.datasize = BUP_REC_WORDS * 4u;
-    dir.blocksize = 4;               /* 512 / 128 (internal block size) */
-    return BUP_Write(0, &dir, (Uint8 *)buf, 0);
+    (void)words;
+    (void)nwords;
+    return -1;
 }
 
-/* Read + DELETE the recorder file (one boot per record, like the cart
- * stash). Returns 0 and fills min(nwords,128) words on success. */
 int Saturn_BupLoad(unsigned int *words, int nwords)
 {
-    static unsigned int buf[BUP_REC_WORDS];
-    int ret;
-    int k;
-
-    if (!Saturn_BupInit())
-        return -1;
-    ret = BUP_Read(0, (Uint8 *)BUP_REC_NAME, (Uint8 *)buf);
-    if (ret != 0)
-        return -1;          /* NOT_FOUND or a dead device: no record */
-    BUP_Delete(0, (Uint8 *)BUP_REC_NAME);
-    for (k = 0; k < (unsigned)nwords && k < BUP_REC_WORDS; k++)
-        words[k] = buf[k];
-    return 0;
+    (void)words;
+    (void)nwords;
+    return -1;
 }
 /* ====== P4: one-shot small-file GFS read (E1M1 PVS blob) ====== */
 
-/* Synchronous one-shot read of cd\E1M1.BLOB into buf (cap bytes).
- * Main thread only (P_SetupLevel) — the VBlank-ISR GFS ban does not
- * apply here. Separate GfsHn/fid path — never touches the persistent
- * IWAD handle or its sector-walk position. Filename is BARE 8.3
- * (GFS_NameToId matches the ISO root directory table — see
- * saturn_open_iwad above). Returns bytes read, 0 on any failure
- * (file absent, size > cap, short read) so the caller fail-opens to
- * the ungated BSP walk. Mirrors jo_engine/fs.c's proven
- * NameToId -> GetFileSize -> GFS_Load(fid) pattern. */
 int Saturn_Pvs_BlobRead(void *buf, unsigned cap)
 {
-    Sint32  fid, ssz, nsct, lsz, fsize;
-    GfsHn   gfs;
-    int     retry;
+    int   fid, fsize;
+    void *gfs;
 
-    fid = GFS_NameToId((Sint8 *)"E1M1.BLOB");
+    fid = __jo_fs_get_file_id("E1M1.BLOB");
     if (fid < 0)
         return 0;
-    gfs = GFS_Open(fid);
+    gfs = __jo_fs_open(fid);
     if (gfs == JO_NULL)
         return 0;
-    GFS_GetFileSize(gfs, &ssz, &nsct, &lsz);
-    GFS_Close(gfs);
-    if (ssz <= 0 || nsct <= 0 || lsz < 0)
-        return 0;
-    fsize = ssz * (nsct - 1) + lsz;
+    fsize = __jo_fs_get_file_size(gfs);
     if (fsize <= 0 || (unsigned)fsize > cap)
-        return 0;
-    for (retry = 10; GFS_Load(fid, 0, (void *)buf, fsize) <= 0; --retry)
     {
-        if (!retry)
-            return 0;
-        jo_spin_wait(16);
+        __jo_fs_close(gfs);
+        return 0;
     }
-    return (int)fsize;
+    {
+        static byte pvs_chunk_buf[2048] __attribute__((aligned(16)));
+        byte *dst = (byte *)buf;
+        uint32_t remaining = (uint32_t)fsize;
+        int retry;
+
+        while (remaining > 0)
+        {
+            uint32_t chunk = (remaining > 2048u) ? 2048u : remaining;
+            for (retry = 10; __jo_fs_read_sectors(gfs, 1, (void *)pvs_chunk_buf, 2048) <= 0; --retry)
+            {
+                if (!retry)
+                {
+                    __jo_fs_close(gfs);
+                    return 0;
+                }
+                jo_spin_wait(16);
+            }
+            D_memcpy(dst, pvs_chunk_buf, chunk);
+            dst += chunk;
+            remaining -= chunk;
+        }
+    }
+    __jo_fs_close(gfs);
+    return fsize;
 }
 
 /* ====== M2: one-shot small-file GFS read (LEAF blob, named 8.3) ====== */
 
-/* Same one-shot pattern as Saturn_Pvs_BlobRead above, parameterized on
- * the filename so the leaf loader stays map-generic ("E1M1.LEAF" from
- * Saturn_LeafLevelLoad). Main thread only (P_SetupLevel). Returns
- * bytes read, 0 on any failure so the caller fail-opens to the plain
- * seg walk. */
 volatile int dbg_leaf_fid = -999;
 volatile int dbg_leaf_err = 0;
 
 int Saturn_Leaf_BlobRead(void *buf, unsigned cap, const char *fname)
 {
-    Sint32  fid, ssz, nsct, lsz, fsize;
-    GfsHn   gfs;
-    int     retry;
+    int   fid, fsize;
+    void *gfs;
+    int   retry;
 
-    fid = GFS_NameToId((Sint8 *)fname);
-    dbg_leaf_fid = (int)fid;
+    fid = __jo_fs_get_file_id(fname);
+    dbg_leaf_fid = fid;
     if (fid < 0)
     {
         dbg_leaf_err = 1;
         return 0;
     }
-    gfs = GFS_Open(fid);
+    gfs = __jo_fs_open(fid);
     if (gfs == JO_NULL)
     {
         dbg_leaf_err = 2;
         return 0;
     }
-    GFS_GetFileSize(gfs, &ssz, &nsct, &lsz);
-    if (ssz <= 0 || nsct <= 0 || lsz < 0)
-    {
-        GFS_Close(gfs);
-        dbg_leaf_err = 3;
-        return 0;
-    }
-    fsize = ssz * (nsct - 1) + lsz;
+    fsize = __jo_fs_get_file_size(gfs);
     if (fsize <= 0)
     {
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_leaf_err = 4;
         return 0;
     }
     if (buf == NULL)
     {
-        GFS_Close(gfs);
-        return (int)fsize;
+        __jo_fs_close(gfs);
+        return fsize;
     }
     if ((unsigned)fsize > cap)
     {
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
         dbg_leaf_err = 5;
         return 0;
     }
@@ -2979,19 +2811,15 @@ int Saturn_Leaf_BlobRead(void *buf, unsigned cap, const char *fname)
 #endif
         uint32_t remaining = (uint32_t)fsize;
 
-        GFS_SetTmode(gfs, GFS_TMODE_CPU);
-        GFS_SetReadPara(gfs, 8);
-        GFS_SetTransPara(gfs, 8);
-
         while (remaining > 0)
         {
             uint32_t chunk = (remaining > 2048u) ? 2048u : remaining;
 
-            for (retry = 10; GFS_Fread(gfs, 1, (void *)leaf_chunk_buf, 2048) <= 0; --retry)
+            for (retry = 10; __jo_fs_read_sectors(gfs, 1, (void *)leaf_chunk_buf, 2048) <= 0; --retry)
             {
                 if (!retry)
                 {
-                    GFS_Close(gfs);
+                    __jo_fs_close(gfs);
                     dbg_leaf_err = 6;
                     return 0;
                 }
@@ -3001,13 +2829,13 @@ int Saturn_Leaf_BlobRead(void *buf, unsigned cap, const char *fname)
             dst += chunk;
             remaining -= chunk;
         }
-        GFS_Close(gfs);
+        __jo_fs_close(gfs);
 #ifndef SATURN_WIN32
         /* Purge Master L1 Cache from uncached Area 1 trampoline so subsequent cached reads fetch fresh DRAM */
         extern void _hw_purge_cache(void);
         ((void (*)(void))((uint32_t)_hw_purge_cache | 0x20000000u))();
 #endif
         dbg_leaf_err = 7;
-        return (int)fsize;
+        return fsize;
     }
 }

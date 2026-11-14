@@ -188,6 +188,15 @@ void P_LoadSegs (int lump)
 =================
 */
 
+#define SATURN_MAX_STATIC_SSECTORS 608
+#define SATURN_MAX_STATIC_SECTORS  256
+#define SATURN_MAX_STATIC_NODES    608
+
+static __attribute__((aligned(16))) subsector_t hw_wram_h_subsectors[SATURN_MAX_STATIC_SSECTORS];
+static __attribute__((aligned(16))) sector_t    hw_wram_h_sectors[SATURN_MAX_STATIC_SECTORS];
+static __attribute__((aligned(16))) node_t      hw_wram_h_nodes[SATURN_MAX_STATIC_NODES];
+static __attribute__((aligned(16))) int16_t     hw_wram_h_node_bboxes[SATURN_MAX_STATIC_NODES][2][4];
+
 void P_LoadSubsectors (int lump)
 {
 	byte			*data;
@@ -226,8 +235,8 @@ void P_LoadSubsectors (int lump)
 
 	numsubsectors = W_LumpLength (lump) / sizeof(mapsubsector_t);
 	count = numsubsectors+1;
-	if ((size_t)count * sizeof(subsector_t) <= 0x3000u)
-		subsectors = (subsector_t *)((uintptr_t)SATURN_WRAM_L_DIVLUT_ADDR + 0x2000u);
+	if (count <= SATURN_MAX_STATIC_SSECTORS)
+		subsectors = hw_wram_h_subsectors;
 	else
 		subsectors = Z_Malloc (count*sizeof(subsector_t),PU_LEVEL);
 	data = W_GetLumpData(lump);
@@ -267,9 +276,9 @@ void P_LoadSectors (int lump)
 	int 			tag;
 			
 	numsectors = W_LumpLength (lump) / sizeof(mapsector_t);
-	if ((size_t)numsectors * sizeof(sector_t) <= SATURN_WRAM_L_SECSHADOW_SIZE)
+	if (numsectors <= SATURN_MAX_STATIC_SECTORS)
 	{
-		sectors = (sector_t *)SATURN_WRAM_L_SECSHADOW_ADDR;
+		sectors = hw_wram_h_sectors;
 	}
 	else
 	{
@@ -469,9 +478,9 @@ void P_LoadNodes (int lump)
 #ifdef SATURN_WIN32
 	printf("P_LoadNodes: data=%p, allocating nodes\n", data); fflush(stdout);
 #endif
-	if ((size_t)numnodes * sizeof(node_t) <= 0x4000u)
+	if (numnodes <= SATURN_MAX_STATIC_NODES)
 	{
-		nodes = (node_t *)((uintptr_t)SATURN_WRAM_L_SKY_ADDR + 0x8000u);
+		nodes = hw_wram_h_nodes;
 	}
 	else
 	{
@@ -481,8 +490,8 @@ void P_LoadNodes (int lump)
 	bboxes = (void *)I_FrameBuffer();
 
 	extern int16_t (*hw_node_bboxes)[2][4];
-	if ((size_t)numnodes * sizeof(int16_t) * 8 <= 0x4000u)
-		hw_node_bboxes = (int16_t (*)[2][4])((uintptr_t)SATURN_WRAM_L_SKY_ADDR + 0xC000u);
+	if (numnodes <= SATURN_MAX_STATIC_NODES)
+		hw_node_bboxes = hw_wram_h_node_bboxes;
 	else
 		hw_node_bboxes = Z_Malloc(numnodes * sizeof(int16_t) * 8, PU_LEVEL);
 
