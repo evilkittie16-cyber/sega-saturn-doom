@@ -738,7 +738,12 @@ void I_FinishUpdate(void)
                     dst->angle = mo->angle;
                     memcpy(dst->name, sprnames[st->sprite], 4);
                     dst->frame = st->frame;
-                    dst->flags = mo->flags;
+                    /* Only MF_SHADOW means the same thing in both trees. d32xr
+                     * reuses PC's MF_TRANSLATION bits (0x0C000000) for
+                     * MF_SEETARGET / MF_STATIC, which made the DOS pane draw
+                     * static items and corpses with the brown/gray player
+                     * translation tables. */
+                    dst->flags = mo->flags & MF_SHADOW;
                     dst->sector_idx = s;
                 }
             }
