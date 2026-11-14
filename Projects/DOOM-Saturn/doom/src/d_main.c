@@ -941,6 +941,9 @@ volatile unsigned int saturn_prof_hitch_cull = 0;
 volatile unsigned int saturn_prof_hitch_mfl  = 0;
 volatile unsigned int saturn_prof_hitch_hud  = 0;
 volatile int          saturn_prof_hitch_comp = 0;
+/* Slowest subsector of the hitch frame and its split (FRT ticks). */
+volatile int          saturn_prof_hitch_subn = -1;
+volatile unsigned int saturn_prof_hitch_sub[6] = { 0, 0, 0, 0, 0, 0 }; /* tot ap fl wall spr occ */
 static int            saturn_prof_disp_comp  = 0;   /* compositions inside D_Display */
 
 #if defined(SATURN_DIVLUT) && (SATURN_DIVLUT_STEP >= 1)
@@ -1632,6 +1635,19 @@ void D_DoomLoop(void)
                     saturn_prof_hitch_mfl  = saturn_hw_prof_mflat;
                     saturn_prof_hitch_hud  = saturn_hw_prof_hud;
                     saturn_prof_hitch_comp = saturn_prof_disp_comp;
+                    {
+                        extern unsigned int saturn_hw_submax_tot, saturn_hw_submax_ap,
+                                            saturn_hw_submax_fl, saturn_hw_submax_wall,
+                                            saturn_hw_submax_spr, saturn_hw_submax_occ;
+                        extern int          saturn_hw_submax_num;
+                        saturn_prof_hitch_subn   = saturn_hw_submax_num;
+                        saturn_prof_hitch_sub[0] = saturn_hw_submax_tot;
+                        saturn_prof_hitch_sub[1] = saturn_hw_submax_ap;
+                        saturn_prof_hitch_sub[2] = saturn_hw_submax_fl;
+                        saturn_prof_hitch_sub[3] = saturn_hw_submax_wall;
+                        saturn_prof_hitch_sub[4] = saturn_hw_submax_spr;
+                        saturn_prof_hitch_sub[5] = saturn_hw_submax_occ;
+                    }
                 }
             }
             /* NO I_WaitVBL(1) here: I_FinishUpdate's VDP1 commit

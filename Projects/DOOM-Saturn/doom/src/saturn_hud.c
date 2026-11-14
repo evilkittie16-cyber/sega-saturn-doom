@@ -1138,17 +1138,30 @@ void Saturn_HUD_Draw(void)
                     dbg[dn++] = ' ';
                     dn = hud_tiny_tag(dbg, dn, 'B', HUD_FRT_MS(saturn_prof_hitch_bsp));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'S', HUD_FRT_MS(saturn_prof_hitch_bg));
-                    dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'J', HUD_FRT_MS(saturn_prof_hitch_slv));
-                    dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'C', HUD_FRT_MS(saturn_prof_hitch_cull));
-                    dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'M', HUD_FRT_MS(saturn_prof_hitch_mfl));
-                    dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'H', HUD_FRT_MS(saturn_prof_hitch_hud));
+                    /* Slowest subsector of that frame: U number, its total,
+                     * then A aperture / F flat submit / G walls / P sprites /
+                     * O occlusion (ms). S J C M H were all ~0 on hardware. */
+                    {
+                        extern volatile int          saturn_prof_hitch_subn;
+                        extern volatile unsigned int saturn_prof_hitch_sub[6];
+                        dn = hud_tiny_tag(dbg, dn, 'U', saturn_prof_hitch_subn < 0 ? 0 : saturn_prof_hitch_subn);
+                        dbg[dn++] = '/';
+                        dn = hud_tiny_num(dbg, dn, HUD_FRT_MS(saturn_prof_hitch_sub[0]));
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'A', HUD_FRT_MS(saturn_prof_hitch_sub[1]));
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'F', HUD_FRT_MS(saturn_prof_hitch_sub[2]));
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'G', HUD_FRT_MS(saturn_prof_hitch_sub[3]));
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'P', HUD_FRT_MS(saturn_prof_hitch_sub[4]));
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'O', HUD_FRT_MS(saturn_prof_hitch_sub[5]));
+                    }
                     dbg[dn++] = ' ';
                     dn = hud_tiny_tag(dbg, dn, 'T', saturn_prof_hitch_comp);
+                    (void)saturn_prof_hitch_bg; (void)saturn_prof_hitch_slv; (void)saturn_prof_hitch_cull;
+                    (void)saturn_prof_hitch_mfl; (void)saturn_prof_hitch_hud;
 #undef HUD_FRT_MS
                     (void)pf_edsr; (void)pf_copr; (void)pf_ref; (void)dda_k;
                     if (p && p->mo)

@@ -28,8 +28,47 @@ static unsigned int hw_prof_fsub_acc = 0;
 static unsigned int hw_prof_spr_acc = 0;
 static unsigned int hw_prof_occl_acc = 0;
 
+/* Hitch diagnostics (2026-11-14): slowest subsector of the frame and how
+ * its time splits (aperture / flat submit / walls / sprites / occlusion),
+ * timed with the vblank-extended Saturn_ProfSpan so a multi-vblank stall
+ * inside one subsector is measured correctly (the 16-bit FRT sub-timers
+ * wrap every ~18 ms). Latched into the HUD hitch row by d_main.c. */
+extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);
+extern volatile unsigned int saturn_vbl_count;
+unsigned int saturn_hw_submax_tot = 0, saturn_hw_submax_ap = 0, saturn_hw_submax_fl = 0,
+             saturn_hw_submax_wall = 0, saturn_hw_submax_spr = 0, saturn_hw_submax_occ = 0;
+int          saturn_hw_submax_num = -1;
+static unsigned int hw_submax_tot = 0, hw_submax_parts[5] = { 0, 0, 0, 0, 0 };
+static int          hw_submax_num = -1;
+
+#define HW_SUBPROF_MARK(slot)                                           \
+    do {                                                                \
+        unsigned int   v_ = saturn_vbl_count;                           \
+        unsigned short f_ = SAT_FRT();                                  \
+        sp_parts[slot] = Saturn_ProfSpan(sp_f, sp_v);                   \
+        sp_f = f_; sp_v = v_;                                           \
+    } while (0)
+
+static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
+                                                         unsigned int *sp_parts);
+
 /* Walk a subsector (takes 2 register arguments: r4=subnum, r5=fully_inside) */
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_inside)
+{
+    unsigned int parts[5] = { 0, 0, 0, 0, 0 };
+    HW_RenderSubsector_Body(subnum, fully_inside, parts);
+    unsigned int tot = parts[0] + parts[1] + parts[2] + parts[3] + parts[4];
+    if (tot > hw_submax_tot)
+    {
+        hw_submax_tot = tot;
+        hw_submax_num = subnum;
+        for (int i = 0; i < 5; i++)
+            hw_submax_parts[i] = parts[i];
+    }
+}
+
+static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
+                                                         unsigned int *sp_parts)
 {
     if (hw_solid_count >= HW_VIEW_W || (unsigned)subnum >= (unsigned)numsubsectors)
         return;
@@ -38,10 +77,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
     if ((unsigned)secnum >= HW_MAX_AP_SECTORS || saturn_visit_count >= CMDBUF_MAX_VISIT)
         return;
     hw_sec_fast_t *sf = &hw_sec_fast[secnum];
+    unsigned int   sp_v = saturn_vbl_count;
+    unsigned short sp_f = SAT_FRT();
 #if HW_PROF_SUBTIMERS
     unsigned short ts0 = SAT_FRT();
 #endif
     int flat_flags = HW_CheckSubsectorAperture(subnum, sf, fully_inside & 3);
+    HW_SUBPROF_MARK(0);
 #if HW_PROF_SUBTIMERS
     unsigned short ts1 = SAT_FRT();
     hw_prof_ap_acc += HW_ProfDelta(ts0, ts1);
@@ -81,12 +123,14 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
             HW_RenderSubsectorBakedFlats(visit_idx, subnum, sec, flat_flags);
         }
     }
+    HW_SUBPROF_MARK(1);
 #if HW_PROF_SUBTIMERS
     hw_prof_fsub_acc += HW_ProfDelta(ts1, SAT_FRT());
 #endif
 
     /* 1. Render segs (front walls of this subsector) */
     HW_RenderSubsectorBakedWalls(subnum, sf);
+    HW_SUBPROF_MARK(2);
 
     /* 2. Render subsector sprites (lazy per-sector frustum-culled bucketing) */
 #if HW_PROF_SUBTIMERS
@@ -98,6 +142,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
         if (HW_SubsectorHasThings(sec, (uint32_t)secnum, subnum))
             HW_RenderSubsectorSprites(sec, subnum);
     }
+    HW_SUBPROF_MARK(3);
 #if HW_PROF_SUBTIMERS
     unsigned short ts3 = SAT_FRT();
     hw_prof_spr_acc += HW_ProfDelta(ts2, ts3);
@@ -118,6 +163,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
         hw_prof_occl_acc += HW_ProfDelta(ts3, SAT_FRT());
 #endif
     }
+    HW_SUBPROF_MARK(4);
 }
 
 typedef struct {
@@ -494,6 +540,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     if (hw_render_frame == 0)
         hw_render_frame = 1;
     hw_flat_sec_cache.sec = NULL;
+    hw_submax_tot = 0;
+    hw_submax_num = -1;
     hw_prof_segs_acc = 0;
     hw_prof_ap_acc = 0;
     hw_prof_fsub_acc = 0;
@@ -613,6 +661,13 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     saturn_hw_prof_sportal = hw_prof_sportal_acc;
     saturn_hw_prof_unb = hw_prof_unb_acc;
     saturn_hw_prof_bsp = Saturn_ProfSpan(tb0, vb0);
+    saturn_hw_submax_tot  = hw_submax_tot;
+    saturn_hw_submax_num  = hw_submax_num;
+    saturn_hw_submax_ap   = hw_submax_parts[0];
+    saturn_hw_submax_fl   = hw_submax_parts[1];
+    saturn_hw_submax_wall = hw_submax_parts[2];
+    saturn_hw_submax_spr  = hw_submax_parts[3];
+    saturn_hw_submax_occ  = hw_submax_parts[4];
 
     static int saturn_hw_sky_was_visible = 0;
     int bg_drawn = 0;
