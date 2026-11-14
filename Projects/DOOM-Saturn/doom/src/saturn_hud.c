@@ -1123,43 +1123,34 @@ void Saturn_HUD_Draw(void)
                  * subtrees, I baked segs iterated, U segs surviving culls, M DDA (k). */
                 if (dbg_y + 8 + 6 <= 224)
                 {
+                    /* Hitch-frame render breakdown in ms (d_main.c latch,
+                     * same frame as row 1's Z group): R total render,
+                     * B BSP walk, S sky fill, J slave wait, C cmd cull,
+                     * M master deferred flats, H HUD, T textures composed. */
+                    extern volatile unsigned int saturn_prof_hitch_rtot, saturn_prof_hitch_bsp,
+                                                 saturn_prof_hitch_bg, saturn_prof_hitch_slv,
+                                                 saturn_prof_hitch_cull, saturn_prof_hitch_mfl,
+                                                 saturn_prof_hitch_hud;
+                    extern volatile int          saturn_prof_hitch_comp;
+#define HUD_FRT_MS(x) ((int)((((unsigned int)(x) + half_ms) * cached_inv_per_ms) >> 20))
                     dn = 0;
-                    dn = hud_tiny_tag(dbg, dn, 'N', saturn_visit_count);
+                    dn = hud_tiny_tag(dbg, dn, 'R', HUD_FRT_MS(saturn_prof_hitch_rtot));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'E', pf_edsr);
-                    dbg[dn++] = '/';
-                    dn = hud_tiny_num(dbg, dn, pf_copr);
+                    dn = hud_tiny_tag(dbg, dn, 'B', HUD_FRT_MS(saturn_prof_hitch_bsp));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'K', (int)saturn_hw_occl_culls);
+                    dn = hud_tiny_tag(dbg, dn, 'S', HUD_FRT_MS(saturn_prof_hitch_bg));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'I', (int)saturn_hw_seg_iter);
+                    dn = hud_tiny_tag(dbg, dn, 'J', HUD_FRT_MS(saturn_prof_hitch_slv));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'U', (int)saturn_hw_seg_vis);
+                    dn = hud_tiny_tag(dbg, dn, 'C', HUD_FRT_MS(saturn_prof_hitch_cull));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'X', pf_ref);
+                    dn = hud_tiny_tag(dbg, dn, 'M', HUD_FRT_MS(saturn_prof_hitch_mfl));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'H', (int)saturn_hw_tex_miss);
+                    dn = hud_tiny_tag(dbg, dn, 'H', HUD_FRT_MS(saturn_prof_hitch_hud));
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'P', (int)saturn_hw_wall_strips);
-                    dbg[dn++] = ' ';
-                    extern const uint16_t *saturn_baked_flat_lod1_q_count;
-                    if (!saturn_baked_flat_lod1_q_count)
-                    {
-                        dbg[dn++] = 'L';
-                        dbg[dn++] = '_';
-                        dbg[dn++] = 'N';
-                        dbg[dn++] = 'U';
-                        dbg[dn++] = 'L';
-                        dbg[dn++] = 'L';
-                    }
-                    else
-                    {
-                        dn = hud_tiny_tag(dbg, dn, 'L', (int)saturn_hw_flat_lod1_subs);
-                        dbg[dn++] = '/';
-                        dn = hud_tiny_num(dbg, dn, (int)saturn_hw_flat_lod0_subs);
-                    }
-                    dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'M', dda_k);
+                    dn = hud_tiny_tag(dbg, dn, 'T', saturn_prof_hitch_comp);
+#undef HUD_FRT_MS
+                    (void)pf_edsr; (void)pf_copr; (void)pf_ref; (void)dda_k;
                     if (p && p->mo)
                     {
                         extern int saturn_map;

@@ -929,6 +929,19 @@ volatile int saturn_prof_hitch_r  = 0;
 volatile int saturn_prof_hitch_t  = 0;
 volatile int saturn_prof_hitch_f  = 0;
 volatile int saturn_prof_hitch_c  = 0;
+/* Render-phase breakdown of the same hitch frame (FRT ticks, converted to
+ * ms by the HUD): total D_Display render, BSP walk, sky/background fill,
+ * slave flat-queue wait, command-buffer cull, master deferred flats, HUD,
+ * plus wall textures composited during that frame's render. */
+volatile unsigned int saturn_prof_hitch_rtot = 0;
+volatile unsigned int saturn_prof_hitch_bsp  = 0;
+volatile unsigned int saturn_prof_hitch_bg   = 0;
+volatile unsigned int saturn_prof_hitch_slv  = 0;
+volatile unsigned int saturn_prof_hitch_cull = 0;
+volatile unsigned int saturn_prof_hitch_mfl  = 0;
+volatile unsigned int saturn_prof_hitch_hud  = 0;
+volatile int          saturn_prof_hitch_comp = 0;
+static int            saturn_prof_disp_comp  = 0;   /* compositions inside D_Display */
 
 #if defined(SATURN_DIVLUT) && (SATURN_DIVLUT_STEP >= 1)
 /* OCRAM divide LUT install — back in the boot path (2026-09-08): the
@@ -1590,7 +1603,11 @@ void D_DoomLoop(void)
                 else if (saturn_prof_cd > 0)
                     saturn_prof_cd--;
             }
-            D_Display();
+            {
+                int comp0 = saturn_tex_comp_count;
+                D_Display();
+                saturn_prof_disp_comp = saturn_tex_comp_count - comp0;
+            }
             saturn_prof_frame_frt = (unsigned short)Saturn_ProfSpan(frame_f0, frame_v0);
             saturn_prof_frame_vbl = (int)(saturn_vbl_count - frame_v0);
             /* Hitch latch: freeze the breakdown of any >=10-vbl frame
@@ -1602,6 +1619,20 @@ void D_DoomLoop(void)
                 saturn_prof_hitch_t  = saturn_prof_ticvbl;
                 saturn_prof_hitch_f  = saturn_prof_fill;
                 saturn_prof_hitch_c  = saturn_wad_cold_reads - prof_r0;
+                {
+                    extern unsigned int saturn_hw_prof_bsp, saturn_hw_prof_bg,
+                                        saturn_hw_prof_slave_wait, saturn_hw_prof_flats,
+                                        saturn_hw_prof_mflat;
+                    extern volatile unsigned int saturn_hw_prof_hud;
+                    saturn_prof_hitch_rtot = saturn_prof_render_frt;
+                    saturn_prof_hitch_bsp  = saturn_hw_prof_bsp;
+                    saturn_prof_hitch_bg   = saturn_hw_prof_bg;
+                    saturn_prof_hitch_slv  = saturn_hw_prof_slave_wait;
+                    saturn_prof_hitch_cull = saturn_hw_prof_flats;
+                    saturn_prof_hitch_mfl  = saturn_hw_prof_mflat;
+                    saturn_prof_hitch_hud  = saturn_hw_prof_hud;
+                    saturn_prof_hitch_comp = saturn_prof_disp_comp;
+                }
             }
             /* NO I_WaitVBL(1) here: I_FinishUpdate's VDP1 commit
              * (slSynch) already blocks until the VBlank that flips the
