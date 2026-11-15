@@ -694,6 +694,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 }
 
 int g_win32_test_mode = 0;
+int g_pos_x = 0, g_pos_y = 0, g_pos_ang = 0, g_pos_map = 0;   /* -pos */
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
 {
@@ -792,6 +793,19 @@ int main(int argc, char **argv)
                     saturn_map = val;
                 }
             }
+        }
+        if (strcmp(argv[i], "-pos") == 0 && i + 3 < argc) {
+            /* -pos X Y ANGLE_DEG: pin the camera (as the HUD prints it) and
+             * log texture-cache activity per frame, then exit. */
+            extern int g_pos_x, g_pos_y, g_pos_ang, g_pos_map;
+            extern int saturn_map;
+            g_pos_map = saturn_map;   /* -map must come first */
+            g_pos_x = atoi(argv[i + 1]);
+            g_pos_y = atoi(argv[i + 2]);
+            g_pos_ang = atoi(argv[i + 3]);
+            g_win32_test_mode = 22;
+            i += 3;
+            continue;
         }
         if (strcmp(argv[i], "-occl") == 0 && i + 1 < argc) {
             extern int saturn_hw_bsp_occl;

@@ -1175,6 +1175,56 @@ void I_FinishUpdate(void)
         }
     }
 
+    /* -pos X Y ANG: pinned camera, per-frame texture-cache log */
+    if (is_test == 22 && players && players[0].mo && gametic >= 8) {
+        extern subsector_t *R_PointInSubsector2(fixed_t x, fixed_t y, int node);
+        extern unsigned int saturn_v1_page_flushes, saturn_v1_variant_uploads;
+        extern uint32_t saturn_vdp1_bus_tex_bytes;
+        extern int saturn_v1w_refuse;
+        extern int g_pos_x, g_pos_y, g_pos_ang;
+        static int s_pos_step = 0;
+        static unsigned int s_last_fl = 0, s_last_vu = 0;
+        extern int g_pos_map, saturn_map, saturn_warp_map;
+        extern void Win32_RequestLevelWarp(int episode, int map);
+        if (saturn_warp_map != 0)
+            goto pos_done;
+        if (g_pos_map && saturn_map != g_pos_map) {
+            Win32_RequestLevelWarp(1, g_pos_map);
+            goto pos_done;
+        }
+        players[0].mo->momx = players[0].mo->momy = players[0].mo->momz = 0;
+        P_UnsetThingPosition(players[0].mo);
+        players[0].mo->x = g_pos_x * FRACUNIT;
+        players[0].mo->y = g_pos_y * FRACUNIT;
+        players[0].mo->angle = (angle_t)(((unsigned long long)g_pos_ang << 32) / 360u);
+        {
+            subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
+            if (ss) {
+                sector_t *sec = SSEC_SECTOR(ss);
+                players[0].mo->subsector = ss;
+                players[0].mo->floorz = sec->floorheight;
+                players[0].mo->ceilingz = sec->ceilingheight;
+                players[0].mo->z = sec->floorheight;
+                players[0].viewz = sec->floorheight + 41 * FRACUNIT;
+            }
+        }
+        P_SetThingPosition(players[0].mo);
+        extern unsigned int Saturn_Vdp1_ArenaFree(void);
+        printf("[POS] f%02d flushes+%u variants+%u arena_free:%uKB refuse:%d bus:%uKB quads:%d (W:%d F:%d)\n",
+               s_pos_step, saturn_v1_page_flushes - s_last_fl, saturn_v1_variant_uploads - s_last_vu,
+               Saturn_Vdp1_ArenaFree() >> 10,
+               saturn_v1w_refuse, (unsigned)(saturn_vdp1_bus_tex_bytes >> 10),
+               g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads);
+        fflush(stdout);
+        s_last_fl = saturn_v1_page_flushes;
+        s_last_vu = saturn_v1_variant_uploads;
+        if (++s_pos_step == 20) {
+            SaveFramebufferBMP("pos_triple.bmp", s_combined_fb, COMBINED_W, COMBINED_H);
+            exit(0);
+        }
+pos_done:;
+    }
+
     /* Automated Level Journey Flight Tour */
     if (is_test == 20 && gametic >= 10 && !s_journey_active && s_journey_frame_count == 0) {
         Telemetry_StartJourney();

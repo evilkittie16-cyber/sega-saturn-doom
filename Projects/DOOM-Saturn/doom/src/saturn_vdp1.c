@@ -224,6 +224,10 @@ static int             v1_page_flush[2] = { 1, 1 };
  * when it comes back into use, so a growing working set doesn't hit a
  * mid-frame refusal (= missing walls/sprites for a frame). */
 #define V1_PAGE_LOWWATER  (96u * 1024u)
+#define V1_PAGE_MINFREE   (16u * 1024u)   /* always re-start below this */
+static unsigned int v1_frame_start_off = V1_PAGE0_START; /* arena offset after the last Reset */
+static int          v1_prev_flushed = 1;                 /* flushed; refill not measured yet */
+static unsigned int v1_lowwater = V1_PAGE_LOWWATER;      /* adaptive pre-emptive flush mark */
 /* diagnostics for the HUD row */
 int saturn_v1w_modr;            /* MODR readback (TVM/FCM/VBE bits)   */
 int saturn_v1w_edsr = 3;        /* EDSR at HUD paint time             */
@@ -740,9 +744,29 @@ static unsigned int v1_arena_alloc(int bytes)
     if (off + (unsigned int)bytes > v1_arena_end)
     {
         v1_page_flush[v1_tex_page] = 1;
-        saturn_v1w_refuse++;        /* HUD 'X': texture missing this frame */
-        return 0;
+        saturn_v1w_refuse++;        /* HUD 'X': texture missing this frame */        return 0;
     }
+    v1_arena_off += (unsigned int)((bytes + 31) & ~31);
+    return off;
+}
+
+/* Optional textures (flat variant pyramids): allocate only while at least
+ * `reserve` bytes stay free for walls and sprites, and NEVER request a page
+ * flush on failure. A failed optional upload just draws without it; a flush
+ * would throw away every cached wall/sprite texture and, with variants
+ * re-requested every frame, thrash the cache (E1M1 nukage room on
+ * hardware: a flush + 12 variant rebuilds per frame, 1.7 FPS). */
+unsigned int Saturn_Vdp1_ArenaFree(void)
+{
+    return (v1_arena_end > v1_arena_off) ? (v1_arena_end - v1_arena_off) : 0u;
+}
+
+static unsigned int v1_arena_alloc_soft(int bytes, unsigned int reserve)
+{
+    unsigned int off = v1_arena_off;
+
+    if (off + (unsigned int)bytes + reserve > v1_arena_end)
+        return 0;
     v1_arena_off += (unsigned int)((bytes + 31) & ~31);
     return off;
 }
@@ -1387,10 +1411,29 @@ void Saturn_Vdp1Wall_Reset(void)
     v1_page_committed = 0;
     v1_arena_end = V1_PAGE0_END;
 
-    /* Flush the unified persistent cache if it overflowed or is nearly full. */
+    /* Flush the unified persistent cache if it overflowed, or pre-emptively
+     * when free space drops under the low-water mark. The mark adapts: it
+     * is at most half of what the last refill left free. With a fixed
+     * 96 KB mark, a working set that refills to just under it was flushed
+     * EVERY frame and rebuilt identically (wall composition + flat variant
+     * pyramids each time): E1M1's nukage room ran at 1.7 FPS on hardware.
+     * Now a pre-emptive flush needs real growth past the refilled set. */
     v1_tags_try_alloc();
-    if (v1_page_flush[0]
-        || v1_arena_end - v1_page_off[0] < V1_PAGE_LOWWATER)
+    unsigned int v1_free = v1_arena_end - v1_page_off[0];
+    if (v1_prev_flushed && v1_page_off[0] > v1_frame_start_off)
+    {
+        /* first Reset after the refill frame (Reset can run twice per
+         * frame; a call with no uploads since the last one waits) */
+        unsigned int half = v1_free >> 1;
+        v1_lowwater = (half < V1_PAGE_LOWWATER) ? half : V1_PAGE_LOWWATER;
+        v1_prev_flushed = 0;
+    }
+    int v1_do_flush = v1_page_flush[0]
+        || v1_free < V1_PAGE_MINFREE
+        || (!v1_prev_flushed && v1_free < v1_lowwater);
+    if (v1_do_flush)
+        v1_prev_flushed = 1;
+    if (v1_do_flush)
     {
 #ifndef SATURN_WIN32
         /* Never overwrite VDP1 texture VRAM while VDP1 is still rasterizing the previous frame */
@@ -1439,6 +1482,7 @@ void Saturn_Vdp1Wall_Reset(void)
         }
     }
     v1_arena_off = v1_page_off[0];
+    v1_frame_start_off = v1_arena_off;
 
     v1w_table_try_alloc();
     v1q_count = 0;
@@ -1658,25 +1702,6 @@ int Saturn_Vdp1_GetFlatSrca(int flatnum)
  *              mip, so one 64-texel texture covers a 128-unit LOD1 cell
  * Point sampling matches the normal pyramid (centre texel of each block).
  * Uploaded on first use only, row by row (no large staging buffer). */
-static int v1_flat_sample(const byte *src, int variant, int level, int y, int x)
-{
-    int step = 1 << level, half = step >> 1;
-
-    if (variant == 1)
-    {
-        int t = x; x = y; y = t;
-    }
-    else if (variant == 2)
-    {
-        int m = (64 >> level) >> 1;
-        step <<= 1;
-        half = step >> 1;
-        y %= m;
-        x %= m;
-    }
-    return src[(y * step + half) * 64 + x * step + half];
-}
-
 int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
 {
     static const unsigned short lvl_ofs[4] = { 0, 4096, 5120, 5376 };
@@ -1702,19 +1727,48 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     src = Saturn_FlatData(flatnum);
     if (!src)
         return 0;
-    off = v1_arena_alloc(5440);
+    off = v1_arena_alloc_soft(5440, 32768u);
     if (off == 0)
         return 0;
+    {
+        extern unsigned int saturn_v1_variant_uploads;
+        saturn_v1_variant_uploads++;
+    }
+    /* Tight per-level loops (a per-texel sampling call cost ~2.5M SH-2
+     * cycles for a dozen variants). Level L, block step s = 1 << L:
+     * transposed texel (y, x) = src[(x*s + s/2)*64 + y*s + s/2]; the tile
+     * uses step 2s and wraps x, y at n/2. */
     for (level = 0; level < 4; level++)
     {
         int   n = 64 >> level, y, x;
         byte *row = (byte *)rowbuf;
 
-        for (y = 0; y < n; y++)
+        if (variant == 1)
         {
-            for (x = 0; x < n; x++)
-                row[x] = (byte)v1_flat_sample(src, variant, level, y, x);
-            v1_copy_block(off + lvl_ofs[level] + (unsigned int)(y * n), row, n);
+            /* transposed: row y, column x = source row x, column y */
+            const int step = 1 << level, half = step >> 1;
+            const int xstride = step * 64;
+            for (y = 0; y < n; y++)
+            {
+                const byte *s = src + half * 64 + y * step + half;
+                for (x = 0; x < n; x++, s += xstride)
+                    row[x] = *s;
+                v1_copy_block(off + lvl_ofs[level] + (unsigned int)(y * n), row, n);
+            }
+        }
+        else
+        {
+            /* LOD1 2x2 tile: a level-(L+1) image repeated 2x2 */
+            const int step = 2 << level, half = step >> 1, m = n >> 1;
+            for (y = 0; y < n; y++)
+            {
+                const byte *s = src + ((y % m) * step + half) * 64 + half;
+                for (x = 0; x < m; x++)
+                    row[x] = s[x * step];
+                for (x = 0; x < m; x++)
+                    row[m + x] = row[x];
+                v1_copy_block(off + lvl_ofs[level] + (unsigned int)(y * n), row, n);
+            }
         }
     }
     *field = (unsigned short)(off / 8u);
@@ -1738,6 +1792,9 @@ void Saturn_Vdp1_ClearPages(void)
     v1_page_committed = 0;
     v1_page_flush[0] = 0;
     v1_page_flush[1] = 0;
+    v1_frame_start_off = V1_PAGE0_START;
+    v1_prev_flushed = 1;
+    v1_lowwater = V1_PAGE_LOWWATER;
     Saturn_Vdp1_ClearTexCacheMRU();
 }
 

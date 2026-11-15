@@ -30,6 +30,7 @@ uint8_t saturn_cmd_m_needs_ytrim = 0;
 uint32_t saturn_vdp1_bus_cmd_bytes = 0;
 uint32_t saturn_vdp1_bus_tex_bytes = 0;
 unsigned int saturn_v1_page_flushes = 0;   /* VDP1 texture page flushes (HUD 'Y') */
+unsigned int saturn_v1_variant_uploads = 0; /* flat variant pyramids built (transposed / tile) */
 
 static const uint32_t hw_mask_left[32] = {
     0xFFFFFFFFu, 0xFFFFFFFEu, 0xFFFFFFFCu, 0xFFFFFFF8u,
