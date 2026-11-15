@@ -1253,6 +1253,17 @@ void I_FinishUpdate(void)
         (void)saturn_vdp1_bus_tex_bytes;
         if (++s_pos_step == (g_walk_frames > 0 ? g_walk_frames + 10 : 20)) {
             SaveFramebufferBMP("pos_triple.bmp", s_combined_fb, COMBINED_W, COMBINED_H);
+            {
+                /* Raw VDP1 VRAM of the final frame (command words are host-endian
+                 * uint32, textures bytes): replay it on 5thPlanet's VDP1 plotter
+                 * (crates/saturn/examples/vdp1_replay.rs) to see hardware raster
+                 * holes the emulator here doesn't model. */
+                FILE *vf = fopen("pos_vram.bin", "wb");
+                if (vf) {
+                    fwrite(saturn_win32_vdp1_vram, 1, sizeof(saturn_win32_vdp1_vram), vf);
+                    fclose(vf);
+                }
+            }
             exit(0);
         }
 pos_done:;

@@ -1578,6 +1578,11 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
             if (bz[i] < z_eff) out |= 1 << i;
         if (out == 15)
             continue;
+        /* One corner out: the slide below covers the pentagon minus one
+         * triangle (the kept neighbour, both clip points); drawn separately
+         * as a flat-colour polygon, see after the band's colour. */
+        int tri_on = 0;
+        fixed_t tri_x[3], tri_z[3];
         if (out)
         {
             fixed_t f0, f1;
@@ -1618,11 +1623,35 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
                 {
                     if (!(out & (1 << i)))
                         continue;
-                    int p = row_p[i];
-                    if (out & (1 << p))
-                        p = side_p[i];
+                    /* Both neighbours in front (one corner out): the exact
+                     * clip is a pentagon, and sliding along one edge drops
+                     * the triangle next to the OTHER neighbour. Slide towards
+                     * the deeper neighbour, so the dropped triangle hugs the
+                     * shallower one, nearest the clip line, i.e. off screen.
+                     * (Always taking the row partner dropped a visible
+                     * triangle down to the top rows: the white mark at the
+                     * top edge of the view, hardware video 18:30, E1M1
+                     * X738 Y-3147 A353.) */
+                    int pr = row_p[i], ps = side_p[i];
+                    int p;
+                    if (!(out & (1 << pr)) && !(out & (1 << ps)))
+                        p = (oz[ps] > oz[pr]) ? ps : pr;
+                    else
+                        p = (out & (1 << pr)) ? ps : pr;
                     if (out & (1 << p)) { lone = i; continue; }
                     HW_SlideToDepth(ox[p], oz[p], ox[i], oz[i], z_eff, &bx[i], &bz[i], &f0);
+                    if (!(out & (1 << pr)) && !(out & (1 << ps)))
+                    {
+                        /* the triangle this slide drops: other neighbour q,
+                         * its clip point on q-i, and the slid point */
+                        int q = (p == pr) ? ps : pr;
+                        fixed_t qx, qz;
+                        HW_SlideToDepth(ox[q], oz[q], ox[i], oz[i], z_eff, &qx, &qz, &f1);
+                        tri_x[0] = ox[q]; tri_z[0] = oz[q];
+                        tri_x[1] = qx;    tri_z[1] = qz;
+                        tri_x[2] = bx[i]; tri_z[2] = bz[i];
+                        tri_on = 1;
+                    }
                 }
                 if (lone >= 0)
                 {
@@ -1670,6 +1699,38 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
         if (zb > 127u) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
         uint32_t quad_size = ((uint32_t)r0 << 16) | 0x0800u | (uint32_t)(r1 - r0);
+
+        /* The triangle the one-corner slide dropped (see tri_on): a small
+         * piece at the clip line, i.e. the screen's top / bottom edge. Drawn
+         * untextured in the flat's most common colour; leaving it out let the
+         * sky behind the view show through (white marks on hardware). */
+        if (tri_on && local_q < qcap)
+        {
+            int tx[3], ty[3], on = 0;
+            for (i = 0; i < 3; i++)
+            {
+                int s = HW_SlaveFastDiv(tri_z[i]);
+                tx[i] = HW_ProjX(tri_x[i], s, vcx);
+                ty[i] = HW_ProjY(y_w, s, vcy);
+                if ((unsigned int)(tx[i] + 1000) > 2000u || (unsigned int)(ty[i] + 1000) > 2000u)
+                    on = -1;
+                else if (on >= 0 && ty[i] >= 0 && ty[i] <= vh)
+                    on = 1;
+            }
+            if (on > 0)
+            {
+                aliased_uint32_t *t32 = (aliased_uint32_t *)&fctx->cmd_s_out[local_q++];
+                uint32_t col = (uint32_t)(is_ceil ? fctx->avg_ceil : fctx->avg_floor);
+                t32[0] = 0x00040000u;                                   /* polygon */
+                t32[1] = ((0x00C0u | (pmod & 0x0600u)) << 16) | (w1 & 0xFF00u) | col;
+                t32[2] = 0;
+                t32[3] = ((uint32_t)tx[0] << 16) | (uint16_t)ty[0];
+                t32[4] = ((uint32_t)tx[1] << 16) | (uint16_t)ty[1];
+                t32[5] = ((uint32_t)tx[2] << 16) | (uint16_t)ty[2];
+                t32[6] = t32[5];
+                t32[7] = 0;
+            }
+        }
 
         int big = 0;
         for (i = 0; i < 4; i++)
