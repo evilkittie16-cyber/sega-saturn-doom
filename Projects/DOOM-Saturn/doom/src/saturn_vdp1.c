@@ -220,14 +220,49 @@ static unsigned int    v1_arena_end = V1_PAGE0_END;
 static unsigned int    v1_page_off[2] = { V1_PAGE0_START, V1_PAGE1_START };
 static unsigned int    v1_page_base[2] = { V1_PAGE0_START, V1_PAGE1_START };
 static int             v1_page_flush[2] = { 1, 1 };
-/* Preemptive flush: re-start a page whose free space dropped under this
- * when it comes back into use, so a growing working set doesn't hit a
- * mid-frame refusal (= missing walls/sprites for a frame). */
-#define V1_PAGE_LOWWATER  (96u * 1024u)
-#define V1_PAGE_MINFREE   (16u * 1024u)   /* always re-start below this */
-static unsigned int v1_frame_start_off = V1_PAGE0_START; /* arena offset after the last Reset */
-static int          v1_prev_flushed = 1;                 /* flushed; refill not measured yet */
-static unsigned int v1_lowwater = V1_PAGE_LOWWATER;      /* adaptive pre-emptive flush mark */
+/* Texture cache = a ring over [v1_page_base[0], V1_PAGE0_END) with
+ * EVICTION instead of whole-cache flushes (2026-11-15).
+ *
+ * A full flush re-uploaded the whole on-screen working set (170-260 KB)
+ * in one frame — a ~180 ms hitch every time E1M1's walk filled the cache
+ * — and, worse, VDP1 auto-draw keeps re-rasterising the LAST committed
+ * list every vblank until the next commit, so the uploads overwrote
+ * textures that list still used: garbage textures on screen for the
+ * whole hitch (wall texels on floors while moving, on hardware).
+ *
+ * Now: every upload is logged (VRAM range + owning tag + age), the log
+ * kept sorted by offset, and uploads go FIRST-FIT into the gaps between
+ * logged ranges (the textures VDP1 still needs are scattered, so one bump
+ * run can't use the free space). At the frame boundary
+ * (Saturn_Vdp1Wall_Reset), if free space is low or an upload was refused,
+ * v1_evict() scans the live command table, protects (and re-ages) every
+ * logged range it references, and drops the oldest unprotected uploads
+ * until V1_EVICT_TARGET is free and a hole fits the largest refused
+ * upload. Only tag fields pointing into dropped ranges are cleared, so
+ * only textures not drawn last frame are ever re-uploaded, and nothing
+ * the live list references is overwritten. Mid-frame overflow refuses
+ * the texture for that frame (missing quad, never garbage). A full flush
+ * remains for level start / mode toggles / log overflow. */
+#define V1_EVICT_LOWWATER (64u * 1024u)   /* evict when free space drops below */
+#define V1_EVICT_TARGET   (128u * 1024u)  /* free space to reach when evicting */
+#define V1_OPT_RESERVE    (32u * 1024u)   /* headroom kept when adding optional wall copies */
+#define V1_LOG_MAX        1024
+typedef struct {
+    unsigned short off32;   /* VRAM byte offset / 32 */
+    unsigned short len32;   /* rounded length / 32 */
+    unsigned int   age;     /* upload sequence (refreshed when seen live) */
+    v1_tag_t      *tag;     /* owning tag (fields pointing in range get cleared) */
+} v1_alloc_t;
+static v1_alloc_t    v1_log[V1_LOG_MAX];    /* sorted by off32 */
+static unsigned char v1_log_prot[V1_LOG_MAX];
+static int           v1_log_n = 0;
+static int           v1_log_full = 0;       /* log overflowed: full flush at next Reset */
+static int           v1_want_evict = 0;     /* an upload was refused this frame */
+static unsigned int  v1_want_bytes = 0;     /* largest refused upload since the last evict */
+static unsigned int  v1_used_bytes = 0;     /* sum of logged lengths */
+static unsigned int  v1_age = 0;
+unsigned int         saturn_v1_evictions = 0;    /* HUD 'E' */
+unsigned int         saturn_v1_evicted_bytes = 0;
 /* diagnostics for the HUD row */
 int saturn_v1w_modr;            /* MODR readback (TVM/FCM/VBE bits)   */
 int saturn_v1w_edsr = 3;        /* EDSR at HUD paint time             */
@@ -733,42 +768,232 @@ static void v1_tags_try_alloc(void)
     v1_page_flush[0] = v1_page_flush[1] = 1;
 }
 
-/* Bump-allocate `bytes` in the current page. 0 = page full: the quad is
- * refused THIS frame and the page is flushed the next time it comes
- * into use (flushing now would overwrite textures this frame's quads
- * already reference). */
-static unsigned int v1_arena_alloc(int bytes)
-{
-    unsigned int off = v1_arena_off;
+unsigned int saturn_v1_alloc_bytes = 0;   /* cumulative texture bytes uploaded to VDP1 VRAM */
 
-    if (off + (unsigned int)bytes > v1_arena_end)
-    {
-        v1_page_flush[v1_tex_page] = 1;
-        saturn_v1w_refuse++;        /* HUD 'X': texture missing this frame */        return 0;
-    }
-    v1_arena_off += (unsigned int)((bytes + 31) & ~31);
-    return off;
+static unsigned int v1_free_total(void)
+{
+    unsigned int cap = V1_PAGE0_END - v1_page_base[0];
+    return (cap > v1_used_bytes) ? (cap - v1_used_bytes) : 0u;
 }
 
-/* Optional textures (flat variant pyramids): allocate only while at least
- * `reserve` bytes stay free for walls and sprites, and NEVER request a page
- * flush on failure. A failed optional upload just draws without it; a flush
- * would throw away every cached wall/sprite texture and, with variants
- * re-requested every frame, thrash the cache (E1M1 nukage room on
- * hardware: a flush + 12 variant rebuilds per frame, 1.7 FPS). */
 unsigned int Saturn_Vdp1_ArenaFree(void)
 {
-    return (v1_arena_end > v1_arena_off) ? (v1_arena_end - v1_arena_off) : 0u;
+    return v1_free_total();
 }
 
-static unsigned int v1_arena_alloc_soft(int bytes, unsigned int reserve)
+/* First gap of at least `len` bytes between logged ranges (sorted log).
+ * Returns its offset (never 0: the arena starts at 0x10000) or 0, and the
+ * log index to insert at. */
+static unsigned int v1_find_gap(unsigned int len, int *pos)
 {
-    unsigned int off = v1_arena_off;
+    unsigned int prev_end = v1_page_base[0];
+    int i;
+    for (i = 0; i < v1_log_n; i++)
+    {
+        unsigned int eo = (unsigned int)v1_log[i].off32 << 5;
+        unsigned int ee = eo + ((unsigned int)v1_log[i].len32 << 5);
+        if (eo >= prev_end && eo - prev_end >= len)
+        {
+            *pos = i;
+            return prev_end;
+        }
+        if (ee > prev_end)
+            prev_end = ee;
+    }
+    if (prev_end + len <= V1_PAGE0_END)
+    {
+        *pos = v1_log_n;
+        return prev_end;
+    }
+    return 0;
+}
 
-    if (off + (unsigned int)bytes + reserve > v1_arena_end)
+/* First-fit allocate and log `bytes` for `tag`, keeping `reserve` bytes of
+ * total free space untouched. 0 = no room. */
+static unsigned int v1_alloc_fit(unsigned int bytes, v1_tag_t *tag, unsigned int reserve)
+{
+    unsigned int len = (bytes + 31u) & ~31u;
+    unsigned int off;
+    int pos, i;
+
+    if (v1_log_n >= V1_LOG_MAX)
+    {
+        v1_log_full = 1;
         return 0;
-    v1_arena_off += (unsigned int)((bytes + 31) & ~31);
+    }
+    if (v1_free_total() < len + reserve)
+        return 0;
+    off = v1_find_gap(len, &pos);
+    if (off == 0)
+        return 0;
+    for (i = v1_log_n; i > pos; i--)
+        v1_log[i] = v1_log[i - 1];
+    v1_log[pos].off32 = (unsigned short)(off >> 5);
+    v1_log[pos].len32 = (unsigned short)(len >> 5);
+    v1_log[pos].age   = ++v1_age;
+    v1_log[pos].tag   = tag;
+    v1_log_n++;
+    v1_used_bytes += len;
+    saturn_v1_alloc_bytes += bytes;
+    if (off + len > v1_arena_off)
+        v1_arena_off = off + len;   /* high-water: the preload base uses it */
     return off;
+}
+
+/* Required texture: on failure the quad is refused THIS frame and the next
+ * Reset evicts (evicting now could overwrite textures this frame's quads
+ * already reference). */
+static unsigned int v1_arena_alloc(int bytes, v1_tag_t *tag)
+{
+    unsigned int off = v1_alloc_fit((unsigned int)bytes, tag, 0u);
+    if (off == 0)
+    {
+        v1_want_evict = 1;
+        if ((unsigned int)bytes > v1_want_bytes)
+            v1_want_bytes = (unsigned int)bytes;
+        saturn_v1w_refuse++;        /* HUD 'X': texture missing this frame */
+    }
+    return off;
+}
+
+/* Optional textures (flat variant pyramids): only while `reserve` bytes stay
+ * free for walls and sprites, and a failure never triggers an eviction —
+ * the surface just draws without it. */
+static unsigned int v1_arena_alloc_soft(int bytes, unsigned int reserve, v1_tag_t *tag)
+{
+    return v1_alloc_fit((unsigned int)bytes, tag, reserve);
+}
+
+/* Does tag field value `s` (SRCA = byte offset / 8) point into log entry e? */
+static int v1_field_in(unsigned short s, const v1_alloc_t *e)
+{
+    unsigned int a, lo, hi;
+    if (s == 0 || s == V1_TAG_BAD)
+        return 0;
+    a  = (unsigned int)s << 3;
+    lo = (unsigned int)e->off32 << 5;
+    hi = lo + ((unsigned int)e->len32 << 5);
+    return a >= lo && a < hi;
+}
+
+/* Entry no longer referenced by its tag (re-uploaded elsewhere / cleared). */
+static int v1_entry_stale(const v1_alloc_t *e)
+{
+    const v1_tag_t *t = e->tag;
+    return !(v1_field_in(t->srca, e) || v1_field_in(t->srca_mono, e) || v1_field_in(t->srca_64, e));
+}
+
+static void v1_entry_drop(const v1_alloc_t *e)
+{
+    v1_tag_t *t = e->tag;
+    if (v1_field_in(t->srca, e))      t->srca = 0;
+    if (v1_field_in(t->srca_mono, e)) t->srca_mono = 0;
+    if (v1_field_in(t->srca_64, e))   t->srca_64 = 0;
+}
+
+/* Read 16-bit field `idx` of the 32-byte VDP1 command at VRAM `base`
+ * (both builds store commands as native uint32 words, first field high). */
+static unsigned int v1_cmd_field(unsigned int base, int idx)
+{
+    uint32_t w = *(volatile uint32_t *)(V1_BASE + base + (unsigned int)((idx >> 1) << 2));
+    return (idx & 1) ? (w & 0xFFFFu) : (w >> 16);
+}
+
+/* Free space by dropping the oldest log entries the live command list
+ * doesn't reference, until `target` bytes are free and a hole fits the
+ * largest refused upload. Returns 0 if almost nothing could be freed
+ * (the live list covers the arena: caller full-flushes). */
+static int v1_evict(unsigned int target)
+{
+    const unsigned int base = v1_page_base[0];
+    int i, n;
+
+    /* 1. drop stale entries (the log stays sorted by offset) */
+    n = 0;
+    for (i = 0; i < v1_log_n; i++)
+    {
+        v1_alloc_t e = v1_log[i];
+        if ((unsigned int)e.off32 << 5 < base || v1_entry_stale(&e))
+        {
+            v1_used_bytes -= (unsigned int)e.len32 << 5;
+            continue;
+        }
+        v1_log[n++] = e;
+    }
+    v1_log_n = n;
+    for (i = 0; i < n; i++)
+        v1_log_prot[i] = 0;
+
+    /* 2. protect everything the live (last committed) list references:
+     *    VDP1 re-draws it every vblank until the next commit */
+    if (v1_have_frame)
+    {
+        unsigned int c;
+        for (c = V1_USER0; c + 32u <= V1_CMD_LIMIT; c += 32u)
+        {
+            unsigned int ctrl = v1_cmd_field(c, 0);
+            unsigned int a;
+            int lo, hi;
+            if (ctrl & 0x8000u)
+                break;                          /* END */
+            if ((ctrl & 0xFu) > 2u)
+                continue;                       /* untextured / clip / local */
+            a = v1_cmd_field(c, 4) << 3;        /* CMDSRCA -> byte offset */
+            lo = 0; hi = n - 1;
+            while (lo <= hi)                    /* entry with off <= a < end */
+            {
+                int mid = (lo + hi) >> 1;
+                unsigned int eo = (unsigned int)v1_log[mid].off32 << 5;
+                if (a < eo)
+                    hi = mid - 1;
+                else if (a >= eo + ((unsigned int)v1_log[mid].len32 << 5))
+                    lo = mid + 1;
+                else
+                {
+                    v1_log_prot[mid] = 1;
+                    v1_log[mid].age = v1_age;   /* in use: counts as recent */
+                    break;
+                }
+            }
+        }
+    }
+
+    /* 3. drop the oldest unprotected entries until enough is free and a
+     *    hole fits the largest upload refused since the last eviction */
+    {
+        const unsigned int need = (v1_want_bytes + 31u) & ~31u;
+        for (;;)
+        {
+            int pos, victim = -1;
+            unsigned int best = 0xFFFFFFFFu;
+            if (v1_free_total() >= target && (need == 0 || v1_find_gap(need, &pos)))
+                break;
+            for (i = 0; i < n; i++)
+            {
+                if (!v1_log_prot[i] && v1_log[i].age < best)
+                {
+                    best = v1_log[i].age;
+                    victim = i;
+                }
+            }
+            if (victim < 0)
+                break;
+            v1_entry_drop(&v1_log[victim]);
+            saturn_v1_evicted_bytes += (unsigned int)v1_log[victim].len32 << 5;
+            v1_used_bytes -= (unsigned int)v1_log[victim].len32 << 5;
+            for (i = victim; i + 1 < n; i++)
+            {
+                v1_log[i] = v1_log[i + 1];
+                v1_log_prot[i] = v1_log_prot[i + 1];
+            }
+            n--;
+            v1_log_n = n;
+        }
+    }
+    v1_want_bytes = 0;
+    Saturn_Vdp1_ClearTexCacheMRU();
+    saturn_v1_evictions++;
+    return v1_free_total() >= (16u * 1024u);
 }
 
 /* Copy a contiguous row-major 8bpp block into VDP1 VRAM. The source's
@@ -963,7 +1188,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
     if (texnum > 0 && saturn_wall_subdivision && tw > 16)
     {
         int strip_bytes = ((tw + 15) / 16) * 16 * th;
-        unsigned int off_strip = v1_arena_alloc(strip_bytes);
+        unsigned int off_strip = v1_arena_alloc(strip_bytes, tag);
         if (off_strip == 0)
             return 0;
         v1_copy_strip_major(off_strip, src, tw, th);
@@ -973,9 +1198,9 @@ static int v1_tex_get(int texnum, int *w, int *h)
         if (tw >= 64 && (tw & 63) == 0)
         {
             int bytes_32 = (tw >> 1) * th;
-            if (v1_arena_off + (unsigned int)bytes_32 + (128u * 1024u) <= v1_arena_end)
+            if (v1_free_total() >= (unsigned int)bytes_32 + V1_OPT_RESERVE)
             {
-                unsigned int off_32 = v1_arena_alloc(bytes_32);
+                unsigned int off_32 = v1_arena_alloc(bytes_32, tag);
                 if (off_32 != 0)
                 {
                     v1_copy_32_blocks(off_32, src, tw, th);
@@ -983,17 +1208,17 @@ static int v1_tex_get(int texnum, int *w, int *h)
                 }
             }
         }
-        else if (v1_arena_off + (unsigned int)(tw * th) + (128u * 1024u) <= v1_arena_end)
+        else if (v1_free_total() >= (unsigned int)(tw * th) + V1_OPT_RESERVE)
         {
-            unsigned int off_mono = v1_arena_alloc(tw * th);
+            unsigned int off_mono = v1_arena_alloc(tw * th, tag);
             if (off_mono != 0)
             {
                 v1_copy_block(off_mono, src, tw * th);
                 tag->srca_mono = (unsigned short)(off_mono / 8u);
                 if (tw == 32 && th <= 16 &&
-                    v1_arena_off + (unsigned int)(64 * th) + (128u * 1024u) <= v1_arena_end)
+                    v1_free_total() >= (unsigned int)(64 * th) + V1_OPT_RESERVE)
                 {
-                    unsigned int off_64 = v1_arena_alloc(64 * th);
+                    unsigned int off_64 = v1_arena_alloc(64 * th, tag);
                     if (off_64 != 0)
                     {
                         int y;
@@ -1015,7 +1240,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
          *   +4096 (srca + 512): 32x32 Level 1 (1,024 B, CMDSIZE 0x0420)
          *   +5120 (srca + 640): 16x16 Level 2 (  256 B, CMDSIZE 0x0210)
          *   +5376 (srca + 672):   8x8 Level 3 (   64 B, CMDSIZE 0x0108) */
-        off = v1_arena_alloc(5440);
+        off = v1_arena_alloc(5440, tag);
         if (off == 0)
             return 0;
         v1_copy_block(off, src, 4096);
@@ -1082,7 +1307,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
          * u_span > tw or near-clipped (e.g. DOORTRAK on 16-unit door jambs).
          * Tile 8-pixel-wide wall textures twice horizontally into a 16xth block. */
         int y;
-        off = v1_arena_alloc(16 * th);
+        off = v1_arena_alloc(16 * th, tag);
         if (off == 0)
             return 0;
         for (y = 0; y < th; y++)
@@ -1097,7 +1322,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
     }
     else
     {
-        off = v1_arena_alloc(tw * th);
+        off = v1_arena_alloc(tw * th, tag);
         if (off == 0)
             return 0;
         v1_copy_block(off, src, tw * th);
@@ -1160,7 +1385,7 @@ static int v1_spr_get(int scache, int *pw_out, int *h_out)
     pw    = (w + 7) & ~7;
     bytes = pw * h;
 
-    off = v1_arena_alloc(bytes);
+    off = v1_arena_alloc(bytes, tag);
     if (off == 0)
         return 0;
 
@@ -1403,36 +1628,24 @@ void Saturn_Vdp1Wall_Reset(void)
      * or pass on the previous draw's stale CEF. The wait that matters
      * is in Saturn_Vdp1Wall_Frame, before the command list is rewritten
      * — once that list is replaced, the old page is free. */
-    /* Remember how full the outgoing page is: its uploads stay resident
-     * (persistent cache) for the next time it comes into use. */
+    /* Texture cache with eviction (see v1_evict). Evict only right after a
+     * committed frame: Reset can run twice per frame, and the live list
+     * in VDP1 VRAM must be the one VDP1 is actually re-drawing. */
+    int v1_frame_boundary = v1_page_committed || !v1_have_frame;
     v1_page_off[0] = v1_arena_off;
     v1_page_off[1] = v1_arena_off;
     v1_tex_page = 0;
     v1_page_committed = 0;
-    v1_arena_end = V1_PAGE0_END;
 
-    /* Flush the unified persistent cache if it overflowed, or pre-emptively
-     * when free space drops under the low-water mark. The mark adapts: it
-     * is at most half of what the last refill left free. With a fixed
-     * 96 KB mark, a working set that refills to just under it was flushed
-     * EVERY frame and rebuilt identically (wall composition + flat variant
-     * pyramids each time): E1M1's nukage room ran at 1.7 FPS on hardware.
-     * Now a pre-emptive flush needs real growth past the refilled set. */
     v1_tags_try_alloc();
-    unsigned int v1_free = v1_arena_end - v1_page_off[0];
-    if (v1_prev_flushed && v1_page_off[0] > v1_frame_start_off)
+    int v1_do_flush = v1_page_flush[0] || v1_log_full;
+    if (!v1_do_flush && v1_frame_boundary
+        && (v1_want_evict || v1_free_total() < V1_EVICT_LOWWATER))
     {
-        /* first Reset after the refill frame (Reset can run twice per
-         * frame; a call with no uploads since the last one waits) */
-        unsigned int half = v1_free >> 1;
-        v1_lowwater = (half < V1_PAGE_LOWWATER) ? half : V1_PAGE_LOWWATER;
-        v1_prev_flushed = 0;
+        v1_want_evict = 0;
+        if (!v1_evict(V1_EVICT_TARGET))
+            v1_do_flush = 1;    /* live list fragments the whole ring */
     }
-    int v1_do_flush = v1_page_flush[0]
-        || v1_free < V1_PAGE_MINFREE
-        || (!v1_prev_flushed && v1_free < v1_lowwater);
-    if (v1_do_flush)
-        v1_prev_flushed = 1;
     if (v1_do_flush)
     {
 #ifndef SATURN_WIN32
@@ -1471,18 +1684,29 @@ void Saturn_Vdp1Wall_Reset(void)
                 }
             }
         }
+        {
+            /* anything else uploaded since the preload (e.g. a flat that
+             * wasn't preloaded) must not keep pointing at reused VRAM */
+            int i;
+            for (i = 0; i < v1_log_n; i++)
+                v1_entry_drop(&v1_log[i]);
+        }
         v1_page_off[0] = v1_page_base[0];
         v1_page_off[1] = v1_page_base[0];
         v1_page_flush[0] = 0;
         v1_page_flush[1] = 0;
+        v1_log_n = 0;
+        v1_log_full = 0;
+        v1_want_evict = 0;
+        v1_used_bytes = 0;
+        v1_arena_end = V1_PAGE0_END;
         Saturn_Vdp1_ClearTexCacheMRU();
         {
             extern unsigned int saturn_v1_page_flushes;
-            saturn_v1_page_flushes++;   /* HUD 'Y': texture cache refills */
+            saturn_v1_page_flushes++;   /* HUD 'Y': full texture cache flushes */
         }
     }
     v1_arena_off = v1_page_off[0];
-    v1_frame_start_off = v1_arena_off;
 
     v1w_table_try_alloc();
     v1q_count = 0;
@@ -1727,7 +1951,7 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     src = Saturn_FlatData(flatnum);
     if (!src)
         return 0;
-    off = v1_arena_alloc_soft(5440, 32768u);
+    off = v1_arena_alloc_soft(5440, 32768u, tag);
     if (off == 0)
         return 0;
     {
@@ -1792,9 +2016,10 @@ void Saturn_Vdp1_ClearPages(void)
     v1_page_committed = 0;
     v1_page_flush[0] = 0;
     v1_page_flush[1] = 0;
-    v1_frame_start_off = V1_PAGE0_START;
-    v1_prev_flushed = 1;
-    v1_lowwater = V1_PAGE_LOWWATER;
+    v1_log_n = 0;
+    v1_log_full = 0;
+    v1_want_evict = 0;
+    v1_used_bytes = 0;
     Saturn_Vdp1_ClearTexCacheMRU();
 }
 
@@ -1824,6 +2049,10 @@ void Saturn_Vdp1_LockPreloadedFlats(void)
     v1_page_base[1] = v1_page_off[0];
     v1_arena_off = v1_page_off[0];
     v1_arena_end = V1_PAGE0_END;
+    /* preloaded pyramids are permanent: never evicted */
+    v1_log_n = 0;
+    v1_log_full = 0;
+    v1_used_bytes = 0;
 }
 
 static int s_mru_texnum = -1;

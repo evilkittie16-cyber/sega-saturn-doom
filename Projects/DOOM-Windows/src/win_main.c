@@ -695,6 +695,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 int g_win32_test_mode = 0;
 int g_pos_x = 0, g_pos_y = 0, g_pos_ang = 0, g_pos_map = 0;   /* -pos */
+int g_walk_x1 = 0, g_walk_y1 = 0, g_walk_frames = 0;          /* -walk */
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
 {
@@ -804,6 +805,15 @@ int main(int argc, char **argv)
             g_pos_y = atoi(argv[i + 2]);
             g_pos_ang = atoi(argv[i + 3]);
             g_win32_test_mode = 22;
+            i += 3;
+            continue;
+        }
+        if (strcmp(argv[i], "-walk") == 0 && i + 3 < argc) {
+            /* after -pos: -walk X1 Y1 FRAMES walks from the -pos point */
+            extern int g_walk_x1, g_walk_y1, g_walk_frames;
+            g_walk_x1 = atoi(argv[i + 1]);
+            g_walk_y1 = atoi(argv[i + 2]);
+            g_walk_frames = atoi(argv[i + 3]);
             i += 3;
             continue;
         }

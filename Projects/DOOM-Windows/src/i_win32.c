@@ -1182,6 +1182,7 @@ void I_FinishUpdate(void)
         extern uint32_t saturn_vdp1_bus_tex_bytes;
         extern int saturn_v1w_refuse;
         extern int g_pos_x, g_pos_y, g_pos_ang;
+        extern int g_walk_frames;
         static int s_pos_step = 0;
         static unsigned int s_last_fl = 0, s_last_vu = 0;
         extern int g_pos_map, saturn_map, saturn_warp_map;
@@ -1194,8 +1195,17 @@ void I_FinishUpdate(void)
         }
         players[0].mo->momx = players[0].mo->momy = players[0].mo->momz = 0;
         P_UnsetThingPosition(players[0].mo);
-        players[0].mo->x = g_pos_x * FRACUNIT;
-        players[0].mo->y = g_pos_y * FRACUNIT;
+        {
+            extern int g_walk_x1, g_walk_y1, g_walk_frames;
+            int wx = g_pos_x, wy = g_pos_y;
+            if (g_walk_frames > 0) {
+                int t = s_pos_step < g_walk_frames ? s_pos_step : g_walk_frames;
+                wx = g_pos_x + (g_walk_x1 - g_pos_x) * t / g_walk_frames;
+                wy = g_pos_y + (g_walk_y1 - g_pos_y) * t / g_walk_frames;
+            }
+            players[0].mo->x = wx * FRACUNIT;
+            players[0].mo->y = wy * FRACUNIT;
+        }
         players[0].mo->angle = (angle_t)(((unsigned long long)g_pos_ang << 32) / 360u);
         {
             subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
@@ -1210,15 +1220,28 @@ void I_FinishUpdate(void)
         }
         P_SetThingPosition(players[0].mo);
         extern unsigned int Saturn_Vdp1_ArenaFree(void);
-        printf("[POS] f%02d flushes+%u variants+%u arena_free:%uKB refuse:%d bus:%uKB quads:%d (W:%d F:%d)\n",
-               s_pos_step, saturn_v1_page_flushes - s_last_fl, saturn_v1_variant_uploads - s_last_vu,
+        extern unsigned int saturn_v1_alloc_bytes;
+        static unsigned int s_last_ab = 0;
+        extern unsigned int saturn_v1_evictions, saturn_v1_evicted_bytes;
+        static unsigned int s_last_ev = 0, s_last_evb = 0;
+        printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
+               s_pos_step, players[0].mo->x >> FRACBITS, players[0].mo->y >> FRACBITS,
+               g_telemetry.avg_err_pct,
+               saturn_v1_page_flushes - s_last_fl,
+               saturn_v1_evictions - s_last_ev, (saturn_v1_evicted_bytes - s_last_evb) >> 10,
+               saturn_v1_variant_uploads - s_last_vu,
+               (saturn_v1_alloc_bytes - s_last_ab) >> 10,
                Saturn_Vdp1_ArenaFree() >> 10,
-               saturn_v1w_refuse, (unsigned)(saturn_vdp1_bus_tex_bytes >> 10),
+               saturn_v1w_refuse,
                g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads);
         fflush(stdout);
         s_last_fl = saturn_v1_page_flushes;
         s_last_vu = saturn_v1_variant_uploads;
-        if (++s_pos_step == 20) {
+        s_last_ab = saturn_v1_alloc_bytes;
+        s_last_ev = saturn_v1_evictions;
+        s_last_evb = saturn_v1_evicted_bytes;
+        (void)saturn_vdp1_bus_tex_bytes;
+        if (++s_pos_step == (g_walk_frames > 0 ? g_walk_frames + 10 : 20)) {
             SaveFramebufferBMP("pos_triple.bmp", s_combined_fb, COMBINED_W, COMBINED_H);
             exit(0);
         }

@@ -844,6 +844,7 @@ void Saturn_HUD_Draw(void)
         static unsigned int win_up_max = 0, pf_up_kb = 0, last_bus = 0;
         static unsigned int last_flushes = 0, pf_flushes = 0;
         static unsigned int last_ring_waits = 0, pf_ring_waits = 0, pf_ring_depth = 0;
+        static unsigned int last_evict = 0, last_evict_b = 0, pf_evict = 0, pf_evict_kb = 0;
         {
             extern uint32_t     saturn_vdp1_bus_tex_bytes;
             unsigned int bus = (unsigned int)saturn_vdp1_bus_tex_bytes;
@@ -928,6 +929,13 @@ void Saturn_HUD_Draw(void)
                     last_ring_waits = saturn_hw_ring_waits;
                     pf_ring_depth = saturn_hw_ring_maxdepth;
                     saturn_hw_ring_maxdepth = 0;
+                }
+                {
+                    extern unsigned int saturn_v1_evictions, saturn_v1_evicted_bytes;
+                    pf_evict    = saturn_v1_evictions - last_evict;
+                    pf_evict_kb = (saturn_v1_evicted_bytes - last_evict_b) >> 10;
+                    last_evict   = saturn_v1_evictions;
+                    last_evict_b = saturn_v1_evicted_bytes;
                 }
                 win_worst_vbl = 0;
                 win_up_max    = 0;
@@ -1166,16 +1174,20 @@ void Saturn_HUD_Draw(void)
                         dbg[dn++] = ' ';
                         dn = hud_tiny_tag(dbg, dn, 'O', HUD_FRT_MS(saturn_prof_hitch_sub[5]));
                     }
-                    /* Y texture-cache flushes, X refusals (per HUD window),
-                     * K deepest slave flat-job backlog / ring-full waits. */
+                    /* Per HUD window: Y full texture-cache flushes,
+                     * E evictions / KB evicted, X refusals, K ring waits
+                     * (slave flat-job ring full; 0 expected). */
                     dbg[dn++] = ' ';
                     dn = hud_tiny_tag(dbg, dn, 'Y', (int)pf_flushes);
                     dbg[dn++] = ' ';
+                    dn = hud_tiny_tag(dbg, dn, 'E', (int)pf_evict);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, (int)pf_evict_kb);
+                    dbg[dn++] = ' ';
                     dn = hud_tiny_tag(dbg, dn, 'X', pf_ref);
                     dbg[dn++] = ' ';
-                    dn = hud_tiny_tag(dbg, dn, 'K', (int)pf_ring_depth);
-                    dbg[dn++] = '/';
-                    dn = hud_tiny_num(dbg, dn, (int)pf_ring_waits);
+                    dn = hud_tiny_tag(dbg, dn, 'K', (int)pf_ring_waits);
+                    (void)pf_ring_depth;
                     (void)saturn_prof_hitch_comp;
                     (void)saturn_prof_hitch_bg; (void)saturn_prof_hitch_slv; (void)saturn_prof_hitch_cull;
                     (void)saturn_prof_hitch_mfl; (void)saturn_prof_hitch_hud;
