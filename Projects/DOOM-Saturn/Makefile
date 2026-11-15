@@ -110,6 +110,18 @@ COMPILER_DIR=../../Compiler
 CCFLAGS += -I./doom/src -I./doom/d32xr
 # -fpermissive removed for C compilation
 CCFLAGS += -DMARS=1 -DSATURN=1
+# Profiling build: `set SATURN_PROF=1` before compile.bat. Turns on the
+# per-subsector sub-timers, so the HUD prints B<bsp>/<aperture>/<occlusion>
+# and G<segs>/<wall quads>/<portals> (ms).
+# VDP1 manual frame-change mode (saturn_vdp1.c): VDP1 draws each list once
+# and slow frames are held instead of cut off. SATURN_V1_MANUAL=0 restores
+# the old 1-cycle mode.
+SATURN_V1_MANUAL ?= 1
+CCFLAGS += -DSATURN_V1_MANUAL=$(SATURN_V1_MANUAL)
+SATURN_PROF ?= 0
+ifeq ($(SATURN_PROF),1)
+CCFLAGS += -DHW_PROF_SUBTIMERS=1
+endif
 # JO_FS_MAX_FILES is 256 in Jo Engine v2026.1
 CCFLAGS += -fno-strict-aliasing
 
@@ -135,8 +147,16 @@ doom/src/saturn_cmdbuf.o: doom/src/saturn_cmdbuf.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
 
 SATURN_HW_DEPS = doom/src/saturn_hw_internal.h doom/src/saturn_hw_occl.c doom/src/saturn_hw_math.h doom/src/saturn_hw_sky.c doom/src/saturn_hw_sprites.c doom/src/saturn_hw_flats.c doom/src/saturn_hw_walls.c
+# SATURN_HW_OS=1: experiment — compile the renderer for size (-Os, no per-function
+# O2) to shrink its instruction-cache footprint.
+SATURN_HW_OS ?= 0
+ifeq ($(SATURN_HW_OS),1)
+HW_RENDER_FLAGS = $(filter-out -O2,$(CCFLAGS_OPT)) -Os -DHW_SIZE_OPT
+else
+HW_RENDER_FLAGS = $(CCFLAGS_OPT)
+endif
 doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c $(SATURN_HW_DEPS)
-	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
 
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@

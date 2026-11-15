@@ -67,7 +67,9 @@ typedef struct {
 
 /* Sega Saturn VDP1 hardware performance model */
 #define VDP1_CLOCK_FREQ            28636364  /* 28.636 MHz */
+#ifndef VDP1_FRAME_CYCLES_60HZ   /* overridable: test real-hardware VDP1 overruns */
 #define VDP1_FRAME_CYCLES_60HZ     (VDP1_CLOCK_FREQ / 60) /* 477,272 */
+#endif
 #define VDP1_FRAME_CYCLES_30HZ     (VDP1_CLOCK_FREQ / 30) /* 954,544 */
 #define VDP1_CMD_OVERHEAD_CYCLES   32        /* command read + slope DDA setup */
 #define VDP1_DISTORTED_PIX_CYCLES  2         /* 2 cycles per textured pixel in 8bpp */
@@ -158,6 +160,8 @@ static inline void edge_advance(Edge *e, const Edge *s, int32_t n)
  *     span exit when leaving the active clip window
  *   - Hardware `AdjustDrawTiming` (`x (1 + 24/256)` in 8bpp) cycle accounting
  * ============================================================================ */
+
+uint32_t g_vdp1_offscreen_cycles = 0, g_vdp1_offscreen_quads = 0;   /* per frame, reset in RenderFrame */
 
 static inline int32_t vdp1_sxt(int32_t v, uint32_t bits)
 {
@@ -867,6 +871,8 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
     int local_x = 0, local_y = 0;
     int quads_drawn = 0;
     uint32_t hw_raster_cycles = 0;
+    g_vdp1_offscreen_cycles = 0;
+    g_vdp1_offscreen_quads = 0;
     uint32_t dta = 0;
     int vblank_cutoffs = 0;
 
@@ -979,12 +985,21 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
             int draw_pixels = !s_vdp1_hw_limit_enabled || (hw_raster_cycles <= VDP1_FRAME_CYCLES_60HZ);
             if (!draw_pixels) vblank_cutoffs++;
 
-            hw_raster_cycles += fill_quad_hw(
-                dst_bgra, fb_w, fb_h, draw_pixels,
-                &sys_clip, &user_clip,
-                tex, tw, th, cmap,
-                pmod, colr, dir, q, &dta,
-                tex_entry);
+            {
+                uint32_t qc = fill_quad_hw(
+                    dst_bgra, fb_w, fb_h, draw_pixels,
+                    &sys_clip, &user_clip,
+                    tex, tw, th, cmap,
+                    pmod, colr, dir, q, &dta,
+                    tex_entry);
+                hw_raster_cycles += qc;
+                /* cost of quads reaching far off-screen (any vertex outside
+                 * [-256, 608] x [-256, 480]): VDP1 walks those edges in full */
+                int off = 0;
+                for (int k = 0; k < 4; k++)
+                    off |= (q[k].x < -256) | (q[k].x > 608) | (q[k].y < -256) | (q[k].y > 480);
+                if (off) { g_vdp1_offscreen_cycles += qc; g_vdp1_offscreen_quads++; }
+            }
         }
         else if (comm == CMD_POLYGON) {
             s_frame_polys++;

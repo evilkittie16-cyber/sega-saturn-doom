@@ -1215,7 +1215,10 @@ void I_FinishUpdate(void)
                 players[0].mo->floorz = sec->floorheight;
                 players[0].mo->ceilingz = sec->ceilingheight;
                 players[0].mo->z = sec->floorheight;
-                players[0].viewz = sec->floorheight + 41 * FRACUNIT;
+                {
+                    extern int g_pos_viewh;
+                    players[0].viewz = sec->floorheight + g_pos_viewh * FRACUNIT;
+                }
             }
         }
         P_SetThingPosition(players[0].mo);
@@ -1224,6 +1227,12 @@ void I_FinishUpdate(void)
         static unsigned int s_last_ab = 0;
         extern unsigned int saturn_v1_evictions, saturn_v1_evicted_bytes, saturn_v1_bad_srca;
         static unsigned int s_last_ev = 0, s_last_evb = 0;
+        {
+            extern uint32_t g_vdp1_offscreen_cycles, g_vdp1_offscreen_quads;
+            printf("[VDP1] load:%.1f%% offscreen_quads:%u offscreen_share:%.1f%%\n",
+                   g_telemetry.vdp1_load_pct, g_vdp1_offscreen_quads,
+                   g_telemetry.vdp1_load_pct > 0 ? g_vdp1_offscreen_cycles * 100.0 / (g_telemetry.vdp1_load_pct * 4772.72) : 0.0);
+        }
         printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) badsrca:%u variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
                s_pos_step, players[0].mo->x >> FRACBITS, players[0].mo->y >> FRACBITS,
                g_telemetry.avg_err_pct,

@@ -64,7 +64,11 @@ static inline unsigned short Saturn_HW_ReadFRT(void)
 #define HW_COLD_OS
 #else
 #define HW_NOINLINE __attribute__((noinline))
+#ifdef HW_SIZE_OPT   /* experiment: whole renderer at -Os (I-cache footprint) */
+#define HW_HOT_O2
+#else
 #define HW_HOT_O2   __attribute__((optimize("O2", "no-reorder-blocks")))
+#endif
 #define HW_COLD_OS  __attribute__((optimize("Os")))
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif

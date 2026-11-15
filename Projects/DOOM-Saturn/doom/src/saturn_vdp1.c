@@ -609,6 +609,101 @@ static void v1_write_priority_regs(void)
 
 extern void Saturn_VDP2_Plane_VBlank(void);
 
+/* MANUAL FRAME-CHANGE MODE (SATURN_V1_MANUAL, 2026-11-15).
+ *
+ * In the default 1-cycle mode (FBCR FCM=FCT=0) VDP1 swaps buffers and
+ * restarts the command list at EVERY field. A list that needs more than
+ * one field is cut off at the swap ("transfer-over", VDP1 manual p.53),
+ * which loses the NEAREST quads because the list runs far-to-near: the
+ * striped near floors and missing close walls seen on hardware. And at 30
+ * FPS every list is drawn twice, so the CPU's CEF wait usually lands in
+ * a redundant redraw (~6 ms/frame measured in 5thPlanet).
+ *
+ * Manual mode (FBCR FCM=1; VDP1 manual p.38-39, Jo Engine's own
+ * JO_VDP1_MANUAL_CHANGE pipeline): VDP1 draws a list ONCE, at the frame
+ * change WE request (FBCR = FCM|FCT = 3, written at vblank), and the
+ * display keeps the last finished frame until the next change — a slow
+ * frame is held, never cut. There is no automatic erase in this mode, so
+ * every list starts with a transparent polygon over the 3D view
+ * (Saturn_CmdBuf_WriteClear). The r6 manual-mode attempt failed because
+ * it used the VBE vblank erase, which hit the buffer about to DISPLAY;
+ * this pipeline never sets VBE.
+ *
+ * State (all touched by the vblank callback and the main loop):
+ *   v1m_pending  a committed list is waiting for its frame change
+ *   v1m_writing  the CPU is rewriting the command table: no change now
+ *   v1m_drawing  a change was requested; VDP1 is (or will be) drawing
+ *   v1m_trig_seq the callback sequence number of that request. EDSR.CEF
+ *                still reads 1 (old draw) until the change actually happens
+ *                at the END of that vblank, so while we are still inside
+ *                the same vblank the draw counts as not finished. */
+#ifndef SATURN_V1_MANUAL
+#define SATURN_V1_MANUAL 0
+#endif
+int saturn_v1_manual = 0;           /* manual mode active (read by saturn_cmdbuf.c) */
+#if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
+#define V2_TVSTAT (*(volatile unsigned short *)0x25F80004u)   /* bit 3 = VBLANK */
+static volatile int          v1m_req = 0, v1m_pending = 0, v1m_writing = 0, v1m_drawing = 0;
+static volatile int          v1m_blank_shown = 0;
+static volatile unsigned int v1m_seq = 0, v1m_trig_seq = 0;
+
+/* Has VDP1 finished the last list we asked it to draw? */
+static int v1m_draw_done(void)
+{
+    if (!v1m_drawing)
+        return 1;
+    if (v1m_seq == v1m_trig_seq && (V2_TVSTAT & 8u))
+        return 0;                   /* change requested, not yet happened */
+    return (V1_EDSR & 2u) != 0;     /* CEF: END fetched */
+}
+
+static void v1m_request_change(void)
+{
+    V1_FBCR = 0x0003u;              /* FCM=1 FCT=1: change at the next field */
+    v1m_pending = 0;
+    v1m_drawing = 1;
+    v1m_trig_seq = v1m_seq;
+}
+
+/* Called from the vblank callback. */
+static void v1m_vblank(void)
+{
+    v1m_seq++;
+    if (!saturn_v1_manual)
+    {
+        if (v1m_req && !v1m_writing)
+        {
+            /* 1-cycle -> manual: "change" is the documented switch (p.39) */
+            saturn_v1_manual = 1;
+            v1m_request_change();
+        }
+        return;
+    }
+    if (v1m_pending && !v1m_writing && v1m_draw_done())
+        v1m_request_change();
+}
+
+/* Main loop: claim the command table. Returns with v1m_writing set and
+ * VDP1 not reading the table (bounded wait). */
+static unsigned int v1m_begin_write(void)
+{
+    unsigned guard = 3500u;
+    v1m_writing = 1;                /* from here the callback won't change frames */
+    while (!v1m_draw_done() && --guard)
+    {
+        for (int w = 0; w < 32; w++)
+            __asm__ volatile("nop");
+    }
+    return guard;
+}
+
+static void v1m_end_write(void)
+{
+    v1m_pending = 1;
+    v1m_writing = 0;
+}
+#endif
+
 static void v1_vblank_callback(void)
 {
     /* QUAD-DRAW FORENSICS (2026-09-07): sample the command table the
@@ -624,6 +719,9 @@ static void v1_vblank_callback(void)
     v1_patch_slot3();
     v1_write_priority_regs();
     Saturn_VDP2_Plane_VBlank();
+#if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
+    v1m_vblank();
+#endif
 }
 
 /* v1_arm_erase DELETED 2026-09-09: the 2026-09-07 "SGL never arms"
@@ -684,6 +782,9 @@ void Saturn_Vdp1Wall_Init(void)
      * priority/sprite registers on every VBlank. */
     jo_core_add_vblank_callback(v1_vblank_callback);
     v1_write_priority_regs();
+#if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
+    v1m_req = 1;                    /* switch to manual frame change at the next vblank */
+#endif
     /* Option A (168 lines default): X2 = 351 (44*8-1), Y2 = 167 (0x00A7), EWRR = 0x58A7.
      * Reclaims ~0.3 ms of VDP1 hardware auto-erase rasterizer time. */
     V1_EWRR = 0x58A7u;
@@ -2253,6 +2354,15 @@ void Saturn_Vdp1Wall_Frame(void)
              * (foreground flats and player weapon) while VDP1 is still drawing! */
             unsigned guard = 3500u;
 
+#if SATURN_V1_MANUAL
+            if (saturn_v1_manual)
+            {
+                /* Manual mode: wait only while VDP1 is still drawing the
+                 * list we last handed it; usually it finished long ago. */
+                guard = v1m_begin_write();
+            }
+            else
+#endif
             while (!(V1_EDSR & 2u) && --guard)
             {
                 if (saturn_vbl_count != vc0 && !(V1_EDSR & 3u))
@@ -2301,6 +2411,13 @@ void Saturn_Vdp1Wall_Frame(void)
         v1_have_frame = 1;
         v1_patch_slot3();
         v1_write_priority_regs();
+#if SATURN_V1_MANUAL
+        if (saturn_v1_manual)
+        {
+            v1m_blank_shown = 0;
+            v1m_end_write();        /* the vblank callback requests the change */
+        }
+#endif
 #endif
     }
     else
@@ -2308,6 +2425,23 @@ void Saturn_Vdp1Wall_Frame(void)
 #ifdef SATURN_WIN32
         *(uint32_t *)(V1_BASE + V1_USER0) = 0x80000000u;
 #else
+#if SATURN_V1_MANUAL
+        if (saturn_v1_manual)
+        {
+            /* No 3D this frame (automap, intermission, ...): manual mode has
+             * no automatic erase, so draw one blank list to clear the last
+             * 3D frame off the sprite layer, once. */
+            if (!v1m_blank_shown)
+            {
+                extern void Saturn_CmdBuf_DeliverBlank(void);
+                v1m_begin_write();
+                Saturn_CmdBuf_DeliverBlank();
+                v1m_blank_shown = 1;
+                v1m_end_write();
+            }
+        }
+        else
+#endif
         V1_VRAM(V1_USER0 + 0x00u) = 0x8000u;
 #endif
     }

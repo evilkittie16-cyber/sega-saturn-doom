@@ -696,6 +696,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 int g_win32_test_mode = 0;
 int g_pos_x = 0, g_pos_y = 0, g_pos_ang = 0, g_pos_map = 0;   /* -pos */
 int g_walk_x1 = 0, g_walk_y1 = 0, g_walk_frames = 0;          /* -walk */
+int g_pos_viewh = 41;                                          /* -viewh */
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
 {
@@ -815,6 +816,14 @@ int main(int argc, char **argv)
             g_walk_y1 = atoi(argv[i + 2]);
             g_walk_frames = atoi(argv[i + 3]);
             i += 3;
+            continue;
+        }
+        if (strcmp(argv[i], "-viewh") == 0 && i + 1 < argc) {
+            /* after -pos: eye height above the floor (default 41; a dead
+             * player's view sinks to 8, low cameras stress near flats) */
+            extern int g_pos_viewh;
+            g_pos_viewh = atoi(argv[i + 1]);
+            i += 1;
             continue;
         }
         if (strcmp(argv[i], "-occl") == 0 && i + 1 < argc) {

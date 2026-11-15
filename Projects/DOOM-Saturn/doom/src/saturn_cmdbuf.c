@@ -128,6 +128,24 @@ CMDBUF_INLINE void v1_write_localcoord(volatile uint32_t *dst32, int x, int y)
     dst32[7] = 0;
 }
 
+/* Manual frame-change mode (saturn_vdp1.c, SATURN_V1_MANUAL) has no
+ * automatic erase: clear the 3D view with one transparent polygon at the
+ * head of every list (Jo Engine's jo_vdp1_make_clear approach). Polygon =
+ * CTRL 0x0004; PMOD 0x00C0 (no end-code / transparency checks, replace);
+ * COLR 0x0000 = the transparent sprite pixel (same value as EWDR's erase).
+ * Coordinates are local (the list's local-coord command centres the view). */
+CMDBUF_INLINE void v1_write_clear(volatile uint32_t *dst32, int vw, int vh)
+{
+    dst32[0] = 0x00040000u;                                  /* CTRL: polygon, LINK 0 */
+    dst32[1] = 0x00C00000u;                                  /* PMOD 0x00C0, COLR 0   */
+    dst32[2] = 0;                                            /* SRCA, SIZE (unused)   */
+    dst32[3] = 0;                                            /* A = (0, 0)            */
+    dst32[4] = ((uint32_t)(uint16_t)(vw - 1) << 16);         /* B = (vw-1, 0)         */
+    dst32[5] = ((uint32_t)(uint16_t)(vw - 1) << 16) | (uint16_t)(vh - 1); /* C */
+    dst32[6] = (uint32_t)(uint16_t)(vh - 1);                 /* D = (0, vh-1)         */
+    dst32[7] = 0;
+}
+
 /* 100% Pipeline-Optimized 32-byte Burst Copy
  * Maximizes SDRAM Read Burst, minimizes Write-Buffer turnaround */
 CMDBUF_HOT_O2 void Saturn_VDP1_BurstCopy32(uint32_t **dst_ptr, const uint32_t **src_ptr)
@@ -433,6 +451,14 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     v1_write_localcoord((volatile uint32_t *)vram32, x_offset, 0);
     vram32 += 8;
 
+    /* 2b. Manual frame-change mode: no hardware erase, clear the view first */
+    extern int saturn_v1_manual;
+    if (saturn_v1_manual)
+    {
+        v1_write_clear((volatile uint32_t *)vram32, vw, vh);
+        vram32 += 8;
+    }
+
     const sub_range_t *ranges = saturn_sub_ranges;
     const uint32_t *cmd_s_base = (const uint32_t *)saturn_cmd_s;
     const uint32_t *cmd_m = (const uint32_t *)saturn_cmd_m;
@@ -490,4 +516,23 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     vram32 += 8;
 
     saturn_vdp1_bus_cmd_bytes = (uint32_t)((uintptr_t)vram32 - (uintptr_t)vram_start);
+}
+
+/* A list that only clears the 3D view (manual frame-change mode, frames
+ * with no 3D: automap, intermission). */
+void Saturn_CmdBuf_DeliverBlank(void)
+{
+    volatile uint32_t *vram32 = (volatile uint32_t *)(SATURN_VDP1_VRAM + SATURN_V1_USER0);
+    extern int saturn_view_w;
+    extern int saturn_view_h;
+    const int vw = (saturn_view_w > 0) ? saturn_view_w : 320;
+    const int vh = (saturn_view_h > 0) ? saturn_view_h : 168;
+    const int x_offset = (352 - vw) >> 1;
+
+    v1_write_userclip(vram32, x_offset, 0, (vw - 1) + x_offset, vh - 1);
+    v1_write_localcoord(vram32 + 8, x_offset, 0);
+    v1_write_clear(vram32 + 16, vw, vh);
+    vram32[24] = 0x80000000u;       /* END */
+    for (int i = 25; i < 32; i++)
+        vram32[i] = 0;
 }
