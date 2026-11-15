@@ -1187,6 +1187,12 @@ void Saturn_HUD_Draw(void)
                     dn = hud_tiny_tag(dbg, dn, 'X', pf_ref);
                     dbg[dn++] = ' ';
                     dn = hud_tiny_tag(dbg, dn, 'K', (int)pf_ring_waits);
+                    {
+                        /* W: VDP1 stuck-draw watchdog recoveries (total) */
+                        extern volatile unsigned int saturn_v1m_watchdog;
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'W', (int)(saturn_v1m_watchdog & 0xFFFFu));
+                    }
                     (void)pf_ring_depth;
                     (void)saturn_prof_hitch_comp;
                     (void)saturn_prof_hitch_bg; (void)saturn_prof_hitch_slv; (void)saturn_prof_hitch_cull;

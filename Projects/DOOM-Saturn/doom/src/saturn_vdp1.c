@@ -672,6 +672,8 @@ extern void Saturn_VDP2_Plane_VBlank(void);
 #define SATURN_V1_MANUAL 0
 #endif
 int saturn_v1_manual = 0;           /* manual mode active (read by saturn_cmdbuf.c) */
+volatile unsigned int saturn_v1m_watchdog = 0;  /* stuck-draw recoveries (HUD 'W') */
+#define V1M_WATCHDOG_FIELDS 8u
 #if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
 #define V2_TVSTAT (*(volatile unsigned short *)0x25F80004u)   /* bit 3 = VBLANK */
 static volatile int          v1m_req = 0, v1m_pending = 0, v1m_writing = 0, v1m_drawing = 0;
@@ -717,6 +719,21 @@ static void v1m_vblank(void)
             v1m_request_change();
         }
         return;
+    }
+    /* Watchdog (2026-11-15 hardware freeze: the 3D picture stopped
+     * changing). A list takes ~1-2 fields; if CEF still isn't set 8 fields
+     * after the request, VDP1 is stuck (never started, or looping), and
+     * without this nothing would ever request another change. Give up on
+     * that draw: the next request's frame change restarts VDP1 at slot 0. */
+    if (v1m_drawing && (v1m_seq - v1m_trig_seq) > V1M_WATCHDOG_FIELDS && !(V1_EDSR & 2u))
+    {
+        saturn_v1m_watchdog++;
+        v1m_drawing = 0;
+        if (!v1m_pending && !v1m_writing)
+        {
+            v1m_pending_table = v1m_draw_table;   /* redraw the last list */
+            v1m_pending = 1;
+        }
     }
     if (v1m_pending && !v1m_writing && v1m_draw_done())
         v1m_request_change();
