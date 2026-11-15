@@ -128,13 +128,28 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     hw_prof_fsub_acc += HW_ProfDelta(ts1, SAT_FRT());
 #endif
 
-    /* 1. Render segs (front walls of this subsector) */
+    /* 1. Render segs (front walls of this subsector). Deferred mode
+     * (saturn_hw_walls.c): record the visible walls, emit them in pass 2. */
+#if HW_DEFER_WALLS
+    int defer_rec0 = hw_defer_nrec;
+    {
+        int ns = (saturn_baked_walls_active && (unsigned)subnum < (unsigned)saturn_baked_wall_num_subsectors)
+               ? (int)saturn_baked_wall_subsectors[subnum].num_segs : 0;
+        hw_defer_on = (hw_defer_nsub < HW_DEFER_SUB_CAP && hw_defer_nrec + ns <= HW_DEFER_REC_CAP);
+        hw_defer_need_snap = 0;
+    }
+#endif
     HW_RenderSubsectorBakedWalls(subnum, sf);
     HW_SUBPROF_MARK(2);
 
     /* 2. Render subsector sprites (lazy per-sector frustum-culled bucketing) */
 #if HW_PROF_SUBTIMERS
     unsigned short ts2 = SAT_FRT();
+#endif
+#if HW_DEFER_WALLS
+    int defer_now = hw_defer_on;
+    uint16_t spr_m0 = saturn_cmd_m_count;
+    hw_defer_on = 0;
 #endif
     if (__builtin_expect(sf->has_things != 0, 0))
     {
@@ -153,6 +168,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
 #else
     ranges[visit_idx].m_start = m_start;
     ranges[visit_idx].m_count = (uint16_t)(saturn_cmd_m_count - m_start);
+#endif
+#if HW_DEFER_WALLS
+    /* After the range write (an immediate flush rewrites it) and before
+     * the occlusion commit (the snapshot must not include this subsector). */
+    if (defer_now)
+        HW_DeferCloseSub(visit_idx, subnum, defer_rec0, spr_m0,
+                         (int)(saturn_cmd_m_count - spr_m0), sf->light_delta);
 #endif
 
     /* 3. Mark solid spans and portal apertures from this subsector */
@@ -536,6 +558,13 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             hw_sub_has_things[i] = 0;
         hw_thing_pool_count = 0;
     }
+#if HW_DEFER_WALLS
+    hw_defer_nsub = 0;
+    hw_defer_nrec = 0;
+    hw_defer_nsnap = 0;
+    hw_defer_on = 0;
+    hw_defer_tex_seen = -1;
+#endif
     hw_render_frame++;
     if (hw_render_frame == 0)
         hw_render_frame = 1;
@@ -651,6 +680,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         tb0 = SAT_FRT();
     } while (__builtin_expect(saturn_vbl_count != vb0, 0));
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
+    HW_EmitDeferredWalls();         /* pass 2: wall quads + sprites */
     saturn_hw_prof_segs = hw_prof_segs_acc;
     saturn_hw_prof_ap = hw_prof_ap_acc;
     saturn_hw_prof_fsub = hw_prof_fsub_acc;

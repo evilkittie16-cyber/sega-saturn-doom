@@ -346,6 +346,87 @@ static hw_wall_emit_ctx_t hw_wctx;
 static uint16_t hw_wctx_tex_frame = 0;
 static const saturn_wl_pillar_t *hw_cur_pillars = NULL;
 
+/* DEFERRED WALL EMISSION (2026-11-15, the 60 FPS work).
+ *
+ * 5thPlanet showed the master's render code running at CPI ~2.5-3.6
+ * (cache-resident code is ~1.3): the BSP walk ran visibility, occlusion,
+ * texture lookup, quad emission and sprites per subsector, ~30 functions
+ * that together are far bigger than the 4 KB cache, so every subsector
+ * refetched all of them. Now the walk (pass 1) only decides visibility and
+ * occlusion and RECORDS each visible wall (hw_wall_rec_t: everything the
+ * emitter reads, the projected pillars copied by value because
+ * local_trans_pillars is per-subsector scratch). Pass 2
+ * (HW_EmitDeferredWalls, right after the walk, while the slave is still on
+ * flats) emits all wall quads and sprites in visit order with a much
+ * smaller code footprint.
+ *
+ * Output is unchanged: each visit's m range still holds its walls then its
+ * sprites (Deliver reads per-visit ranges, so where they sit in cmd_m does
+ * not matter), and the strip-level / sprite occlusion tests run against a
+ * snapshot of the solid mask as it was at that subsector. A subsector that
+ * does not fit the record pool, or needs a snapshot when the snapshot pool
+ * is full, is emitted immediately like before.
+ *
+ * RESULT (5thPlanet, E1M1 start, 2026-11-15): neutral on the master alone.
+ * render 22.04 -> 22.28 ms/frame. Pass 2's emitters did get cache-resident
+ * (HW_EmitWallStrips_Linear_General CPI 2.43 -> 1.78, HW_EmitBakedWallQuads
+ * 3.07 -> 1.83), but recording + the pass-1 bookkeeping cost as much, and
+ * the walk's own functions stayed at CPI ~2.5-3.7 (HighWRAM fetch stalls
+ * only -5%). Kept, OFF by default, as the base for running pass 2 on the
+ * half-idle slave (it needs no texture uploads: pass 1 touches them).
+ * Verified output-identical to the immediate path (DOOM-Windows -pos,
+ * settled frames, 5 spots incl. E1M1 nukage pit + computer room). */
+#ifndef HW_DEFER_WALLS
+#define HW_DEFER_WALLS 0
+#endif
+#ifndef HW_DEFER_REC_CAP
+#define HW_DEFER_REC_CAP  320
+#endif
+#define HW_DEFER_SUB_CAP  CMDBUF_MAX_VISIT
+#ifndef HW_DEFER_SNAP_CAP
+#define HW_DEFER_SNAP_CAP 96
+#endif
+#ifndef HW_DEFER_ALWAYS_SNAP
+#define HW_DEFER_ALWAYS_SNAP 0
+#endif
+
+typedef struct {
+    const baked_seg_t *seg;
+    hw_trans_pillar_t  p0, p1;
+    int                dz_top, dz_bot;
+    int                u_start, u_span;
+    uint32_t           inv_u_span;
+    int16_t            ya0, ya1, yb0, yb1;
+    int16_t            seg_sx, seg_ex, ytop_min, ybot_max;
+    int16_t            wall_h, cur_v;
+    uint8_t            top_overlap, bot_overlap, was_near_clipped, occl_state;
+} hw_wall_rec_t;
+
+typedef struct {
+    uint16_t  spr_start;    /* sprite quads emitted in pass 1 (cmd_m range), */
+    uint16_t  spr_count;    /* moved after the walls in pass 2 */
+    uint16_t  visit_idx;
+    uint16_t  subnum;
+    uint16_t  rec_first;
+    uint16_t  rec_count;
+    int16_t   light_delta;
+    int16_t   snap;         /* hw_defer_snap index, -1 = none needed */
+} hw_wall_sub_t;
+
+typedef struct {
+    uint32_t mask[HW_SOLID_WORDS];
+    uint32_t summary, any;      /* hw_solid_summary / hw_solid_any (occl queries read them) */
+    int      count;
+} hw_solid_snap_t;
+
+static hw_wall_rec_t   hw_defer_rec[HW_DEFER_REC_CAP];
+static hw_wall_sub_t   hw_defer_sub[HW_DEFER_SUB_CAP];
+static hw_solid_snap_t hw_defer_snap[HW_DEFER_SNAP_CAP];
+static int     hw_defer_nrec = 0, hw_defer_nsub = 0, hw_defer_nsnap = 0;
+static int     hw_defer_on = 0;         /* this subsector records instead of emitting */
+static int     hw_defer_tex_seen = -1;  /* last wall texture touched in pass 1 */
+static uint8_t hw_defer_need_snap = 0;  /* a record needs strip-level occlusion */
+
 /* Cold helper for clipped/clamped 16-texel strips (du_vis < 16, UserClip reset, or XY DDA overflow).
  * Takes 4 register arguments (r4=s, r5=u_lo_and_hi, r6=strip_cmd1, r7=strip_cmd2), 0 stack arguments! */
 static HW_NOINLINE HW_HOT_O2 int HW_EmitStripQuad_Slow(
@@ -2259,6 +2340,9 @@ static HW_NOINLINE HW_COLD_OS void HW_OccludeZeroHeightSeg(
     }
 }
 
+static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
+    hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg);
+
 static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     const baked_seg_t *seg)
 {
@@ -2408,6 +2492,52 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     if (__builtin_expect((ya0 < -8 && yb0 < -8) || (ya1 > HW_VIEW_H + 8 && yb1 > HW_VIEW_H + 8), 0))
         saturn_cmd_m_needs_ytrim = 1;
 
+#if HW_DEFER_WALLS
+    if (hw_defer_on)
+    {
+        /* Pass 1: record; HW_EmitDeferredWalls emits it (capacity checked
+         * per subsector in HW_RenderSubsector_Body).
+         * Still make sure the texture is uploaded HERE, in walk order: the
+         * cache builds a texture's mono/64 variants only while the arena has
+         * room, so uploading every wall after every flat (pass 2) left walls
+         * without variants -> up to ~40% more wall quads (tour9 E1M1
+         * Zigzag 164 -> 227). Eviction only runs at the frame boundary, so
+         * the upload is still valid in pass 2. */
+        if (tex_id != hw_defer_tex_seen)
+        {
+            int ttw, tth, tmono, t64;
+            hw_defer_tex_seen = tex_id;
+            (void)HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
+        }
+        hw_wall_rec_t *r = &hw_defer_rec[hw_defer_nrec++];
+        r->seg              = seg;
+        r->p0               = *ctx->p0;
+        r->p1               = *ctx->p1;
+        r->dz_top           = ctx->dz_top;
+        r->dz_bot           = ctx->dz_bot;
+        r->u_start          = ctx->u_start;
+        r->u_span           = ctx->u_span;
+        r->inv_u_span       = ctx->inv_u_span;
+        r->ya0              = (int16_t)ya0;
+        r->ya1              = (int16_t)ya1;
+        r->yb0              = (int16_t)yb0;
+        r->yb1              = (int16_t)yb1;
+        r->seg_sx           = ctx->seg_sx;
+        r->seg_ex           = ctx->seg_ex;
+        r->ytop_min         = ctx->ytop_min;
+        r->ybot_max         = ctx->ybot_max;
+        r->wall_h           = ctx->wall_h;
+        r->cur_v            = ctx->cur_v;
+        r->top_overlap      = (uint8_t)top_overlap;
+        r->bot_overlap      = (uint8_t)bot_overlap;
+        r->was_near_clipped = ctx->was_near_clipped;
+        r->occl_state       = ctx->occl_state;
+        if (ctx->occl_state)
+            hw_defer_need_snap = 1;
+        return;
+    }
+#endif
+
     ctx->seg         = seg;
     ctx->ya0         = (int16_t)ya0;
     ctx->ya1         = (int16_t)ya1;
@@ -2415,6 +2545,17 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     ctx->yb1         = (int16_t)yb1;
     ctx->top_overlap = (uint8_t)top_overlap;
     ctx->bot_overlap = (uint8_t)bot_overlap;
+    HW_EmitWallFromCtx(ctx, seg);
+}
+
+/* Texture + quad emission for the wall described by hw_wctx (immediate
+ * path above, or pass 2 from a hw_wall_rec_t). */
+static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
+    hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
+{
+    uint8_t seg_flags = seg->flags;
+    int tex_id = seg->tex_64;
+    int ya0 = ctx->ya0, ya1 = ctx->ya1, yb0 = ctx->yb0, yb1 = ctx->yb1;
 
     if (__builtin_expect(tex_id != ctx->cur_tex_id, 0))
     {
@@ -2915,6 +3056,162 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
     hw_prof_segs_acc += HW_ProfDelta(tw0, SAT_FRT());
     return 1;
 }
+
+#if HW_DEFER_WALLS
+/* Emit one deferred subsector: its walls, then its sprites, into a fresh
+ * m range. The solid mask must already be the subsector's (snapshot
+ * restored, or the live mask when emitted straight from pass 1). */
+static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredSub(const hw_wall_sub_t *h)
+{
+    hw_wall_emit_ctx_t *ctx = &hw_wctx;
+    uint16_t m_start = saturn_cmd_m_count;
+
+    hw_wall_light_delta = h->light_delta;
+    ctx->sub_m_start  = m_start;
+    ctx->last_clip_x0 = -1;
+    ctx->last_clip_x1 = -1;
+
+    const hw_wall_rec_t *r  = &hw_defer_rec[h->rec_first];
+    const hw_wall_rec_t *re = r + h->rec_count;
+    for (; r < re; r++)
+    {
+        ctx->p0               = &r->p0;
+        ctx->p1               = &r->p1;
+        ctx->dz_top           = r->dz_top;
+        ctx->dz_bot           = r->dz_bot;
+        ctx->u_start          = r->u_start;
+        ctx->u_span           = r->u_span;
+        ctx->inv_u_span       = r->inv_u_span;
+        ctx->ya0              = r->ya0;
+        ctx->ya1              = r->ya1;
+        ctx->yb0              = r->yb0;
+        ctx->yb1              = r->yb1;
+        ctx->seg_sx           = r->seg_sx;
+        ctx->seg_ex           = r->seg_ex;
+        ctx->ytop_min         = r->ytop_min;
+        ctx->ybot_max         = r->ybot_max;
+        ctx->wall_h           = r->wall_h;
+        ctx->cur_v            = r->cur_v;
+        ctx->top_overlap      = r->top_overlap;
+        ctx->bot_overlap      = r->bot_overlap;
+        ctx->was_near_clipped = r->was_near_clipped;
+        ctx->occl_state       = r->occl_state;
+        ctx->seg              = r->seg;
+        HW_EmitWallFromCtx(ctx, r->seg);
+    }
+    if (ctx->last_clip_x0 != -1)
+    {
+        HW_EmitUserClip(0, 0, HW_VIEW_W - 1, HW_VIEW_H - 1);
+        ctx->last_clip_x0 = -1;
+        ctx->last_clip_x1 = -1;
+    }
+    /* Sprites stay in pass 1 (their occlusion test and texture upload
+     * order are unchanged); move their quads after this subsector's walls. */
+    if (h->spr_count)
+    {
+        uint32_t dst = saturn_cmd_m_count;
+        if (dst + h->spr_count <= CMDBUF_M_CAP)
+        {
+            const uint32_t *s32 = (const uint32_t *)&saturn_cmd_m[h->spr_start];
+            uint32_t *d32 = (uint32_t *)&saturn_cmd_m[dst];
+            for (int k = 0; k < (int)h->spr_count * 8; k++)
+                d32[k] = s32[k];
+            saturn_cmd_m_count = (uint16_t)(dst + h->spr_count);
+        }
+    }
+
+    sub_range_t *ranges = hw_cur_sub_ranges;
+#ifndef SATURN_WIN32
+    ((aliased_uint32_t *)&ranges[h->visit_idx])[0] =
+        ((uint32_t)m_start << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
+#else
+    ranges[h->visit_idx].m_start = m_start;
+    ranges[h->visit_idx].m_count = (uint16_t)(saturn_cmd_m_count - m_start);
+#endif
+}
+
+/* Pass 1, end of a subsector that recorded (rec_first.. = its records):
+ * queue it for pass 2, or emit it right now if it needs an occlusion
+ * snapshot and the snapshot pool is full. */
+static void HW_DeferCloseSub(int visit_idx, int subnum, int rec_first,
+                             int spr_start, int spr_count, int16_t light_delta)
+{
+    int rec_count = hw_defer_nrec - rec_first;
+    if (rec_count <= 0)
+        return;                 /* no walls: the sprites are already in place */
+    hw_wall_sub_t *h = &hw_defer_sub[hw_defer_nsub];
+    h->spr_start   = (uint16_t)spr_start;
+    h->spr_count   = (uint16_t)spr_count;
+    h->visit_idx   = (uint16_t)visit_idx;
+    h->subnum      = (uint16_t)subnum;
+    h->rec_first   = (uint16_t)rec_first;
+    h->rec_count   = (uint16_t)rec_count;
+    h->light_delta = light_delta;
+    h->snap        = -1;
+    if ((hw_defer_need_snap || HW_DEFER_ALWAYS_SNAP) && hw_solid_count > 0)
+    {
+        if (hw_defer_nsnap >= HW_DEFER_SNAP_CAP)
+        {
+            HW_EmitDeferredSub(h);          /* live mask is this subsector's */
+            hw_defer_nrec = rec_first;
+            return;
+        }
+        hw_solid_snap_t *sn = &hw_defer_snap[hw_defer_nsnap];
+        for (int w = 0; w < HW_SOLID_WORDS; w++)
+            sn->mask[w] = hw_solid_mask[w];
+        sn->summary = hw_solid_summary;
+        sn->any     = hw_solid_any;
+        sn->count   = hw_solid_count;
+        h->snap = (int16_t)hw_defer_nsnap++;
+    }
+    hw_defer_nsub++;
+}
+
+/* Pass 2: emit every queued subsector in visit order. */
+static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredWalls(void)
+{
+    int nsub = hw_defer_nsub;
+    if (nsub > 0)
+    {
+        uint32_t live_mask[HW_SOLID_WORDS];
+        int      live_count   = hw_solid_count;
+        uint32_t live_summary = hw_solid_summary;
+        uint32_t live_any     = hw_solid_any;
+        for (int w = 0; w < HW_SOLID_WORDS; w++)
+            live_mask[w] = hw_solid_mask[w];
+
+        for (int i = 0; i < nsub; i++)
+        {
+            const hw_wall_sub_t *h = &hw_defer_sub[i];
+            if (h->snap >= 0)
+            {
+                const hw_solid_snap_t *sn = &hw_defer_snap[h->snap];
+                for (int w = 0; w < HW_SOLID_WORDS; w++)
+                    hw_solid_mask[w] = sn->mask[w];
+                hw_solid_summary = sn->summary;
+                hw_solid_any     = sn->any;
+                hw_solid_count   = sn->count;
+            }
+            else
+            {
+                hw_solid_count = 0;     /* no occlusion test needed / nothing solid yet */
+            }
+            HW_EmitDeferredSub(h);
+        }
+
+        for (int w = 0; w < HW_SOLID_WORDS; w++)
+            hw_solid_mask[w] = live_mask[w];
+        hw_solid_summary = live_summary;
+        hw_solid_any     = live_any;
+        hw_solid_count   = live_count;
+    }
+    hw_defer_nsub = 0;
+    hw_defer_nrec = 0;
+    hw_defer_nsnap = 0;
+}
+#else
+static void HW_EmitDeferredWalls(void) { }
+#endif
 
 static HW_NOINLINE HW_COLD_OS int HW_CheckNearSubsectorFrustum(const saturn_flat_bbox_t *fb)
 {
