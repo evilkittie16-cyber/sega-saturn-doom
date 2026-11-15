@@ -595,12 +595,20 @@ typedef struct {
      * rows instead of fanning polygons that each repeat the texture. */
     fixed_t                 z_eff_floor;
     fixed_t                 z_eff_ceil;
+    uint8_t                 avg_floor;      /* raster-hole backing colours (palette idx) */
+    uint8_t                 avg_ceil;
 } hw_flat_emit_ctx_t;
 
+#if HW_JOB_PAD_WORDS < 2
+#error "hw_flat_job_t needs 2 spare words (alternate flat SRCA pack, backing colours)"
+#endif
 #if HW_JOB_PAD_WORDS < 1
 #error "hw_flat_job_t needs a spare word for the alternate flat SRCA pack"
 #endif
 #define HW_JOB_ALT_SRCA_WORD HW_JOB_WORDS_BEFORE_PAD   /* align_pad[0] */
+/* align_pad[1]: average palette index of the floor (bits 15-8) and ceiling
+ * (bits 7-0) flat, the raster-hole backing colour (HW_FlatHoleBacking). */
+#define HW_JOB_AVG_WORD      (HW_JOB_WORDS_BEFORE_PAD + 1)
 
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_master;
 #ifndef SATURN_WIN32
@@ -653,6 +661,223 @@ static HW_NOINLINE HW_HOT_O2 int HW_Slave_IsSpanOccluded(const hw_flat_emit_ctx_
     return ((fctx->solid[w1] & mask1) == mask1);
 }
 
+/* =========================================================================
+ * VDP1 RASTER-HOLE BACKING (2026-11-15)
+ *
+ * VDP1 draws a distorted sprite as spans between its stepped edges A->D and
+ * B->C (VDP1.sv edge + span Bresenham with anti-alias fill-in). When a span
+ * is tilted and BOTH edge points step a row at the same time, the next
+ * span's row change lands one column over and a single pixel between them
+ * is never drawn. Through those holes the VDP2 sky picture behind the 3D
+ * view showed as moving white dots (hardware photos, E1M1 ceilings).
+ *
+ * Measured on 5thPlanet's VDP1 plotter (VDP1.sv model) with 72k realistic
+ * ceiling/floor quads: flipping orientation is unreliable (the other
+ * orientation often holes too) and shape-only rules flag most of the floor
+ * area. This walks the two edge steppers exactly as VDP1 does (O(dmax)
+ * integer steps, no pixels) and flags the quad when a tilted span is
+ * followed by a step where both edges move across it; a flagged quad gets an
+ * untextured polygon in the quad's own colour drawn just before it in the
+ * OTHER orientation, so a hole only survives where both miss the same pixel.
+ * Python model + emulator plotter: ~90% of visible hole pixels removed.
+ * Runs on the slave (it has the idle time). HW_FLAT_HOLE_BACKING=0 disables.
+ * ========================================================================= */
+#ifndef HW_FLAT_HOLE_BACKING
+#define HW_FLAT_HOLE_BACKING 1
+#endif
+#define HW_HOLE_DMIN   8        /* smaller quads: holes too rare/small to matter */
+#define HW_HOLE_DMAX   400      /* bigger: not worth the walk (off-screen giants) */
+unsigned int saturn_hw_flat_backings = 0;   /* backing polygons this frame (stats) */
+/* Only needed when the sky is visible: without sky the clear polygon is
+ * opaque black (saturn_cmdbuf.c) and holes are dark dots. Set by the master
+ * at frame start from the previous frame's sky visibility (measured cost
+ * when on, 5thPlanet E1M1 start: VDP1 draw 13.2 -> 15.6 ms, slave +2.4 ms
+ * per field). Read by the slave through the uncached alias. */
+int hw_hole_backing_on = 0;
+
+typedef struct {
+    int de, de_inc, de_adj, de_cmp;
+    int x, xi, xe, xe_inc, xe_adj, xe_cmp;
+    int y, yi, ye, ye_inc, ye_adj, ye_cmp;
+} hw_v1edge_t;
+
+HW_ALWAYS_INLINE void HW_V1EdgeInit(hw_v1edge_t *e, int x0, int y0, int x1, int y1, int dmax)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    int m = adx > ady ? adx : ady;
+    e->x = x0; e->xi = dx >= 0 ? 1 : -1;
+    e->xe_inc = 2 * adx; e->xe_adj = -2 * m; e->xe = -m - 1; e->xe_cmp = dy < 0 ? -1 : 0;
+    e->y = y0; e->yi = dy >= 0 ? 1 : -1;
+    e->ye_inc = 2 * ady; e->ye_adj = -2 * m; e->ye = -m - 1; e->ye_cmp = dx < 0 ? -1 : 0;
+    e->de = -dmax - 1; e->de_inc = 2 * m; e->de_adj = -2 * dmax;
+    e->de_cmp = ((ady > adx ? dy : dx) < 0) ? -1 : 0;
+}
+
+HW_ALWAYS_INLINE void HW_V1EdgeStep(hw_v1edge_t *e)
+{
+    e->de += e->de_inc;
+    if (e->de >= e->de_cmp)
+    {
+        e->de += e->de_adj;
+        e->xe += e->xe_inc;
+        if (e->xe >= e->xe_cmp) { e->x += e->xi; e->xe += e->xe_adj; }
+        e->ye += e->ye_inc;
+        if (e->ye >= e->ye_cmp) { e->y += e->yi; e->ye += e->ye_adj; }
+    }
+}
+
+/* 1 if VDP1 would (likely) leave interior holes in quad A,B,C,D. */
+static HW_NOINLINE HW_HOT_O2 int HW_V1QuadHoleRisk(int ax, int ay, int bx, int by,
+                                                   int cx, int cy, int dx, int dy)
+{
+    int l = dx - ax, t;
+    int dmax = l < 0 ? -l : l;
+    t = dy - ay; if (t < 0) t = -t; if (t > dmax) dmax = t;
+    t = cx - bx; if (t < 0) t = -t; if (t > dmax) dmax = t;
+    t = cy - by; if (t < 0) t = -t; if (t > dmax) dmax = t;
+    if (dmax < HW_HOLE_DMIN || dmax > HW_HOLE_DMAX)
+        return 0;
+
+    /* Fast path, nearly every flat: both span-end edges A-B and D-C are
+     * x-major, so every span in between is too, and only the two edges'
+     * Y stepping matters. Track just the D (step) and Y accumulators. */
+    {
+        int abx = bx - ax, aby = by - ay, dcx = cx - dx, dcy = cy - dy;
+        if (abx < 0) abx = -abx;
+        if (aby < 0) aby = -aby;
+        if (dcx < 0) dcx = -dcx;
+        if (dcy < 0) dcy = -dcy;
+        if (abx > aby + 1 && dcx > dcy + 1)
+        {
+            int ldx = dx - ax, ldy = dy - ay, rdx = cx - bx, rdy = cy - by;
+            int aldx = ldx < 0 ? -ldx : ldx, aldy = ldy < 0 ? -ldy : ldy;
+            int ardx = rdx < 0 ? -rdx : rdx, ardy = rdy < 0 ? -rdy : rdy;
+            if (aldy == 0 || ardy == 0)
+                return 0;                   /* an edge never changes row */
+            int lm = aldx > aldy ? aldx : aldy, rm = ardx > ardy ? ardx : ardy;
+            int lde = -dmax - 1, lde_inc = 2 * lm, de_adj = -2 * dmax;
+            int lde_cmp = ((aldy > aldx ? ldy : ldx) < 0) ? -1 : 0;
+            int lye = -lm - 1, lye_inc = 2 * aldy, lye_adj = -2 * lm, lye_cmp = ldx < 0 ? -1 : 0;
+            int rde = -dmax - 1, rde_inc = 2 * rm;
+            int rde_cmp = ((ardy > ardx ? rdy : rdx) < 0) ? -1 : 0;
+            int rye = -rm - 1, rye_inc = 2 * ardy, rye_adj = -2 * rm, rye_cmp = rdx < 0 ? -1 : 0;
+            int lyi = ldy >= 0 ? 1 : -1, ryi = rdy >= 0 ? 1 : -1;
+            int tilt = ay - by;             /* yL - yR of the current span */
+            for (int i = 0; i < dmax; i++)
+            {
+                int sl = 0, sr = 0;
+                lde += lde_inc;
+                if (lde >= lde_cmp)
+                {
+                    lde += de_adj;
+                    lye += lye_inc;
+                    if (lye >= lye_cmp) { lye += lye_adj; sl = lyi; }
+                }
+                rde += rde_inc;
+                if (rde >= rde_cmp)
+                {
+                    rde += de_adj;
+                    rye += rye_inc;
+                    if (rye >= rye_cmp) { rye += rye_adj; sr = ryi; }
+                }
+                if (sl != 0 && sl == sr && tilt != 0)
+                    return 1;
+                tilt += sl - sr;
+            }
+            return 0;
+        }
+    }
+
+    hw_v1edge_t L, R;
+    HW_V1EdgeInit(&L, ax, ay, dx, dy, dmax);
+    HW_V1EdgeInit(&R, bx, by, cx, cy, dmax);
+    for (int i = 0; i < dmax; i++)
+    {
+        int lx = L.x, ly = L.y, rx = R.x, ry = R.y;
+        HW_V1EdgeStep(&L);
+        HW_V1EdgeStep(&R);
+        int sdx = rx - lx, sdy = ry - ly;
+        int asx = sdx < 0 ? -sdx : sdx, asy = sdy < 0 ? -sdy : sdy;
+        if (asx >= asy)
+        {
+            int d = L.y - ly;
+            if (sdy != 0 && d != 0 && d == R.y - ry)
+                return 1;
+        }
+        else
+        {
+            int d = L.x - lx;
+            if (sdx != 0 && d != 0 && d == R.x - rx)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* After a textured flat command was written at local_q - 1: if VDP1 would
+ * leave holes in it, move it up one slot and put the backing polygon in
+ * front. Returns the new local_q. */
+static HW_NOINLINE HW_HOT_O2 int HW_FlatHoleBacking(hw_flat_emit_ctx_t *fctx, int local_q)
+{
+#if HW_FLAT_HOLE_BACKING
+    if (local_q >= fctx->qcap)
+        return local_q;
+#ifndef SATURN_WIN32
+    if (!*(volatile int *)((uintptr_t)&hw_hole_backing_on | SATURN_WRAM_H_UNCACHED))
+        return local_q;
+#else
+    if (!hw_hole_backing_on)
+        return local_q;
+#endif
+    aliased_uint32_t *c = (aliased_uint32_t *)&fctx->cmd_s_out[local_q - 1];
+    /* Ceilings only: their holes show the bright sky (the top half of the
+     * NBG0 picture); floor holes show its dark lower half and are barely
+     * visible, so they are not worth the walk + VDP1 time. The quad is a
+     * ceiling if its SRCA lies in the ceiling's pyramid (5440 B = 680 units). */
+    if ((uint32_t)((c[2] >> 16) - fctx->ceil_srca) >= 680u)
+        return local_q;
+    uint32_t pa = c[3], pb = c[4], pc = c[5], pd = c[6];
+    if (!HW_V1QuadHoleRisk((int16_t)(pa >> 16), (int16_t)pa, (int16_t)(pb >> 16), (int16_t)pb,
+                           (int16_t)(pc >> 16), (int16_t)pc, (int16_t)(pd >> 16), (int16_t)pd))
+        return local_q;
+    aliased_uint32_t *n = (aliased_uint32_t *)&fctx->cmd_s_out[local_q];
+    for (int k = 0; k < 8; k++)
+        n[k] = c[k];
+    /* colour: the flat's most common texel (Saturn_Vdp1_FlatAvgColor). The
+     * quad belongs to the ceiling if its SRCA lies inside the ceiling's
+     * pyramid (5440 bytes = 680 SRCA units). */
+    uint32_t tex  = fctx->avg_ceil;
+    c[0] = 0x00040000u;                                     /* polygon */
+    c[1] = ((0x00C0u | (((n[1] >> 16)) & 0x0600u)) << 16)   /* keep the user-clip mode */
+         | ((n[1] & 0xFF00u) | tex);                        /* shade bank | texel */
+    c[2] = 0;
+    /* Other orientation, and inset by one pixel towards the centre: drawn
+     * the other way round the polygon's edge pixels differ from the
+     * textured quad's, and anything poking out would paint a solid line over
+     * the farther neighbour (seen in 5thPlanet). Holes are interior. */
+    {
+        int vx[4] = { (int16_t)(pa >> 16), (int16_t)(pd >> 16), (int16_t)(pc >> 16), (int16_t)(pb >> 16) };
+        int vy[4] = { (int16_t)pa, (int16_t)pd, (int16_t)pc, (int16_t)pb };
+        int mx2 = vx[0] + vx[1] + vx[2] + vx[3];   /* 4 x centroid */
+        int my2 = vy[0] + vy[1] + vy[2] + vy[3];
+        for (int k = 0; k < 4; k++)
+        {
+            int ex = mx2 - 4 * vx[k], ey = my2 - 4 * vy[k];
+            if (ex >= 4) vx[k]++; else if (ex <= -4) vx[k]--;
+            if (ey >= 4) vy[k]++; else if (ey <= -4) vy[k]--;
+            c[3 + k] = ((uint32_t)vx[k] << 16) | (uint16_t)vy[k];
+        }
+    }
+    c[7] = 0;
+    saturn_hw_flat_backings++;
+    return local_q + 1;
+#else
+    (void)fctx;
+    return local_q;
+#endif
+}
+
 /* Cold helper for offscreen-clipped flat quads & generated clip triangles.
  * Takes 4 register arguments (r4=fctx, r5=local_q, r6=w1, r7=size_and_ceil), 0 stack arguments! */
 static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
@@ -699,6 +924,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
             c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3;
         }
         c32[7] = 0;
+        local_q = HW_FlatHoleBacking(fctx, local_q);
     }
 
     const int *ptx = tx[0], *pty = ty[0];
@@ -884,6 +1110,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
                 c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3;
             }
             c32[7] = 0;
+            local_q = HW_FlatHoleBacking(fctx, local_q);
         }
     }
     return local_q;
@@ -1009,6 +1236,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         c32[5] = w5;
         c32[6] = w6;
         c32[7] = 0;
+        local_q = HW_FlatHoleBacking(fctx, local_q);
     }
     return local_q;
 }
@@ -1477,6 +1705,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
         if (cw < 0) { c32[3] = p1; c32[4] = p0; c32[5] = p3; c32[6] = p2; }
         else        { c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3; }
         c32[7] = 0;
+        local_q = HW_FlatHoleBacking(fctx, local_q);
     }
     return local_q;
 }
@@ -1621,6 +1850,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     int solid_count        = (int)(int16_t)(w10 >> 16);
     uint16_t solid_dirty   = (uint16_t)(w10 & 0xFFFFu);
     uint32_t alt_pack      = jw[HW_JOB_ALT_SRCA_WORD];
+    uint32_t avg_pack      = jw[HW_JOB_AVG_WORD];
 #else
     fixed_t y_floor_w      = job->y_floor_w;
     const uint8_t *raw_vf  = job->vfrac;
@@ -1628,7 +1858,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     int solid_count        = (int)job->solid_count;
     uint16_t solid_dirty   = (uint16_t)job->pad;
     uint32_t alt_pack      = job->align_pad[0];
+    uint32_t avg_pack      = job->align_pad[1];
 #endif
+    fctx->avg_floor = (uint8_t)(avg_pack >> 8);
+    fctx->avg_ceil  = (uint8_t)avg_pack;
     /* Per-quad QUV words parallel to the quad array (same index). */
     fctx->quv = (saturn_baked_flat_quv && saturn_baked_flat_quads)
         ? saturn_baked_flat_quv + (quads - saturn_baked_flat_quads)
@@ -2158,6 +2391,7 @@ typedef struct
     uint32_t        trans_pack;   /* transposed pyramids (floor << 16 | ceil) */
     uint32_t        tile_pack;    /* LOD1 tile pyramids  (floor << 16 | ceil) */
     uint8_t         alt_have;     /* bit0 trans_pack valid, bit1 tile_pack valid */
+    uint32_t        avg_pack;     /* backing colours: floor << 8 | ceil (HW_JOB_AVG_WORD) */
 } hw_flat_sec_cache_t;
 
 /* Alternate flat pyramids for the baked QUV mapping (variant 1 transposed,
@@ -2233,6 +2467,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_CacheFlatSectorInfo(const sector_t *sec)
     fc->y_floor_w  = HW_DZQ(sec->floorheight, vz);
     fc->y_ceil_w   = HW_DZQ(sec->ceilingheight, vz);
     fc->alt_have   = 0;
+    fc->avg_pack   = ((emit_floor ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->floorpic) : 0u) << 8)
+                   | (emit_ceil ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->ceilingpic) : 0u);
 }
 
 #ifndef SATURN_WIN32
@@ -2256,6 +2492,7 @@ static HW_NOINLINE HW_COLD_OS void HW_DeferMasterFlatJob(
     mw[9]  = hw_solid_summary;
     mw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)s_any;
     mw[HW_JOB_ALT_SRCA_WORD] = hw_def_alt_pack;
+    mw[HW_JOB_AVG_WORD] = fc->avg_pack;
     if (s_any != 0)
     {
         const uint32_t *sm = hw_solid_mask;
@@ -2388,6 +2625,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
             (uint32_t)fc->light_bits | ((uint32_t)sub_idx & 0x0FFFu);
     jw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)dirty;
     jw[HW_JOB_ALT_SRCA_WORD] = alt_pack;
+    jw[HW_JOB_AVG_WORD] = fc->avg_pack;
 
     if (__builtin_expect(dirty != 0, 0))
     {
@@ -2486,6 +2724,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
         if (variant)
             job.align_pad[0] = HW_FlatAltPack(sec, variant, emit_floor, emit_ceil);
     }
+    job.align_pad[1] = ((emit_floor ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->floorpic) : 0u) << 8)
+                     | (emit_ceil ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->ceilingpic) : 0u);
 
     volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
     HW_Master_ProcessJob(ipc, &job);

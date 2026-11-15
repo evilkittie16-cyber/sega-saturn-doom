@@ -2200,6 +2200,42 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     return (int)*field;
 }
 
+/* Backing colour for raster-hole patches (saturn_hw_flats.c
+ * HW_FlatHoleBacking): the flat's most common palette index, computed once
+ * per flat from its raw texels (no palette needed; a real texture colour
+ * blends in where a hole lets it show). Master only. */
+#define V1_FLAT_AVG_MAX 1024
+int Saturn_Vdp1_FlatAvgColor(int flatnum)
+{
+    static unsigned char avg[V1_FLAT_AVG_MAX];
+    static unsigned char have[V1_FLAT_AVG_MAX];
+    static unsigned short hist[256];
+    int f, i, best;
+    const byte *src;
+
+    if (flatnum < 0 || flatnum >= (int)numflats)
+        return 0;
+    f = flattranslation ? (int)flattranslation[flatnum] : flatnum;
+    if (f < 0 || f >= (int)numflats || f >= V1_FLAT_AVG_MAX)
+        return 0;
+    if (have[f])
+        return avg[f];
+    src = Saturn_FlatData(flatnum);
+    if (!src)
+        return 0;
+    for (i = 0; i < 256; i++)
+        hist[i] = 0;
+    for (i = 0; i < 4096; i++)
+        hist[src[i]]++;
+    best = 0;
+    for (i = 1; i < 256; i++)
+        if (hist[i] > hist[best])
+            best = i;
+    avg[f] = (unsigned char)best;
+    have[f] = 1;
+    return best;
+}
+
 void Saturn_Vdp1_ClearPages(void)
 {
     v1_tags_try_alloc();

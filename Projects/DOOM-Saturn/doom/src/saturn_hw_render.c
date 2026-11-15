@@ -600,6 +600,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     /* Queue player weapon directly into saturn_cmd_w */
     HW_RenderPlayerWeapon();
 
+    /* raster-hole backing polygons only when the sky shows (saturn_hw_flats.c) */
+    hw_hole_backing_on = saturn_hw_sky_visible;     /* last frame's value */
     saturn_hw_sky_visible = (hw_psec && ((int16_t)hw_psec->ceilingpic == -1));
 
     /* Apply Potentially Visible Set (PVS) for player's current leaf position.
