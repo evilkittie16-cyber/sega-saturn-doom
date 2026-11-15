@@ -560,20 +560,51 @@ static void v1_write_commands(void)
  * every vblank) and from Frame() as belt-and-braces. */
 static int v1_have_frame;
 
+/* Double-buffered command tables (manual frame-change mode only): VDP1
+ * draws one table while the CPU writes the other, so the CPU never waits
+ * for a draw to finish. Slot 3 (local coord) jumps to the table to draw
+ * ("jump assign", JP=001, VDP1 manual p.77; CMDLINK = address / 8). In
+ * 1-cycle mode only table A is used and slot 3 falls through to it. */
+#define V1M_TABLE_A      V1_USER0           /* 0x0080 */
+#define V1M_TABLE_B      0x8000u
+#define V1M_TABLE_A_END  0x7FE0u            /* last slot kept for END */
+#define V1M_TABLE_B_END  0xFFE0u
+unsigned int saturn_v1_write_table = V1M_TABLE_A;     /* table the CPU fills (saturn_cmdbuf.c) */
+unsigned int saturn_v1_write_limit = V1M_TABLE_B_END; /* its END-slot limit */
+static volatile unsigned int v1m_draw_table = V1M_TABLE_A;  /* table slot 3 points VDP1 at */
+static volatile int v1m_double = 0;         /* double-buffered tables active */
+extern int saturn_v1_manual;
+
+static void v1_patch_slot3_ex(int from_vblank);
 static void v1_patch_slot3(void)
+{
+    v1_patch_slot3_ex(0);
+}
+
+static void v1_patch_slot3_ex(int from_vblank)
 {
     if (!v1_have_frame)
         return;                 /* no list yet — leave END */
+    if (v1m_double && !from_vblank)
+        return;                 /* only the vblank callback re-points slot 3 */
     V1_VRAM(0x0000u + 0x02) = 0x0000u;      /* slot 0 LINK = 0 */
     V1_VRAM(0x0000u + 0x00) = V1_CMD_SYSCLIP; /* slot 0 CTRL: sys clip (overwrite Jo's 0x9000 jump) */
     V1_VRAM(0x0020u + 0x02) = 0x0000u;      /* slot 1 LINK = 0 */
     V1_VRAM(0x0020u + 0x00) = V1_CMD_USERCLIP; /* slot 1 CTRL: user clip (overwrite Jo's 0x8000 END) */
     V1_VRAM(0x0040u + 0x02) = 0x0000u;      /* slot 2 LINK = 0 */
     V1_VRAM(0x0040u + 0x00) = 0x000Au;      /* slot 2 CTRL: local coord */
-    V1_VRAM(V1_SLOT3 + 0x02) = 0x0000u;     /* slot 3 LINK = 0 */
     V1_VRAM(V1_SLOT3 + 0x0C) = 16;          /* local XA = 16 (centered 320 view in 352 screen) */
     V1_VRAM(V1_SLOT3 + 0x0E) = 0;           /* local YA */
-    V1_VRAM(V1_SLOT3 + 0x00) = 0x000Au;     /* CTRL: local coord */
+    if (v1m_double)
+    {
+        V1_VRAM(V1_SLOT3 + 0x02) = (unsigned short)(v1m_draw_table >> 3);  /* LINK */
+        V1_VRAM(V1_SLOT3 + 0x00) = 0x100Au; /* CTRL: local coord + jump assign */
+    }
+    else
+    {
+        V1_VRAM(V1_SLOT3 + 0x02) = 0x0000u; /* slot 3 LINK = 0 */
+        V1_VRAM(V1_SLOT3 + 0x00) = 0x000Au; /* CTRL: local coord (falls through to slot 4) */
+    }
 }
 
 /* Belt-and-braces register refresh (saturn-libs pattern): sprite
@@ -657,9 +688,12 @@ static int v1m_draw_done(void)
     return (V1_EDSR & 2u) != 0;     /* CEF: END fetched */
 }
 
+static volatile unsigned int v1m_pending_table = V1M_TABLE_A;
+
 static void v1m_request_change(void)
 {
     V1_FBCR = 0x0003u;              /* FCM=1 FCT=1: change at the next field */
+    v1m_draw_table = v1m_pending_table;   /* the callback re-points slot 3 next */
     v1m_pending = 0;
     v1m_drawing = 1;
     v1m_trig_seq = v1m_seq;
@@ -673,8 +707,13 @@ static void v1m_vblank(void)
     {
         if (v1m_req && !v1m_writing)
         {
-            /* 1-cycle -> manual: "change" is the documented switch (p.39) */
+            /* 1-cycle -> manual: "change" is the documented switch (p.39).
+             * The live list is in table A; from now on the CPU alternates. */
             saturn_v1_manual = 1;
+            V1_VRAM(V1M_TABLE_B + 0x02) = 0x0000u;   /* table B starts empty */
+            V1_VRAM(V1M_TABLE_B + 0x00) = 0x8000u;
+            v1m_pending_table = V1M_TABLE_A;
+            v1m_double = 1;
             v1m_request_change();
         }
         return;
@@ -683,12 +722,23 @@ static void v1m_vblank(void)
         v1m_request_change();
 }
 
-/* Main loop: claim the command table. Returns with v1m_writing set and
- * VDP1 not reading the table (bounded wait). */
+/* Main loop: claim a command table to write. Returns with v1m_writing set
+ * (the callback won't change frames meanwhile) and saturn_v1_write_table /
+ * _limit pointing at a table VDP1 is not reading. With double tables that
+ * is always the one VDP1 is NOT drawing: no wait. If it still holds an
+ * older list waiting for its change, that list is simply replaced by the
+ * newer one. */
 static unsigned int v1m_begin_write(void)
 {
     unsigned guard = 3500u;
-    v1m_writing = 1;                /* from here the callback won't change frames */
+    v1m_writing = 1;
+    if (v1m_double)
+    {
+        unsigned int t = (v1m_draw_table == V1M_TABLE_A) ? V1M_TABLE_B : V1M_TABLE_A;
+        saturn_v1_write_table = t;
+        saturn_v1_write_limit = (t == V1M_TABLE_A) ? V1M_TABLE_A_END : V1M_TABLE_B_END;
+        return guard;
+    }
     while (!v1m_draw_done() && --guard)
     {
         for (int w = 0; w < 32; w++)
@@ -699,6 +749,7 @@ static unsigned int v1m_begin_write(void)
 
 static void v1m_end_write(void)
 {
+    v1m_pending_table = saturn_v1_write_table;
     v1m_pending = 1;
     v1m_writing = 0;
 }
@@ -716,12 +767,12 @@ static void v1_vblank_callback(void)
      * User slot 0 CTRL: 0x0002 = our quad table intact at vblank. */
     saturn_v1w_slot3_at_vbl = (int)V1_VRAM(V1_SLOT3 + 0x00);
     saturn_v1w_user0_at_vbl = (int)V1_VRAM(V1_USER0 + 0x00);
-    v1_patch_slot3();
+#if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
+    v1m_vblank();                   /* may re-point v1m_draw_table first */
+#endif
+    v1_patch_slot3_ex(1);
     v1_write_priority_regs();
     Saturn_VDP2_Plane_VBlank();
-#if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
-    v1m_vblank();
-#endif
 }
 
 /* v1_arm_erase DELETED 2026-09-09: the 2026-09-07 "SGL never arms"
@@ -1052,10 +1103,15 @@ static int v1_evict(unsigned int target)
 
     /* 2. protect everything the live (last committed) list references:
      *    VDP1 re-draws it every vblank until the next commit */
-    if (v1_have_frame)
+    /* With double-buffered tables (manual mode) VDP1 may be drawing either
+     * table and the other may hold a list waiting for its frame change:
+     * protect both. */
+    for (int tb = 0; v1_have_frame && tb < (v1m_double ? 2 : 1); tb++)
     {
         unsigned int c;
-        for (c = V1_USER0; c + 32u <= V1_CMD_LIMIT; c += 32u)
+        const unsigned int t_base = tb ? V1M_TABLE_B : V1_USER0;
+        const unsigned int t_end  = (v1m_double && !tb) ? V1M_TABLE_B : V1_CMD_LIMIT;
+        for (c = t_base; c + 32u <= t_end; c += 32u)
         {
             unsigned int ctrl = v1_cmd_field(c, 0);
             unsigned int a;
@@ -2402,6 +2458,19 @@ void Saturn_Vdp1Wall_Frame(void)
         }
         else if (v1q != NULL && v1q_count > 0)
         {
+#if SATURN_V1_MANUAL
+            /* Legacy writer: always table A. With double tables, make sure
+             * VDP1 is not drawing A before overwriting it. */
+            if (v1m_double)
+            {
+                unsigned g = 3500u;
+                while (v1m_draw_table == V1M_TABLE_A && !v1m_draw_done() && --g)
+                    for (int w = 0; w < 32; w++)
+                        __asm__ volatile("nop");
+                saturn_v1_write_table = V1M_TABLE_A;
+                saturn_v1_write_limit = V1M_TABLE_A_END;
+            }
+#endif
             v1_write_commands();
         }
 

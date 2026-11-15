@@ -434,7 +434,10 @@ unsigned int Saturn_CmdBuf_ComputeDDA(void)
 
 CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
 {
-    uint32_t *vram32 = (uint32_t *)(SATURN_VDP1_VRAM + SATURN_V1_USER0);
+    /* Table to fill: SATURN_V1_USER0 in 1-cycle mode; in manual mode the
+     * double-buffered table VDP1 is not drawing (saturn_vdp1.c). */
+    extern unsigned int saturn_v1_write_table, saturn_v1_write_limit;
+    uint32_t *vram32 = (uint32_t *)(SATURN_VDP1_VRAM + saturn_v1_write_table);
     const uint32_t * const vram_start = vram32;
 
     /* 1. Slot 0 (V1_USER0): Set user clip to full 3D viewport */
@@ -468,8 +471,10 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
      * iterating in reverse (saturn_visit_count - 1 down to 0) provides the
      * exact back-to-front topological order. Never re-sort subsectors by bbox
      * centers, which breaks BSP plane partitioning for concave/large sectors! */
-    const uint32_t * const vram_limit = (const uint32_t *)(SATURN_VDP1_VRAM + 0xFFE0u);
-    if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= 2040u, 1))
+    const uint32_t * const vram_limit = (const uint32_t *)(SATURN_VDP1_VRAM + saturn_v1_write_limit);
+    /* unchecked fast path only when every quad surely fits before the limit */
+    const uint32_t fit_slots = (uint32_t)(vram_limit - (const uint32_t *)vram32) >> 3;
+    if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
     {
         for (int i = saturn_visit_count - 1; i >= 0; i--)
         {
@@ -522,7 +527,8 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
  * with no 3D: automap, intermission). */
 void Saturn_CmdBuf_DeliverBlank(void)
 {
-    volatile uint32_t *vram32 = (volatile uint32_t *)(SATURN_VDP1_VRAM + SATURN_V1_USER0);
+    extern unsigned int saturn_v1_write_table;
+    volatile uint32_t *vram32 = (volatile uint32_t *)(SATURN_VDP1_VRAM + saturn_v1_write_table);
     extern int saturn_view_w;
     extern int saturn_view_h;
     const int vw = (saturn_view_w > 0) ? saturn_view_w : 320;
