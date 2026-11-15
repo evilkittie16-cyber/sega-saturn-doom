@@ -2350,6 +2350,22 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     unsigned int ring_idx = tail & (HW_JOB_RING - 1);
     volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
 
+    /* Ring-full guard: the slave reads each job IN PLACE while it draws it
+     * and only advances job_head when done, so a master more than
+     * HW_JOB_RING jobs ahead would overwrite a job mid-draw (garbage flat
+     * geometry / texture addresses). Wait for a free slot instead. */
+    {
+        unsigned int depth = tail - ipc->job_head;
+        if (depth > saturn_hw_ring_maxdepth)
+            saturn_hw_ring_maxdepth = depth;
+        if (__builtin_expect(depth >= HW_JOB_RING - 1u, 0))
+        {
+            saturn_hw_ring_waits++;
+            while ((unsigned int)(tail - ipc->job_head) >= HW_JOB_RING - 1u)
+                HW_BUS_YIELD();
+        }
+    }
+
     /* Write directly to uncached IPC ring so Master L1 cache is never polluted by write-only IPC jobs */
     volatile aliased_uint32_t *jw = (volatile aliased_uint32_t *)((uintptr_t)ipc->jobs + (ring_idx << 6) + (ring_idx << 5));
     jw[0] = (uint32_t)&saturn_baked_flat_verts[v_first];
