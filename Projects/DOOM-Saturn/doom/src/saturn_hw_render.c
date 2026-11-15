@@ -703,6 +703,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
 
     static int saturn_hw_sky_was_visible = 0;
     int bg_drawn = 0;
+#ifndef SATURN_WIN32
+    HW_SkyHwBegin();   /* VDP2 sky: per-frame scroll value, no fill */
+#endif
 
 #ifndef SATURN_WIN32
     if (hw_frame_slave_enabled)

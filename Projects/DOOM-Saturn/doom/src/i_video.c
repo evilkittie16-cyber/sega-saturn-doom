@@ -189,6 +189,7 @@ static unsigned char saturn_fb_live = 0;
  * DOOM's wood/stone textures, plus everything the dark COLORMAP levels
  * crush down to index 1 Ã¢â‚¬â€ displayed as teal RGB(0,64,64) (0xA100). */
 static unsigned char saturn_cram_stage_dirty = 0;
+static void hwsky_invalidate_all(void);
 
 /* Fill both pages entirely Ã¢â‚¬â€ visible lines 0..199 (head 160 bytes) with
  * one palette index, and the never-copied lines 200..255 with index 0.
@@ -220,6 +221,7 @@ void saturn_vdp2_stage_fill(jo_color color)
         return;
     cram[1] = color;                     /* index 1 = this stage color */
     saturn_cram_stage_dirty = 1;         /* I_FinishUpdate restores */
+    hwsky_invalidate_all();              /* pages overwritten */
     for (page = 0; page < 2; page++)
     {
         volatile unsigned int *d = (volatile unsigned int *)
@@ -746,6 +748,66 @@ static inline void saturn_vdp2_copy_row_320(const void *src_row, volatile void *
     );
 }
 
+/* VDP2 hardware sky (2026-11-15, see saturn_hw_sky.c HW_SkyHwBegin).
+ * Each page keeps the sky panorama in its view rows; hwsky_valid/key say
+ * whether it is current (anything copied over those rows clears it). The
+ * NBG0 line-scroll table (8-line interval: X scroll + line zoom, 8 bytes
+ * per entry, 28 entries for 224 lines) lives in the never-displayed rows
+ * 224.. of the same page, so the flip just re-points LSTA0. */
+#define HWSKY_TABLE_OFS (224u * SATURN_FB_STRIDE)
+static unsigned char hwsky_valid[2];       /* [0] page A, [1] page B */
+static unsigned int  hwsky_key[2];
+static unsigned char hwsky_lower[2];       /* lower-rows mode written */
+static unsigned char hwsky_back_on = 0;    /* the page about to flip uses it */
+
+static void hwsky_invalidate_all(void)
+{
+    hwsky_valid[0] = 0;
+    hwsky_valid[1] = 0;
+}
+
+static void hwsky_prepare(int page, unsigned char *dst)
+{
+    extern unsigned int Saturn_HW_SkyKey(void);
+    extern int          Saturn_HW_SkyLowerY(void);
+    extern int          Saturn_HW_SkyLowerMode(void);
+    extern void         Saturn_HW_SkyWritePanorama(volatile unsigned char *page, int y0);
+    extern unsigned int saturn_hwsky_scx;
+    extern int          saturn_view_h;
+    unsigned int key   = Saturn_HW_SkyKey();
+    unsigned char lower = (unsigned char)Saturn_HW_SkyLowerMode();
+    volatile unsigned int *t;
+    int i;
+
+    if (!hwsky_valid[page] || hwsky_key[page] != key)
+    {
+        Saturn_HW_SkyWritePanorama(dst, 0);
+        hwsky_valid[page] = 1;
+        hwsky_key[page]   = key;
+        hwsky_lower[page] = lower;
+    }
+    else if (hwsky_lower[page] != lower)
+    {
+        /* walked in/out of a sky sector: only rows 108.. change */
+        Saturn_HW_SkyWritePanorama(dst, Saturn_HW_SkyLowerY());
+        hwsky_lower[page] = lower;
+    }
+    t = (volatile unsigned int *)(dst + HWSKY_TABLE_OFS);
+    for (i = 0; i < SATURN_FB_LINES / 8; i++, t += 2)
+    {
+        if (i * 8 < saturn_view_h)
+        {
+            t[0] = saturn_hwsky_scx;
+            t[1] = 0x0000CD00u;       /* 205/256 texel per dot */
+        }
+        else
+        {
+            t[0] = 0;
+            t[1] = 0x00010000u;       /* HUD lines: 1:1 */
+        }
+    }
+}
+
 /* Copy the 320x200 8bpp fb into the back NBG0 bitmap page (head 320
  * bytes of each 512-byte line). Word copy when the fb is 4-aligned
  * (jo_malloc guarantees it); the stride arithmetic stays exact either
@@ -778,13 +840,31 @@ static void saturn_vdp2_copy_back(void)
 
     int st_y = (saturn_view_latch > 0) ? 168 : ((saturn_stbar_y > 0) ? saturn_stbar_y : 192);
     int cy_y = (saturn_view_cy > 0) ? saturn_view_cy : 96;
+    int page = saturn_fb_front ? 0 : 1;    /* dst: front ? A : B */
+    extern int          saturn_hwsky_frame;
+    extern int          saturn_view_h;
+    int hw_sky = saturn_hwsky_frame && saturn_game_started && (((unsigned int)src & 3) == 0);
+
+    saturn_hwsky_frame = 0;
+    hwsky_back_on = (unsigned char)hw_sky;
+    if (!hw_sky && (!saturn_game_started || ((unsigned int)src & 3) != 0))
+        hwsky_valid[page] = 0;             /* full-page / byte copy paths */
 
     if (((unsigned int)src & 3) == 0)
     {
         if (saturn_game_started)
         {
-            if (sky_active || saturn_view_latch > 0)
+            if (hw_sky)
             {
+                hwsky_prepare(page, dst);
+                /* HUD rows below must not overwrite the panorama (FULL view
+                 * mode with view_latch copies from row 168). */
+                if (st_y < saturn_view_h)
+                    st_y = saturn_view_h;
+            }
+            else if (sky_active || saturn_view_latch > 0)
+            {
+                hwsky_valid[page] = 0;
                 int max_sky = (saturn_hw_is_sky || saturn_view_latch > 0) ? st_y : 108;
                 if (max_sky > st_y) max_sky = st_y;
                 const unsigned char *s = src;
@@ -4216,6 +4296,28 @@ void I_FinishUpdate(void)
             JO_VDP2_CYCA1U = 0xEEEEu;
             JO_VDP2_BGON   = (unsigned short)(JO_NBG0_SCREEN
                              | (saturn_vdp2_plane_active ? JO_RBG0_SCREEN : 0));
+            /* VDP2 hardware sky: NBG0 line scroll (LSCX) + line zoom (LZMX),
+             * 8-line interval (LSS = 3), table in the shown page's rows 224..;
+             * window 0 keeps NBG0 inside the 320-px view (display x 16..335,
+             * WPSX/WPEX in half-dots, area = inside) so the panorama does not
+             * spill into the side borders. Off for 2D frames. */
+            if (hwsky_back_on)
+            {
+                unsigned int lsta = ((fb_addr & 0x7FFFFu) + HWSKY_TABLE_OFS) >> 1;
+                JO_VDP2_LSTA0U = (unsigned short)((lsta >> 16) & 0x0007u);
+                JO_VDP2_LSTA0L = (unsigned short)(lsta & 0xFFFFu);
+                JO_VDP2_SCRCTL = (unsigned short)((JO_VDP2_SCRCTL & 0xFF00u) | 0x003Au);
+                *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
+                *(volatile unsigned short *)0x25F800C2u = 0;
+                *(volatile unsigned short *)0x25F800C4u = (unsigned short)((SATURN_BORDER_X + FB_W - 1) * 2);
+                *(volatile unsigned short *)0x25F800C6u = (unsigned short)(SATURN_FB_LINES - 1);
+                JO_VDP2_WCTLA  = (unsigned short)((JO_VDP2_WCTLA & 0xFF00u) | 0x0003u);
+            }
+            else
+            {
+                JO_VDP2_SCRCTL = (unsigned short)(JO_VDP2_SCRCTL & 0xFF00u);
+                JO_VDP2_WCTLA  = (unsigned short)(JO_VDP2_WCTLA & 0xFF00u);
+            }
         }
         saturn_fb_front ^= 1;
         saturn_prof_syn = (int)(saturn_vbl_count - t0);

@@ -394,6 +394,12 @@ void Saturn_HW_RenderInit(void)
             D_memcpy(HW_FAST_SKY_ADDR, sky, sz);
         }
     }
+#ifndef SATURN_WIN32
+    {
+        extern unsigned int saturn_hwsky_gen;
+        saturn_hwsky_gen++;   /* new sky texture: rebuild the VDP2 sky panorama */
+    }
+#endif
     hw_last_sky_angle = 0xFFFFFFFFu;
     hw_last_sky_cy    = -1;
 
@@ -990,11 +996,124 @@ void Saturn_HW_ForceSkyRepaint(void)
     hw_sky_dirty      = 1;
 }
 
+#ifndef SATURN_WIN32
+/* ---- VDP2 hardware sky (2026-11-15) -------------------------------------
+ * The software fill below costs 7-30 ms on every frame the view angle
+ * changes (5thPlanet, ~14 cycles/px over up to 320x192 px), so turning with
+ * sky in view dropped the frame rate. Instead, the sky is written ONCE into
+ * the NBG0 view rows of both bitmap pages as a horizontally periodic
+ * panorama (bitmap column b holds texture column (255 - b) & wmask), and
+ * VDP2 line scroll + line zoom map it to the screen: the view lines get
+ * X scroll = f(viewangle) and a 205/256 (~0.8) coordinate increment, i.e.
+ * 256 texels per 90-degree view like vanilla; the HUD lines get identity.
+ * i_video.c (saturn_vdp2_copy_back + the NBG0 flip) owns the table and the
+ * registers. Difference from vanilla: the column->angle mapping is linear
+ * instead of atan (vanilla stretches the sky more toward the screen edges).
+ * Build with -DSATURN_HW_SKY=0 to get the software fill back. */
+#ifndef SATURN_HW_SKY
+#define SATURN_HW_SKY 1
+#endif
+int          saturn_hwsky_frame = 0;   /* this 3D frame uses the VDP2 sky */
+unsigned int saturn_hwsky_scx   = 0;   /* line-scroll X longword for sky lines */
+unsigned int saturn_hwsky_gen   = 1;   /* bumped when the sky texture reloads */
+
+static int HW_SkyHwGeom(int *pw, int *ph)
+{
+    int skytex = Saturn_SkyTexNum();
+    if (skytex < 0)
+        return 0;
+    int w = Saturn_TexWidth(skytex);
+    int h = Saturn_TexHeight(skytex);
+    /* Power-of-two widths up to 512 tile the 512-wide bitmap exactly. */
+    if (w <= 0 || h <= 0 || w > 512 || (w & (w - 1)) != 0)
+        return 0;
+    if (w * h > 32768)
+        h = 32768 / w;
+    *pw = w;
+    *ph = h;
+    return 1;
+}
+
+/* Called once per 3D frame, after hw_viewangle is set. */
+static void HW_SkyHwBegin(void)
+{
+    int w, h;
+    saturn_hwsky_frame = 0;
+    if (!SATURN_HW_SKY || !HW_SkyHwGeom(&w, &h))
+        return;
+    saturn_hwsky_frame = 1;
+    /* Bitmap column at display x: b = SX + x * 205/256. Vanilla puts texture
+     * column floor(A), A = viewangle / 2^22, at the view centre (display
+     * x 176 = 16-px border + 160), and texture column = 255 - b, so
+     * SX = 255.996 - A - 176 * 205/256. Units of 1/256 px; the 512-px
+     * bitmap wraps, so mask to 9.8 bits. */
+    saturn_hwsky_scx = ((65535u - 176u * 205u - (hw_viewangle >> 14)) & 0x1FFFFu) << 8;
+}
+
+unsigned int Saturn_HW_SkyKey(void)
+{
+    return saturn_hwsky_gen ^ ((unsigned int)saturn_view_h << 16) ^ ((unsigned int)saturn_view_cy << 24);
+}
+
+/* First panorama row whose content depends on where the player stands. Like
+ * HW_FillBackground's max_sky_y: the sky only reaches below row 108 while
+ * the player is in a sky sector (low outdoor ceilings / far outdoor floors
+ * below the horizon); indoors those rows are black, so a VDP1 raster hole
+ * in a near floor shows black rather than the clamped bottom sky row. */
+#define HW_SKY_LOWER_Y 108
+int Saturn_HW_SkyLowerY(void)
+{
+    return HW_SKY_LOWER_Y;
+}
+int Saturn_HW_SkyLowerMode(void)
+{
+    return hw_is_sky ? 1 : 0;
+}
+
+/* Write the sky panorama into NBG0 page rows y0..view_h-1 (512 bytes each).
+ * Row y shows texture row clamp(y + 100 - CY), as in HW_FillBackground. */
+void Saturn_HW_SkyWritePanorama(volatile unsigned char *page, int y0)
+{
+    int w, h, y, b;
+    if (!HW_SkyHwGeom(&w, &h))
+        return;
+    const uint8_t *sky = HW_FAST_SKY_ADDR;
+    int wmask = w - 1;
+    int row_ofs = 100 - saturn_view_cy;
+    int lower_black = !hw_is_sky;
+    for (y = y0; y < saturn_view_h; y++)
+    {
+        volatile unsigned int *d = (volatile unsigned int *)(page + (unsigned int)y * 512u);
+        if (lower_black && y >= HW_SKY_LOWER_Y)
+        {
+            for (b = 0; b < 128; b++)
+                d[b] = 0xF7F7F7F7u;   /* PLAYPAL 247: opaque black */
+            continue;
+        }
+        int texrow = y + row_ofs;
+        if (texrow < 0) texrow = 0;
+        if (texrow >= h) texrow = h - 1;
+        const uint8_t *src = sky + texrow * w;
+        for (b = 0; b < 512; b += 4)
+        {
+            d[b >> 2] = ((unsigned int)src[(255 - b) & wmask] << 24) |
+                        ((unsigned int)src[(254 - b) & wmask] << 16) |
+                        ((unsigned int)src[(253 - b) & wmask] << 8) |
+                        (unsigned int)src[(252 - b) & wmask];
+        }
+    }
+}
+#endif
+
 /* Background fill in I_VideoBuffer: Paints the sky texture across rows 0..95
  * when visible in skybox openings. VDP2 saturn_vdp2_copy_back transfers this
  * region to NBG0 bitmap plane, where it displays behind VDP1 3D walls/floors. */
 static HW_HOT_O2 void HW_FillBackground(void)
 {
+#ifndef SATURN_WIN32
+    if (saturn_hwsky_frame)
+        return;   /* VDP2 line-scroll sky: nothing to paint */
+#endif
     if (!saturn_hw_sky_visible && saturn_hw_sky_prime <= 0)
         return;
 
