@@ -55,7 +55,10 @@ _Static_assert(sizeof(vdp1_cmd_t) == 32, "vdp1_cmd_t must be exactly 32 bytes");
 #define PMOD_HSS             (1u << 12)
 #define PMOD_PCLP            (1u << 11)
 #define PMOD_CLIP_IN         (2u << 9)   /* V1_PMOD_WINDOW_IN */
-#define PMOD_WALL            (PMOD_HSS | 0x0080u | 0x0040u | (4u << 3)) /* HSS | PCLP=0 (hw pre-clip enabled) | ECD | SPD | CM=4 (8bpp 256 colors) */
+#ifndef PMOD_WALL_HSS
+#define PMOD_WALL_HSS        PMOD_HSS
+#endif
+#define PMOD_WALL            (PMOD_WALL_HSS | 0x0080u | 0x0040u | (4u << 3)) /* HSS | PCLP=0 (hw pre-clip enabled) | ECD | SPD | CM=4 (8bpp 256 colors) */
 
 /* Command Buffer Capacities */
 #define CMDBUF_M_CAP         1280

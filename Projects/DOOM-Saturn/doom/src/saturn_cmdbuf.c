@@ -133,11 +133,24 @@ CMDBUF_INLINE void v1_write_localcoord(volatile uint32_t *dst32, int x, int y)
  * head of every list (Jo Engine's jo_vdp1_make_clear approach). Polygon =
  * CTRL 0x0004; PMOD 0x00C0 (no end-code / transparency checks, replace);
  * COLR 0x0000 = the transparent sprite pixel (same value as EWDR's erase).
- * Coordinates are local (the list's local-coord command centres the view). */
-CMDBUF_INLINE void v1_write_clear(volatile uint32_t *dst32, int vw, int vh)
+ * Coordinates are local (the list's local-coord command centres the view).
+ *
+ * OPAQUE BLACK WHEN NO SKY (2026-11-15, hardware photo: a white/dotted
+ * mark in the E1M1 start-room ceiling that moves with the view). VDP1
+ * leaves occasional single undrawn pixels inside skewed ceiling quads
+ * (5thPlanet framebuffer: lone 0x0000 pixels on a diagonal through two
+ * quads). Those keep the clear value, and with a transparent clear the
+ * VDP2 sky picture behind the view (NBG0, which still holds the last sky
+ * even indoors) shows through as bright dots. When no sky is visible this
+ * frame nothing should show NBG0, so the clear is opaque palette black
+ * (bank 0x300 = the walls' and flats' bank, index 0 = black): holes go
+ * dark. With sky visible the clear must stay transparent (the sky IS the
+ * undrawn area). */
+#define V1_CLEAR_OPAQUE_COLR 0x0300u
+CMDBUF_INLINE void v1_write_clear(volatile uint32_t *dst32, int vw, int vh, uint32_t colr)
 {
     dst32[0] = 0x00040000u;                                  /* CTRL: polygon, LINK 0 */
-    dst32[1] = 0x00C00000u;                                  /* PMOD 0x00C0, COLR 0   */
+    dst32[1] = 0x00C00000u | colr;                           /* PMOD 0x00C0, COLR     */
     dst32[2] = 0;                                            /* SRCA, SIZE (unused)   */
     dst32[3] = 0;                                            /* A = (0, 0)            */
     dst32[4] = ((uint32_t)(uint16_t)(vw - 1) << 16);         /* B = (vw-1, 0)         */
@@ -458,7 +471,10 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     extern int saturn_v1_manual;
     if (saturn_v1_manual)
     {
-        v1_write_clear((volatile uint32_t *)vram32, vw, vh);
+        extern int saturn_hw_sky_visible;
+        extern int saturn_vdp2_plane_active;   /* RBG0 floor behind VDP1 (test feature) */
+        v1_write_clear((volatile uint32_t *)vram32, vw, vh,
+                       (saturn_hw_sky_visible || saturn_vdp2_plane_active) ? 0u : V1_CLEAR_OPAQUE_COLR);
         vram32 += 8;
     }
 
@@ -537,7 +553,7 @@ void Saturn_CmdBuf_DeliverBlank(void)
 
     v1_write_userclip(vram32, x_offset, 0, (vw - 1) + x_offset, vh - 1);
     v1_write_localcoord(vram32 + 8, x_offset, 0);
-    v1_write_clear(vram32 + 16, vw, vh);
+    v1_write_clear(vram32 + 16, vw, vh, 0u);   /* no 3D: let NBG0 show */
     vram32[24] = 0x80000000u;       /* END */
     for (int i = 25; i < 32; i++)
         vram32[i] = 0;
