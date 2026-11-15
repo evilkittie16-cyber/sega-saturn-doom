@@ -597,7 +597,14 @@ typedef struct {
     fixed_t                 z_eff_ceil;
     uint8_t                 avg_floor;      /* raster-hole backing colours (palette idx) */
     uint8_t                 avg_ceil;
+    uint8_t                 hole_on;        /* per job: backing enabled && ceiling emitted */
 } hw_flat_emit_ctx_t;
+
+/* Inline gate (2026-11-15): HW_FlatHoleBacking ran 182x per heavy frame at
+ * ~240 cycles a call, nearly all early-outs (uncached flag read + call
+ * overhead). Only ceilings of jobs with the backing on can need it. */
+#define HW_FLAT_HOLE_BACKING_GATE(fctx, local_q) \
+    do { if ((fctx)->hole_on) (local_q) = HW_FlatHoleBacking((fctx), (local_q)); } while (0)
 
 #if HW_JOB_PAD_WORDS < 2
 #error "hw_flat_job_t needs 2 spare words (alternate flat SRCA pack, backing colours)"
@@ -823,13 +830,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_FlatHoleBacking(hw_flat_emit_ctx_t *fctx, in
 #if HW_FLAT_HOLE_BACKING
     if (local_q >= fctx->qcap)
         return local_q;
-#ifndef SATURN_WIN32
-    if (!*(volatile int *)((uintptr_t)&hw_hole_backing_on | SATURN_WRAM_H_UNCACHED))
-        return local_q;
-#else
-    if (!hw_hole_backing_on)
-        return local_q;
-#endif
+    /* (hw_hole_backing_on is sampled once per job into fctx->hole_on) */
     aliased_uint32_t *c = (aliased_uint32_t *)&fctx->cmd_s_out[local_q - 1];
     /* Ceilings only: their holes show the bright sky (the top half of the
      * NBG0 picture); floor holes show its dark lower half and are barely
@@ -924,7 +925,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuad_Clipped(
             c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3;
         }
         c32[7] = 0;
-        local_q = HW_FlatHoleBacking(fctx, local_q);
+        HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
     }
 
     const int *ptx = tx[0], *pty = ty[0];
@@ -1110,7 +1111,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
                 c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3;
             }
             c32[7] = 0;
-            local_q = HW_FlatHoleBacking(fctx, local_q);
+            HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
         }
     }
     return local_q;
@@ -1236,7 +1237,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         c32[5] = w5;
         c32[6] = w6;
         c32[7] = 0;
-        local_q = HW_FlatHoleBacking(fctx, local_q);
+        HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
     }
     return local_q;
 }
@@ -1491,6 +1492,20 @@ HW_ALWAYS_INLINE void HW_SlideToDepth(fixed_t in_cx, fixed_t in_cz, fixed_t out_
 
 #define HW_FLAT_BANDS_MAX 4
 
+/* x / n for n in 1..HW_FLAT_BANDS_MAX and x >= 0 (2026-11-15): constant
+ * divisors compile to shifts / a multiply instead of ~480 __sdivsi3 calls
+ * (~1.4 ms of slave time) per heavy frame. Same results as x / n. */
+HW_ALWAYS_INLINE int HW_DivBands(unsigned int x, int n)
+{
+    switch (n)
+    {
+    case 1:  return (int)x;
+    case 2:  return (int)(x >> 1);
+    case 3:  return (int)(x / 3u);
+    default: return (int)(x >> 2);
+    }
+}
+
 /* Emits one surface (floor or ceiling) of quad qp with texture rows
  * [start, start + count). Returns the new local_q. */
 static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
@@ -1560,10 +1575,10 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
     for (k = 0; k < n_bands; k++)
     {
         /* Band corners: rows run p3p2 (start) -> p0p1 (start + count). */
-        fixed_t t0 = (fixed_t)((k * FRACUNIT) / n_bands);
-        fixed_t t1 = (fixed_t)(((k + 1) * FRACUNIT) / n_bands);
-        int r0 = start + (count * k) / n_bands;
-        int r1 = start + (count * (k + 1)) / n_bands;
+        fixed_t t0 = (fixed_t)HW_DivBands((unsigned int)(k * FRACUNIT), n_bands);
+        fixed_t t1 = (fixed_t)HW_DivBands((unsigned int)((k + 1) * FRACUNIT), n_bands);
+        int r0 = start + HW_DivBands((unsigned int)(count * k), n_bands);
+        int r1 = start + HW_DivBands((unsigned int)(count * (k + 1)), n_bands);
         fixed_t bx[4], bz[4];
         if (r1 <= r0)
             continue;
@@ -1766,7 +1781,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
         if (cw < 0) { c32[3] = p1; c32[4] = p0; c32[5] = p3; c32[6] = p2; }
         else        { c32[3] = p0; c32[4] = p1; c32[5] = p2; c32[6] = p3; }
         c32[7] = 0;
-        local_q = HW_FlatHoleBacking(fctx, local_q);
+        HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
     }
     return local_q;
 }
@@ -1923,6 +1938,16 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
 #endif
     fctx->avg_floor = (uint8_t)(avg_pack >> 8);
     fctx->avg_ceil  = (uint8_t)avg_pack;
+#if HW_FLAT_HOLE_BACKING
+#ifndef SATURN_WIN32
+    fctx->hole_on = (uint8_t)(emit_ceil &&
+        *(volatile int *)((uintptr_t)&hw_hole_backing_on | SATURN_WRAM_H_UNCACHED));
+#else
+    fctx->hole_on = (uint8_t)(emit_ceil && hw_hole_backing_on);
+#endif
+#else
+    fctx->hole_on = 0;
+#endif
     /* Per-quad QUV words parallel to the quad array (same index). */
     fctx->quv = (saturn_baked_flat_quv && saturn_baked_flat_quads)
         ? saturn_baked_flat_quv + (quads - saturn_baked_flat_quads)
