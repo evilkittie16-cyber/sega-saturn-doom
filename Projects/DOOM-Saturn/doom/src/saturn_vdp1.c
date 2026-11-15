@@ -243,8 +243,12 @@ static int             v1_page_flush[2] = { 1, 1 };
  * the live list references is overwritten. Mid-frame overflow refuses
  * the texture for that frame (missing quad, never garbage). A full flush
  * remains for level start / mode toggles / log overflow. */
+#ifndef V1_EVICT_LOWWATER                 /* overridable: eviction stress tests */
 #define V1_EVICT_LOWWATER (64u * 1024u)   /* evict when free space drops below */
+#endif
+#ifndef V1_EVICT_TARGET
 #define V1_EVICT_TARGET   (128u * 1024u)  /* free space to reach when evicting */
+#endif
 #define V1_OPT_RESERVE    (32u * 1024u)   /* headroom kept when adding optional wall copies */
 #define V1_LOG_MAX        1024
 typedef struct {
@@ -263,6 +267,7 @@ static unsigned int  v1_used_bytes = 0;     /* sum of logged lengths */
 static unsigned int  v1_age = 0;
 unsigned int         saturn_v1_evictions = 0;    /* HUD 'E' */
 unsigned int         saturn_v1_evicted_bytes = 0;
+unsigned int         saturn_v1_bad_srca = 0;     /* live textured cmds with SRCA below the arena (seen at evict) */
 /* diagnostics for the HUD row */
 int saturn_v1w_modr;            /* MODR readback (TVM/FCM/VBE bits)   */
 int saturn_v1w_edsr = 3;        /* EDSR at HUD paint time             */
@@ -883,12 +888,32 @@ static int v1_entry_stale(const v1_alloc_t *e)
     return !(v1_field_in(t->srca, e) || v1_field_in(t->srca_mono, e) || v1_field_in(t->srca_64, e));
 }
 
+/* Is tag `t` a flat's? Flats use srca_mono/srca_64 = 0 for "variant not
+ * resident"; walls (and sprites) use field == srca for "no optional copy". */
+static int v1_tag_is_flat(const v1_tag_t *t)
+{
+    int p;
+    for (p = 0; p < 2; p++)
+    {
+        if (v1_tag[p] && t >= v1_tag[p] + v1_tag_flat0 && t < v1_tag[p] + v1_tag_spr0)
+            return 1;
+    }
+    return 0;
+}
+
 static void v1_entry_drop(const v1_alloc_t *e)
 {
     v1_tag_t *t = e->tag;
+    int flat = v1_tag_is_flat(t);
     if (v1_field_in(t->srca, e))      t->srca = 0;
-    if (v1_field_in(t->srca_mono, e)) t->srca_mono = 0;
-    if (v1_field_in(t->srca_64, e))   t->srca_64 = 0;
+    /* A wall's optional downsampled copy dropped while its main texture
+     * stays resident must fall back to the alias (== srca), NOT 0: the wall
+     * emitters test `srca_mono != srca` and would otherwise draw from
+     * SRCA 0 + offset = the VDP1 command table (hardware 2026-11-15: a
+     * band of regular garbage marks on a distant step riser, persisting
+     * from the eviction frame until the texture was re-uploaded). */
+    if (v1_field_in(t->srca_mono, e)) t->srca_mono = flat ? 0 : t->srca;
+    if (v1_field_in(t->srca_64, e))   t->srca_64   = flat ? 0 : t->srca;
 }
 
 /* Read 16-bit field `idx` of the 32-byte VDP1 command at VRAM `base`
@@ -939,6 +964,8 @@ static int v1_evict(unsigned int target)
             if ((ctrl & 0xFu) > 2u)
                 continue;                       /* untextured / clip / local */
             a = v1_cmd_field(c, 4) << 3;        /* CMDSRCA -> byte offset */
+            if (a < V1_PAGE0_START)
+                saturn_v1_bad_srca++;           /* textured from below the arena: garbage */
             lo = 0; hi = n - 1;
             while (lo <= hi)                    /* entry with off <= a < end */
             {

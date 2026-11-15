@@ -1222,13 +1222,14 @@ void I_FinishUpdate(void)
         extern unsigned int Saturn_Vdp1_ArenaFree(void);
         extern unsigned int saturn_v1_alloc_bytes;
         static unsigned int s_last_ab = 0;
-        extern unsigned int saturn_v1_evictions, saturn_v1_evicted_bytes;
+        extern unsigned int saturn_v1_evictions, saturn_v1_evicted_bytes, saturn_v1_bad_srca;
         static unsigned int s_last_ev = 0, s_last_evb = 0;
-        printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
+        printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) badsrca:%u variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
                s_pos_step, players[0].mo->x >> FRACBITS, players[0].mo->y >> FRACBITS,
                g_telemetry.avg_err_pct,
                saturn_v1_page_flushes - s_last_fl,
                saturn_v1_evictions - s_last_ev, (saturn_v1_evicted_bytes - s_last_evb) >> 10,
+               saturn_v1_bad_srca,
                saturn_v1_variant_uploads - s_last_vu,
                (saturn_v1_alloc_bytes - s_last_ab) >> 10,
                Saturn_Vdp1_ArenaFree() >> 10,
