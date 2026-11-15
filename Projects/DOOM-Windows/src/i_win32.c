@@ -1162,6 +1162,14 @@ void I_FinishUpdate(void)
                            g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads,
                            g_telemetry.hud_diag.quads_dropped, g_telemetry.hud_diag.tex_refused,
                            g_telemetry.bus_kb);
+                    {
+                        extern int g_vdp1_od_quads, g_vdp1_od_hidden, g_vdp1_od_hidden_px, g_vdp1_od_total_px;
+                        extern int g_vdp1_od_hidden_cyc, g_vdp1_od_total_cyc;
+                        printf("[OD9] %-16s quads:%d hidden:%d px:%d hidden_px:%d cyc:%d hidden_cyc:%d subs:%d\n",
+                               st->desc, g_vdp1_od_quads, g_vdp1_od_hidden, g_vdp1_od_total_px,
+                               g_vdp1_od_hidden_px, g_vdp1_od_total_cyc, g_vdp1_od_hidden_cyc,
+                               g_telemetry.hud_diag.subsectors);
+                    }
                     fflush(stdout);
                     s_t9_idx++;
                     s_t9_step = 0;
@@ -1232,6 +1240,16 @@ void I_FinishUpdate(void)
             printf("[VDP1] load:%.1f%% offscreen_quads:%u offscreen_share:%.1f%%\n",
                    g_telemetry.vdp1_load_pct, g_vdp1_offscreen_quads,
                    g_telemetry.vdp1_load_pct > 0 ? g_vdp1_offscreen_cycles * 100.0 / (g_telemetry.vdp1_load_pct * 4772.72) : 0.0);
+            {
+                extern int g_vdp1_od_quads, g_vdp1_od_hidden, g_vdp1_od_hidden_px, g_vdp1_od_total_px;
+                extern int g_vdp1_od_hidden_cyc, g_vdp1_od_total_cyc;
+                printf("[OVERDRAW] quads:%d hidden:%d (%.1f%%) px:%d hidden_px:%d (%.1f%%) cyc_hidden:%.1f%%\n",
+                       g_vdp1_od_quads, g_vdp1_od_hidden,
+                       g_vdp1_od_quads ? g_vdp1_od_hidden * 100.0 / g_vdp1_od_quads : 0.0,
+                       g_vdp1_od_total_px, g_vdp1_od_hidden_px,
+                       g_vdp1_od_total_px ? g_vdp1_od_hidden_px * 100.0 / g_vdp1_od_total_px : 0.0,
+                       g_vdp1_od_total_cyc ? g_vdp1_od_hidden_cyc * 100.0 / g_vdp1_od_total_cyc : 0.0);
+            }
         }
         printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) badsrca:%u variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
                s_pos_step, players[0].mo->x >> FRACBITS, players[0].mo->y >> FRACBITS,

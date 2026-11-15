@@ -1,0 +1,201 @@
+/*
+** Jo Engine linker script (DOOM copy with a hot-function order)
+**
+** 0x06004000 - ...        : program and user data, then the engine work area (VDP1 command lists, 3D buffers...)
+** ...        - 0x060FBC00 : free (given to jo_malloc(), see jo_init_memory())
+** 0x060FBC00 - 0x060FFC00 : master CPU stack
+*/
+SECTIONS {
+    JO_START 0x06004000 : {
+        ___Start = .;
+        *(JO_START)
+    }
+    .text ALIGN(0x20) :
+    {
+        /* DOOM: profile-ordered hot functions first (doom_hot.linker, 2026-11-15;
+           regenerate with 5thPlanet tmp/doomprof/hotorder.py). Packs the
+           render code the SH-2 4 KB cache keeps refetching. */
+        *(.text.HW_CheckSubsectorAperture)
+        *(.text.HW_RenderSubsector_Body.constprop.6)
+        *(.text.Saturn_HW_RenderPlayerView)
+        *(.text.HW_EmitWallStrips_Linear_General.constprop.19)
+        *(.text.HW_GetSpanAperture)
+        *(.text.HW_ProjectAndCullPillarPair)
+        *(.text.Saturn_CmdBuf_Deliver)
+        *(.text.HW_SubmitSlaveFlatJob)
+        *(.text.HW_EmitVisibleBakedSeg)
+        *(.text.HW_RenderSubsectorBakedWalls)
+        *(.text.HW_EmitBakedWallQuads.constprop.13)
+        *(.text.HW_WalkSubsectorBakedSegs)
+        *(.text.HW_RescanApertureWords)
+        *(.text.HW_CheckSpanOcclusion)
+        *(.text.HW_EmitMonolithicBakedSeg.constprop.15)
+        *(.text.HW_TransformSubsectorPillar)
+        *(.text.HW_CheckBBoxOccluded)
+        *(.text.HW_TryCoalesceLinearStrip)
+        *(.text.HW_EvalSubsectorFlatAperture)
+        *(.text.Saturn_ProfSpan.part.1)
+        *(.text.HW_RenderBSPNode.isra.4.constprop.5)
+        *(.text.HW_UpdatePortalWordCols)
+        *(.text.HW_EmitMultiBandBakedWall.constprop.17)
+        *(.text.HW_RenderSubsectorSprites.isra.2)
+        *(.text.HW_EmitWallStrips_Linear.constprop.18)
+        *(.text.HW_RecordSegPortalAperture.constprop.26)
+        *(.text.HW_EmitSubdividedBakedSeg.constprop.14)
+        *(.text.HW_CacheFlatSectorInfo)
+        *(.text.HW_EmitWallFromCtx.isra.3.constprop.9)
+        *(.text.v1_tex_get)
+        *(.text.HW_BuildSectorThings.isra.0)
+        *(.text.HW_CommitSubSolidMask)
+        *(.text.HW_CheckBBoxStatus)
+        *(.text.HW_UpdatePortalWordPartial)
+        *(.text.P_MobjThinker)
+        *(.text.HW_CommitPortalSpan)
+        *(.text.P_GetSightMobj)
+        *(.text.Saturn_Vdp1_GetFlatSrcaVariant)
+        *(.text.HW_IsSpanOccluded)
+        *(.text.HW_RecordSubsectorUnbakedPortals.constprop.24)
+        *(.text.Saturn_Vdp1_FlatAvgColor)
+        *(.text.P_RunMobjBase2)
+        *(.text.P_RunMobjLate)
+        *(.text.HW_MarkSubSolidSpan)
+        *(.text.HW_TransformPillar_Shifted)
+        *(.text.HW_RenderSubsector)
+        *(.text.HW_LoadWallTexCtx.constprop.10)
+        *(.text.HW_EmitWallStrips_Persp_General.constprop.21)
+        *(.text.HW_CullBSPBBox)
+        *(.text.Saturn_SpritePatch)
+        *(.text.HW_RecordPortalSpan)
+        *(.text.HW_SubsectorHasThings.isra.1)
+        *(.text.jo_get_inputs_vblank)
+        *(.text.Saturn_Vdp1Spr_Add)
+        *(.text.Saturn_HUD_Draw)
+        *(.text.HW_EvalSubsectorSpanSlow)
+        *(.text.v1_tags_try_alloc)
+        *(.text.HW_CommitSubsectorOcclusion)
+        *(.text.PS_CrossBSPNode)
+        *(.text.Saturn_CmdBuf_ComputeDDA)
+        *(.text.hud_tiny)
+        *(.text.HW_EmitStripQuad_Slow)
+        *(.text.jo_smpc_handler)
+        *(.text.HW_ProjectPortalEndpoint)
+        *(.text.P_SetMobjState)
+        *(.text.P_PlayerThink)
+        *(.text.HW_IsStripOccluded_Slow)
+        *(.text.HW_FlatAltPack)
+        *(.text.Saturn_ProfSpan)
+        *(.text.HW_ExtrapolateMonoWallX.constprop.16)
+        *(.text.D_DoomLoop)
+        *(.text.jo_smpc_parse_port)
+        *(.text.HW_RenderPlayerWeapon)
+        *(.text.jo_core_vblank_in_handler)
+        *(.text.P_CalcHeight)
+        *(.text.P_UpdateSpecials)
+        *(.text.P_BuildMove)
+        *(.text.v1_vblank_callback)
+        *(.text.Saturn_Vdp1Wall_Frame)
+        *(.text.HW_CheckPortalSubsectorStepCull)
+        *(.text.lshrsi3_r0)
+        *(.text.HW_ClampedFrac)
+        *(.text.I_ReadControls)
+        *(.text.HW_ClipWallNearPlane.constprop.25)
+        *(.text.HW_ClipPortalScales)
+        *(.text.P_MovePlayer)
+        *(.text.P_MovePsprites)
+        *(.text.P_Ticker)
+        *(.text.A_WeaponReady)
+        *(.text.Saturn_Vdp1Wall_Reset)
+        *(.text.jo_smpc_read_status)
+        *(.text.HW_EmitWallStrips_Persp.constprop.20)
+        *(.text.HW_CheckNearSubsectorFrustum)
+        *(.text.v1_patch_slot3_ex)
+        *(.text.P_PlayerMobjThink)
+        *(.text.FixedDiv)
+        *(.text.D_Display.part.3)
+        *(.text.saturn_vblank_callback)
+        *(.text.P_SetPsprite)
+        *(.text.v1_copy_block)
+        *(.text.finesine)
+        *(.text.Saturn_G_Ticker)
+        *(.text.P_RunThinkers)
+        *(.text.jo_vdp1_vblank)
+        *(.text.jo_vdp2_commit)
+        *(.text.HW_EmitUserClip.constprop.27)
+        *(.text.P_LookForPlayers)
+        *(.text.HW_ClipSegNearPlane.constprop.8)
+        *(.text.jo_smpc_vblank_in)
+        *(.text.hud_tiny_num)
+        *(.text.Saturn_G_Display)
+        *(.text.T_Glow)
+        *(.text.Saturn_CmdBuf_CullOccluded)
+        *(.text.HW_Worker_ProcessJob.constprop.7)
+        *(.text.HW_EmitFlatQuadBanded)
+        *(.text.HW_EmitFlatBands)
+        *(.text.HW_V1QuadHoleRisk)
+        *(.text.HW_FlatHoleBacking)
+        *(.text.sdivsi3)
+        *(.text.HW_ScreenClipDepth)
+        *(.text.HW_ClipFlatQuadOffscreen)
+        *(.text.HW_FlatSizeLOD)
+        *(.text.HW_EmitFlatQuad_Clipped)
+        *(.text.HW_Slave_IsSpanOccluded)
+        *(.text.HW_ClipQuadPlane)
+        *(.text.ashlsi3_r0)
+        *(.text.HW_SliceFlatQuadV)
+        *(.text.HW_ClipCoord)
+        *(.text.movstrSI16)
+        *libgcc.a:*(.text)
+        *(.text)
+        *(.text.*)
+        *(.strings)
+        __etext = .;
+    }
+    .rodata ALIGN(0x20) :
+    {
+        *(.rodata)
+        *(.rodata.*)
+    }
+    .tors ALIGN(0x10) :
+    {
+        ___ctors = . ;
+        *(.ctors)
+        ___ctors_end = . ;
+        ___dtors = . ;
+        *(.dtors)
+        ___dtors_end = . ;
+    }
+    .data ALIGN(0x10) :
+    {
+        *(.data)
+        *(.data.*)
+        __edata = . ;
+    }
+    .bss ALIGN(0x10) (NOLOAD) :
+    {
+        __bstart = . ;
+        *(.bss)
+        *(.bss.*)
+        * ( COMMON )
+        . = ALIGN(4);
+        __bend = . ;
+        _end = .;
+    }
+    JO_WORK ALIGN(0x4000) (NOLOAD) :
+    {
+        __jo_work_start = . ;
+        /* (the buffers with a big alignment first, 16 KB at most: no hole between the others; the high work RAM between
+           the end of the program and this area is given to jo_malloc()) */
+        *(JO_WORK_ALIGNED)
+        *(SORT_BY_ALIGNMENT(JO_WORK))
+        . = ALIGN(4);
+        __jo_work_end = . ;
+    }
+    /DISCARD/ :
+    {
+        *(.comment)
+        *(.eh_frame)
+        *(.eh_frame_hdr)
+    }
+}
+ASSERT(__jo_work_end <= 0x060FBC00, "Program too big: the program and the engine work area overlap the stack at 0x060FBC00")
+

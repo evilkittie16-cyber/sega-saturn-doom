@@ -128,6 +128,17 @@ CCFLAGS += -fno-strict-aliasing
 include $(COMPILER_DIR)/COMMON/jo_engine_makefile
 CCFLAGS := $(filter-out -flto,$(CCFLAGS))
 LDFLAGS += -fno-use-linker-plugin
+# SATURN_HOT_ORDER=1 (2026-11-15): one section per function and a project
+# linker script that places the profiled hot render functions first and
+# contiguous (doom_hot.linker), to cut SH-2 instruction-cache waste.
+# Measured in 5thPlanet: no change (22.75 -> 22.79 ms render, same fetch
+# stalls) - the misses are capacity (81 KB of hot code vs a 4 KB cache), not
+# layout. Off by default; kept for re-testing once the hot code is smaller.
+SATURN_HOT_ORDER ?= 0
+ifeq ($(SATURN_HOT_ORDER),1)
+CCFLAGS += -ffunction-sections
+LDFILE := ./doom_hot.linker
+endif
 
 OBJS += doom/src/saturn_draw.o
 game.elf: doom/src/saturn_draw.o

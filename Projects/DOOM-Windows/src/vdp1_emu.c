@@ -102,6 +102,16 @@ static uint32_t s_palette32[256];
 static int s_palette_set = 0;
 static int s_frame_quad_pixels = 0;
 static int s_cur_quad = 0;
+/* Overdraw analysis (2026-11-15): which textured quad last wrote each pixel
+ * (0 = background, -1 = untextured polygon), and per-quad pixels / VDP1
+ * cycles, so quads with no surviving pixel ("fully hidden") can be counted. */
+#define OD_MAX_QUADS 8192
+#define OD_MAX_PX    (704 * 512)
+static int16_t  s_od_owner[OD_MAX_PX];
+static uint32_t s_od_px[OD_MAX_QUADS + 1];
+static uint32_t s_od_cyc[OD_MAX_QUADS + 1];
+int g_vdp1_od_quads, g_vdp1_od_hidden, g_vdp1_od_hidden_px, g_vdp1_od_total_px;
+int g_vdp1_od_hidden_cyc, g_vdp1_od_total_cyc;
 
 void VDP1_SetPalette(const uint8_t *palette_rgb24)
 {
@@ -415,6 +425,11 @@ static inline void vdp1_plot_dot(
             uint8_t out_c = cmap ? cmap[texel] : texel;
             fb[py * fb_w + px] = s_palette32[out_c];
             s_frame_quad_pixels++;
+            if (py * fb_w + px < OD_MAX_PX) {
+                int q = s_cur_quad <= OD_MAX_QUADS ? s_cur_quad : OD_MAX_QUADS;
+                s_od_owner[py * fb_w + px] = (int16_t)q;
+                s_od_px[q]++;
+            }
             if (tex_info) {
                 tex_info->strip_mask |= (uint16_t)(1u << ((iu >> 4) & 15));
                 tex_info->pixels_drawn++;
@@ -423,6 +438,8 @@ static inline void vdp1_plot_dot(
     } else {
         fb[py * fb_w + px] = s_palette32[colr & 0xFF];
         s_frame_poly_pixels++;
+        if (py * fb_w + px < OD_MAX_PX)
+            s_od_owner[py * fb_w + px] = -1;
     }
 }
 
@@ -839,6 +856,9 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
 {
     s_frame_quad_pixels = 0;
     s_frame_poly_pixels = 0;
+    memset(s_od_owner, 0, sizeof(s_od_owner));
+    memset(s_od_px, 0, sizeof(s_od_px));
+    memset(s_od_cyc, 0, sizeof(s_od_cyc));
     s_frame_polys = 0;
     s_frame_other_cmds = 0;
     s_frame_tex_count = 0;
@@ -993,6 +1013,7 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
                     pmod, colr, dir, q, &dta,
                     tex_entry);
                 hw_raster_cycles += qc;
+                s_od_cyc[quads_drawn <= OD_MAX_QUADS ? quads_drawn : OD_MAX_QUADS] += qc;
                 /* cost of quads reaching far off-screen (any vertex outside
                  * [-256, 608] x [-256, 480]): VDP1 walks those edges in full */
                 int off = 0;
@@ -1042,6 +1063,30 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
 
         /* Next 32-byte packet */
         cmd_stream += 8;
+    }
+
+    /* Overdraw analysis: a quad with no pixel left owning the framebuffer
+     * was fully covered by later quads (or drew nothing). */
+    {
+        static uint8_t vis[OD_MAX_QUADS + 1];
+        int n = quads_drawn < OD_MAX_QUADS ? quads_drawn : OD_MAX_QUADS;
+        int npx = fb_w * fb_h < OD_MAX_PX ? fb_w * fb_h : OD_MAX_PX;
+        memset(vis, 0, sizeof(vis));
+        for (int i = 0; i < npx; i++)
+            if (s_od_owner[i] > 0)
+                vis[s_od_owner[i]] = 1;
+        g_vdp1_od_quads = n;
+        g_vdp1_od_hidden = g_vdp1_od_hidden_px = g_vdp1_od_total_px = 0;
+        g_vdp1_od_hidden_cyc = g_vdp1_od_total_cyc = 0;
+        for (int q = 1; q <= n; q++) {
+            g_vdp1_od_total_px += (int)s_od_px[q];
+            g_vdp1_od_total_cyc += (int)s_od_cyc[q];
+            if (!vis[q]) {
+                g_vdp1_od_hidden++;
+                g_vdp1_od_hidden_px += (int)s_od_px[q];
+                g_vdp1_od_hidden_cyc += (int)s_od_cyc[q];
+            }
+        }
     }
 
     if (vblank_cutoffs > 0) {
