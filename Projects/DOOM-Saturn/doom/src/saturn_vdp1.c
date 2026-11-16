@@ -265,6 +265,11 @@ static int           v1_want_evict = 0;     /* an upload was refused this frame 
 static unsigned int  v1_want_bytes = 0;     /* largest refused upload since the last evict */
 static unsigned int  v1_used_bytes = 0;     /* sum of logged lengths */
 static unsigned int  v1_age = 0;
+/* v1_age at the last two frame boundaries (2026-11-16 thrash fix; v1_age
+ * also ticks once per frame). Entries with age >= v1_age_mark_prev were
+ * uploaded, touched (cache hit) or drawn in the last two frames and are not
+ * evicted for the free-space target alone (see v1_evict step 3). */
+static unsigned int  v1_age_mark_prev = 0, v1_age_mark_cur = 0;
 unsigned int         saturn_v1_evictions = 0;    /* HUD 'E' */
 unsigned int         saturn_v1_evicted_bytes = 0;
 unsigned int         saturn_v1_bad_srca = 0;     /* live textured cmds with SRCA below the arena (seen at evict) */
@@ -1169,12 +1174,31 @@ static int v1_evict(unsigned int target)
             unsigned int best = 0xFFFFFFFFu;
             if (v1_free_total() >= target && (need == 0 || v1_find_gap(need, &pos)))
                 break;
+            /* Textures uploaded in the last two frames but not (yet) in a
+             * command - e.g. flat variant pyramids the master requests for
+             * every nearby floor, which the slave only sometimes uses - are
+             * needed again next frame. Evicting them for the free-space
+             * target alone re-uploaded ~65 KB every frame at E1M2 (0,160):
+             * the uploads ate exactly the space the eviction freed, a
+             * self-sustaining thrash (56 ms/frame). Only a refused upload
+             * (need > 0) may take them. */
             for (i = 0; i < n; i++)
             {
-                if (!v1_log_prot[i] && v1_log[i].age < best)
+                if (!v1_log_prot[i] && v1_log[i].age < v1_age_mark_prev && v1_log[i].age < best)
                 {
                     best = v1_log[i].age;
                     victim = i;
+                }
+            }
+            if (victim < 0 && need != 0)
+            {
+                for (i = 0; i < n; i++)
+                {
+                    if (!v1_log_prot[i] && v1_log[i].age < best)
+                    {
+                        best = v1_log[i].age;
+                        victim = i;
+                    }
                 }
             }
             if (victim < 0)
@@ -1319,6 +1343,29 @@ static void v1_copy_32_blocks(unsigned int off, const byte *src, int w, int h)
  * current page (uploading it on a miss) and its size; 0 = not drawable
  * (unusable texture, or page full this frame — counted by the caller in
  * saturn_v1w_refuse). */
+/* A cache hit counts as use: refresh the age of the log entry holding SRCA
+ * `srca` (8-byte units), so a texture requested every frame is never "old"
+ * to v1_evict even when no command references it yet. */
+static void v1_touch(unsigned int srca)
+{
+    unsigned int a = srca << 3;
+    int lo = 0, hi = v1_log_n - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) >> 1;
+        unsigned int eo = (unsigned int)v1_log[mid].off32 << 5;
+        if (a < eo)
+            hi = mid - 1;
+        else if (a >= eo + ((unsigned int)v1_log[mid].len32 << 5))
+            lo = mid + 1;
+        else
+        {
+            v1_log[mid].age = v1_age;
+            return;
+        }
+    }
+}
+
 static int v1_tex_get(int texnum, int *w, int *h)
 {
     v1_tag_t   *tag;
@@ -1344,6 +1391,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
         {
             if (tag->srca == V1_TAG_BAD)
                 return 0;
+            v1_touch(tag->srca);
             *w = (int)tag->w8 << 3;
             *h = (int)tag->h;
             return (int)tag->srca;
@@ -1368,6 +1416,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
         {
             if (tag->srca == V1_TAG_BAD)
                 return 0;
+            v1_touch(tag->srca);
             *w = (int)tag->w8 << 3;
             *h = (int)tag->h;
             return (int)tag->srca;
@@ -1833,6 +1882,12 @@ void Saturn_Vdp1Wall_Reset(void)
      * committed frame: Reset can run twice per frame, and the live list
      * in VDP1 VRAM must be the one VDP1 is actually re-drawing. */
     int v1_frame_boundary = v1_page_committed || !v1_have_frame;
+    if (v1_frame_boundary)
+    {
+        /* tick per frame too, so marks advance even without uploads */
+        v1_age_mark_prev = v1_age_mark_cur;
+        v1_age_mark_cur  = ++v1_age;
+    }
     v1_page_off[0] = v1_arena_off;
     v1_page_off[1] = v1_arena_off;
     v1_tex_page = 0;
@@ -2147,7 +2202,12 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     tag   = &v1_tag[v1_tex_page][v1_tag_flat0 + f];
     field = (variant == 1) ? &tag->srca_mono : &tag->srca_64;
     if (*field)
-        return (*field == V1_TAG_BAD) ? 0 : (int)*field;
+    {
+        if (*field == V1_TAG_BAD)
+            return 0;
+        v1_touch(*field);
+        return (int)*field;
+    }
 
     src = Saturn_FlatData(flatnum);
     if (!src)
