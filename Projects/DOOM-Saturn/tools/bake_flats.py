@@ -187,7 +187,11 @@ def quant16(v):
 #                  per 128 units), rows in tile texels
 # Encoding: bits 15-14 mode, bits 13-8 start row, bits 6-0 row count (1..64).
 QUV_NORMAL, QUV_TRANSPOSED, QUV_TILE = 1, 2, 3
+QUV_WARP = 0x80             # bit 7: piece needs its own warped texture
+WARP_MIN_ERR = float(os.environ.get("WARP_MIN_ERR", "3"))   # texels
 SUBFLAG_TRANSPOSED = 1      # subsector's LOD0 list uses the transposed texture
+SUBFLAG_WARP = 2            # subsector's LOD0 list has QUV_WARP quads
+SUBFLAG_WARP_LOD1 = 4       # subsector's LOD1 list has QUV_WARP quads
 
 def _match_corners(q, targets):
     """Reorder quad q (4 points, may repeat one) to best fit target corners,
@@ -216,7 +220,11 @@ def quad_uv(q, gx, gy, cell):
         # LOD1: tile texture, 2 world units per texel, normal orientation
         start, count = _row_range((128 - yt) / 2.0, (128 - yb) / 2.0, 64)
         targets = [(gx + xa, gy + yb), (gx + xb, gy + yb), (gx + xb, gy + yt), (gx + xa, gy + yt)]
-        return _match_corners(q, targets), (QUV_TILE << 14) | (start << 8) | count
+        rq = _match_corners(q, targets)
+        want = [(gx, gy + yb), (gx + 128, gy + yb), (gx + 128, gy + yt), (gx, gy + yt)]
+        # LOD1 tile texels are 2 units: error in texels = units / 2
+        err = max(max(abs(rq[i][0] - want[i][0]), abs(rq[i][1] - want[i][1])) for i in range(4)) / 2.0
+        return rq, (QUV_TILE << 14) | (start << 8) | (QUV_WARP if err > WARP_MIN_ERR else 0) | count
     if (64 - (xb - xa)) <= (64 - (yt - yb)):
         start, count = _row_range(64 - yt, 64 - yb, 64)
         targets = [(gx + xa, gy + yb), (gx + xb, gy + yb), (gx + xb, gy + yt), (gx + xa, gy + yt)]
@@ -225,7 +233,24 @@ def quad_uv(q, gx, gy, cell):
         start, count = _row_range(xa, xb, 64)
         targets = [(gx + xb, gy + yt), (gx + xb, gy + yb), (gx + xa, gy + yb), (gx + xa, gy + yt)]
         mode = QUV_TRANSPOSED
-    return _match_corners(q, targets), (mode << 14) | (start << 8) | count
+    # QUV_WARP (also set for LOD1 above): the row mapping is only exact for an axis-aligned
+    # rectangle spanning the full cell along the mode's column axis. Any
+    # other piece (cut by a diagonal, or trimmed on both axes) squashes the
+    # whole texture width into it; the runtime gives it its own warped
+    # texture (Saturn_Vdp1_GetWarpSrca) and keeps the rows as a fallback.
+    rq = _match_corners(q, targets)
+    # Texel error of the row mapping: the texture's full column range lands
+    # on p0-p1 / p3-p2, so a corner's error is its distance from where that
+    # texel belongs (cell edge along the column axis, row-range edge along
+    # the rows). Only pieces whose worst corner is off by more than
+    # WARP_MIN_ERR texels get a warped texture.
+    if mode == QUV_NORMAL:
+        want = [(gx, gy + yb), (gx + 64, gy + yb), (gx + 64, gy + yt), (gx, gy + yt)]
+    else:
+        want = [(gx + xb, gy + 64), (gx + xb, gy), (gx + xa, gy), (gx + xa, gy + 64)]
+    err = max(max(abs(rq[i][0] - want[i][0]), abs(rq[i][1] - want[i][1])) for i in range(4))
+    warp = QUV_WARP if err > WARP_MIN_ERR else 0
+    return rq, (mode << 14) | (start << 8) | warp | count
 
 def clip_plane(poly, nx, ny, c):
     """Keep the part of convex poly with nx*x + ny*y <= c (exact)."""
@@ -743,7 +768,11 @@ def bake_map_adaptive(wad_data, directory, map_name):
     for ss in range(nsssec):
         qf, qc = sub_q_first[ss], sub_q_count[ss]
         has_t = any((all_quv[i] >> 14) == QUV_TRANSPOSED for i in range(qf, qf + qc))
-        subflags.append(SUBFLAG_TRANSPOSED if has_t else 0)
+        has_w = any(all_quv[i] & QUV_WARP for i in range(qf, qf + qc))
+        lf, lc = lod1_sub_q_first[ss], lod1_sub_q_count[ss]
+        has_w1 = any(all_quv[i] & QUV_WARP for i in range(lf, lf + lc))
+        subflags.append((SUBFLAG_TRANSPOSED if has_t else 0) | (SUBFLAG_WARP if has_w else 0) |
+                        (SUBFLAG_WARP_LOD1 if has_w1 else 0))
 
     return {
         "quv": all_quv,
@@ -879,12 +908,15 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     saturn_dir = os.path.abspath(os.path.join(script_dir, ".."))
-    cd_dir = os.path.join(saturn_dir, "cd")
-    stage_dir = os.path.join(saturn_dir, "staging_assets")
+    cd_dir = os.environ.get("BAKE_OUT") or os.path.join(saturn_dir, "cd")
+    stage_dir = os.environ.get("BAKE_OUT") or os.path.join(saturn_dir, "staging_assets")
 
     os.makedirs(cd_dir, exist_ok=True)
     os.makedirs(stage_dir, exist_ok=True)
-    win_cd_dir = os.path.abspath(os.path.join(saturn_dir, "..", "DOOM-Windows", "cd"))
+    win_name = "DOOM-Windows-rw" if saturn_dir.endswith("-rw") else "DOOM-Windows"
+    win_cd_dir = os.path.abspath(os.path.join(saturn_dir, "..", win_name, "cd"))
+    if os.environ.get("BAKE_OUT"):
+        win_cd_dir = os.environ["BAKE_OUT"]
     if os.path.exists(win_cd_dir):
         os.makedirs(win_cd_dir, exist_ok=True)
 

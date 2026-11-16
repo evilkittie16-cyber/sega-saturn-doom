@@ -4323,6 +4323,13 @@ void I_FinishUpdate(void)
                  * borders are always black, so the window never hides
                  * anything real. */
                 JO_VDP2_SCRCTL = (unsigned short)(JO_VDP2_SCRCTL & 0xFF00u);
+                {
+                    /* this 2D page replaces the last 3D frame: hide the
+                     * sprite layer now, not when the 2D screen started
+                     * (saturn_vdp1.c Saturn_Vdp1_Show2D) */
+                    extern void Saturn_Vdp1_Show2D(void);
+                    Saturn_Vdp1_Show2D();
+                }
                 if (hwsky_valid[0] || hwsky_valid[1] || hwsky_ever)
                 {
                     *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);

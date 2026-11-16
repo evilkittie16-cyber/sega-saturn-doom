@@ -731,12 +731,12 @@ int Saturn_TexHeight(int texnum)
     return textures[t].height;
 }
 
-byte *Saturn_FlatData(int flatnum)
+/* Flat  itself, no animation translation (warp textures key on the
+ * translated flat, saturn_vdp1.c Saturn_Vdp1_GetWarpSrca). */
+byte *Saturn_FlatDataExact(int f)
 {
     extern flattex_t *flatpixels;
-    if (flatnum < 0 || flatnum >= numflats) return NULL;
-    int f = flattranslation[flatnum];
-    if (f < 0 || f >= numflats) f = flatnum;
+    if (f < 0 || f >= numflats) return NULL;
     
     if (!flat_cache[f])
     {
@@ -759,6 +759,14 @@ byte *Saturn_FlatData(int flatnum)
             ReplaceZeroPixels(flat_cache[f], len);
     }
     return flat_cache[f];
+}
+
+byte *Saturn_FlatData(int flatnum)
+{
+    if (flatnum < 0 || flatnum >= numflats) return NULL;
+    int f = flattranslation[flatnum];
+    if (f < 0 || f >= numflats) f = flatnum;
+    return Saturn_FlatDataExact(f);
 }
 
 byte *Saturn_FlatDataNoLoad(int flatnum)

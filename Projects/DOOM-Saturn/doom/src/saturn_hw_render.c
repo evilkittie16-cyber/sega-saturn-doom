@@ -514,6 +514,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_slave_dirty_words = 0;
     hw_def_flat_count = 0;
     hw_frame_flat_jobs = 0;
+    Saturn_Vdp1_WarpNewFrame();
+    HW_WarpService();       /* textures the flat workers asked for last frame */
     {
         static int16_t last_ap_vh = -1;
         hw_aperture_state_t *ap = HW_APERTURE;

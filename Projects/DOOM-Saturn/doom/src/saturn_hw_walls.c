@@ -1716,6 +1716,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
             unsigned short s = tag->srca;
             if (__builtin_expect(s != 0 && s != 0xFFFFu, 1))
             {
+                /* no optional copies yet and VRAM has room this frame:
+                 * make them now (saturn_vdp1.c, one wall per frame) */
+                extern int saturn_v1_late_copy_armed;
+                if (__builtin_expect(saturn_v1_late_copy_armed && tag->srca_mono == s, 0))
+                    Saturn_Vdp1_WallLateCopy(texnum);
                 ctx->srca      = s;
                 ctx->srca_mono = tag->srca_mono;
                 ctx->srca_64   = tag->srca_64;

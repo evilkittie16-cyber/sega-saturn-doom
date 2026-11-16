@@ -61,6 +61,12 @@ extern const uint8_t                *saturn_baked_flat_subflags; /* bit0: LOD0 u
 #define SATURN_QUV_TRANSPOSED  2
 #define SATURN_QUV_TILE        3
 #define SATURN_SUBFLAG_TRANSPOSED 1
+/* QUV bit 7: the piece is not an exact row mapping (cut by a diagonal or
+ * trimmed on both axes); drawn with its own warped texture when one is
+ * resident (Saturn_Vdp1_GetWarpSrca). Subflag bit 1: LOD0 list has some. */
+#define SATURN_QUV_WARP        0x80u
+#define SATURN_SUBFLAG_WARP    2
+#define SATURN_SUBFLAG_WARP_LOD1 4  /* LOD1 (128-unit) list has QUV_WARP quads */
 extern int                           saturn_baked_flat_numsubsectors;
 
 #endif /* SATURN_BAKED_FLATS_H */

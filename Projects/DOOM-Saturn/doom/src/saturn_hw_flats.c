@@ -164,11 +164,23 @@ HW_ALWAYS_INLINE int HW_FlatTriDy(int y0, int y1, int y2)
     return dy;
 }
 
+/* quad_size bits 15-8: 0x08 (64-wide flat pyramid) or HW_WARP_SIZE_FLAG |
+ * (w / 8) for a warped per-piece texture (fctx->size_wbits). */
+#define HW_WARP_SIZE_FLAG 0x4000u
+#define HW_FLAT_SIZE_W64  0x0800u
+
 /* Takes 3 register arguments (r4=base_srca, r5=quad_size, r6=dy), 0 stack arguments, 0 callee-saved reg pushes */
 static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_size, int dy)
 {
     int v0   = (int)(quad_size >> 16);
     int rows = (int)(quad_size & 0xFFu);
+    if (__builtin_expect(quad_size & HW_WARP_SIZE_FLAG, 0))
+    {
+        /* warped per-piece texture: w/8 in bits 13-8, one level, no mips */
+        uint32_t w8 = (quad_size >> 8) & 0x3Fu;
+        uint32_t srca = (uint32_t)base_srca + (uint32_t)v0 * w8;
+        return (srca << 16) | (w8 << 8) | (uint32_t)rows;
+    }
     if (__builtin_expect(rows <= 32, 0))
         dy <<= (rows <= 16) ? 2 : 1;
 
@@ -620,6 +632,17 @@ typedef struct {
     uint8_t                 avg_floor;      /* raster-hole backing colours (palette idx) */
     uint8_t                 avg_ceil;
     uint8_t                 hole_on;        /* per job: backing enabled && ceiling emitted */
+    /* Warped per-piece textures (SATURN_QUV_WARP quads, HW_WarpApply):
+     * the job's translated floor / ceiling flats (0xFF = none), its first
+     * quad / vertex index, the frame stamp. size_wbits = the SIZE width bits
+     * of the quad being emitted (HW_FLAT_SIZE_W64 or warp). */
+    uint32_t                warp_gq0;
+    uint32_t                warp_v0;
+    uint16_t                warp_frame;
+    uint8_t                 warp_ff;
+    uint8_t                 warp_cf;
+    uint8_t                 warp_room;      /* saturn_warp_room: placeholders allowed */
+    uint32_t                size_wbits;
 } hw_flat_emit_ctx_t;
 
 /* Inline gate (2026-11-15): HW_FlatHoleBacking ran 182x per heavy frame at
@@ -639,7 +662,47 @@ typedef struct {
  * (bits 7-0) flat, the raster-hole backing colour (HW_FlatHoleBacking). */
 #define HW_JOB_AVG_WORD      (HW_JOB_WORDS_BEFORE_PAD + 1)
 
+/* Warped per-piece textures (SATURN_QUV_WARP quads). The flat worker that
+ * draws a piece looks its texture up in saturn_warp_tab (HW_WarpFind) and,
+ * if it is missing, queues a request; the master makes the requested
+ * textures at the start of the next frame (HW_WarpService), within the
+ * per-frame budget. One queue per CPU (master jobs: deferred / no slave).
+ * A job carries its translated floor / ceiling flat numbers in bits 31-24 /
+ * 23-16 of HW_JOB_AVG_WORD (0xFF = no warp for that surface). */
+typedef struct {
+    uint32_t gq;        /* global baked quad index */
+    uint32_t v_first;   /* the job's first vertex (quad indices are relative) */
+    uint16_t flat;      /* translated flat number */
+    uint8_t  is_ceil;
+    uint8_t  lv;
+} hw_warp_req_t;
+#define HW_WARP_REQ_MAX 128
+#ifdef SATURN_WIN32
+unsigned int saturn_warp_hits = 0, saturn_warp_fallbacks = 0;   /* emulator diagnostics */
+#endif
+static HW_ALIGN16 hw_warp_req_t hw_warp_req[2][HW_WARP_REQ_MAX];   /* [0] slave, [1] master */
+static volatile int hw_warp_req_n[2];
+
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_master;
+static uint32_t HW_WarpApply(hw_flat_emit_ctx_t *fctx, int q_local, fixed_t cz_min, int emit_floor, int emit_ceil, int prefetch);
+
+/* Nearest corner's distance from the camera (max + min/2 of |cx|, |cz|),
+ * the warp texture level input: unlike depth it doesn't change when the
+ * player turns on the spot (changing level re-made textures mid-turn). */
+HW_ALWAYS_INLINE fixed_t HW_WarpDist(const saturn_proj_v_t *a, const saturn_proj_v_t *b,
+                                     const saturn_proj_v_t *c, const saturn_proj_v_t *d)
+{
+    const saturn_proj_v_t *pvs[4] = { a, b, c, d };
+    fixed_t m = 0x7FFFFFFF;
+    for (int k = 0; k < 4; k++)
+    {
+        fixed_t ax = pvs[k]->cx < 0 ? -pvs[k]->cx : pvs[k]->cx;
+        fixed_t az = pvs[k]->cz < 0 ? -pvs[k]->cz : pvs[k]->cz;
+        fixed_t dk = (ax > az) ? ax + (az >> 1) : az + (ax >> 1);
+        if (dk < m) m = dk;
+    }
+    return m;
+}
 #ifndef SATURN_WIN32
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_slave;
 #endif
@@ -1084,7 +1147,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
         int s_rows  = r_end - r_start;
         if (s_rows < 1) s_rows = 1;
         int v0 = base_v0 + (quad_rows - r_end);
-        uint32_t strip_size = ((uint32_t)v0 << 16) | 0x0800u | (uint32_t)s_rows;
+        uint32_t strip_size = ((uint32_t)v0 << 16) | fctx->size_wbits | (uint32_t)s_rows;
 
         unsigned int cz_s_avg = ((unsigned int)cz_L[s] >> 2) + ((unsigned int)cz_R[s] >> 2) +
                                 ((unsigned int)cz_L[s+1] >> 2) + ((unsigned int)cz_R[s+1] >> 2);
@@ -1120,7 +1183,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
 
             vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
-            uint32_t w2 = (((uint32_t)base_srca + (uint32_t)(v0 << 3)) << 16) | 0x0800u | (uint32_t)s_rows;
+            uint32_t w2 = __builtin_expect(fctx->size_wbits == HW_FLAT_SIZE_W64, 1)
+                ? ((((uint32_t)base_srca + (uint32_t)(v0 << 3)) << 16) | 0x0800u | (uint32_t)s_rows)
+                : HW_FlatSizeLOD(base_srca, strip_size, 32);
             c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
             c32[1] = w1;
             c32[2] = w2;
@@ -1199,7 +1264,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
 
-        uint32_t quad_size = ((qpack >> 8) & 0x007F0000u) | 0x0800u | ((qpack >> 16) & 0xFFu);
+        uint32_t quad_size = ((qpack >> 8) & 0x007F0000u) | fctx->size_wbits | ((qpack >> 16) & 0xFFu);
         int x0 = pv0->px, y0 = py0;
         int x1 = pv1->px, y1 = py1;
         int x2 = pv2->px, y2 = py2;
@@ -1735,7 +1800,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
         unsigned int zb = (((unsigned int)cz_min >> 1) + ((unsigned int)cz_max >> 1)) >> 20;
         if (zb > 127u) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
-        uint32_t quad_size = ((uint32_t)r0 << 16) | 0x0800u | (uint32_t)(r1 - r0);
+        uint32_t quad_size = ((uint32_t)r0 << 16) | fctx->size_wbits | (uint32_t)(r1 - r0);
 
         /* The triangle the one-corner slide dropped (see tri_on): a small
          * piece at the clip line, i.e. the screen's top / bottom edge. Drawn
@@ -1805,6 +1870,152 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
         c32[7] = 0;
         HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
     }
+    return local_q;
+}
+
+/* A warped per-piece texture (Saturn_Vdp1_GetWarpSrca) is stored as
+ * column strips (saturn_warp_strip_w: 32, 16 or 8 texels wide), each a
+ * texture of its own, so a piece can be cut along its columns as well as its
+ * rows: one sub-quad per strip, its corners interpolated in camera space
+ * along p0-p1 / p3-p2, each drawn by the banded emitter (which slices rows
+ * for perspective and clips the near plane). With rows only, a piece whose
+ * depth changes across its columns skewed as the player turned (hardware
+ * 2026-11-16: "ceiling textures distort as the player rotates"). */
+static HW_NOINLINE HW_HOT_O2 int HW_EmitWarpStrips(hw_flat_emit_ctx_t *fctx,
+                                                   const saturn_flat_quad_idx_t *qp,
+                                                   uint32_t wh, int is_ceil, uint16_t srca,
+                                                   int local_q)
+{
+    saturn_proj_v_t sub[4];
+    static const saturn_flat_quad_idx_t sub_q = { { 0, 1, 2, 3 } };
+    saturn_proj_v_t *const saved_pv = fctx->proj_v;
+    const saturn_proj_v_t *p0 = &saved_pv[qp->v[0]], *p1 = &saved_pv[qp->v[1]];
+    const saturn_proj_v_t *p2 = &saved_pv[qp->v[2]], *p3 = &saved_pv[qp->v[3]];
+    const int w = (int)(wh >> 8), h = (int)(wh & 0xFFu);
+    const int sw = saturn_warp_strip_w(w);      /* strip width */
+    const int ns = w / sw;
+    const uint32_t saved_wbits = fctx->size_wbits;
+    int s;
+
+    const fixed_t z_eff = is_ceil ? fctx->z_eff_ceil : fctx->z_eff_floor;
+    const fixed_t y_w   = is_ceil ? fctx->y_ceil_w : fctx->y_floor_w;
+    const uint32_t pmod = (PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu;
+    const fixed_t du = (fixed_t)(FRACUNIT / ns);
+
+    if (ns <= 0 || h <= 0 || !srca)
+        return local_q;
+    fctx->size_wbits = HW_WARP_SIZE_FLAG | ((uint32_t)(sw >> 3) << 8);
+    fctx->proj_v = sub;
+    for (s = 0; s < ns; s++)
+    {
+        /* strip s covers columns [s*sw, (s+1)*sw): u from s/ns to (s+1)/ns */
+        fixed_t u0 = du * s, u1 = (s + 1 == ns) ? FRACUNIT : du * (s + 1);
+        const uint16_t ssrca = (uint16_t)(srca + (uint32_t)((s * sw * h) >> 3));
+        sub[0].cx = p0->cx + FixedMul(p1->cx - p0->cx, u0); sub[0].cz = p0->cz + FixedMul(p1->cz - p0->cz, u0);
+        sub[1].cx = p0->cx + FixedMul(p1->cx - p0->cx, u1); sub[1].cz = p0->cz + FixedMul(p1->cz - p0->cz, u1);
+        sub[2].cx = p3->cx + FixedMul(p2->cx - p3->cx, u1); sub[2].cz = p3->cz + FixedMul(p2->cz - p3->cz, u1);
+        sub[3].cx = p3->cx + FixedMul(p2->cx - p3->cx, u0); sub[3].cz = p3->cz + FixedMul(p2->cz - p3->cz, u0);
+        {
+            /* Fast path: in front of the clip depth and shallow along the rows
+             * (the banded emitter would draw one band): project and write one
+             * command. Anything else goes through the banded emitter. */
+            fixed_t zmin = sub[0].cz, zmax = sub[0].cz;
+            int i, px[4], py[4], fits = 1;
+            for (i = 1; i < 4; i++)
+            {
+                if (sub[i].cz < zmin) zmin = sub[i].cz;
+                if (sub[i].cz > zmax) zmax = sub[i].cz;
+            }
+            if (zmin >= z_eff && zmax - zmin < (zmin >> 1))
+            {
+                for (i = 0; i < 4; i++)
+                {
+                    int sd = HW_SlaveFastDiv(sub[i].cz);
+                    px[i] = HW_ProjX(sub[i].cx, sd, fctx->vcx);
+                    py[i] = HW_ProjY(y_w, sd, fctx->vcy);
+                    if ((unsigned int)(px[i] + 1000) > 2000u || (unsigned int)(py[i] + 1000) > 2000u)
+                        fits = 0;
+                }
+                if (fits)
+                {
+                    int cw;
+                    if ((px[0] < 0 && px[1] < 0 && px[2] < 0 && px[3] < 0) ||
+                        (px[0] > fctx->vw && px[1] > fctx->vw && px[2] > fctx->vw && px[3] > fctx->vw) ||
+                        (py[0] < 0 && py[1] < 0 && py[2] < 0 && py[3] < 0) ||
+                        (py[0] > fctx->vh && py[1] > fctx->vh && py[2] > fctx->vh && py[3] > fctx->vh))
+                        continue;
+                    cw = HW_MulsW_PairAdd(px[2] - px[0], py[3] - py[1], px[1] - px[3], py[2] - py[0], 0);
+                    if (cw == 0)
+                        continue;
+                    if (local_q >= fctx->qcap)
+                        break;
+                    {
+                        unsigned int zb = (((unsigned int)zmin >> 1) + ((unsigned int)zmax >> 1)) >> 20;
+                        uint32_t p0w = ((uint32_t)px[0] << 16) | (uint16_t)py[0];
+                        uint32_t p1w = ((uint32_t)px[1] << 16) | (uint16_t)py[1];
+                        uint32_t p2w = ((uint32_t)px[2] << 16) | (uint16_t)py[2];
+                        uint32_t p3w = ((uint32_t)px[3] << 16) | (uint16_t)py[3];
+                        aliased_uint32_t *c32 = (aliased_uint32_t *)&fctx->cmd_s_out[local_q++];
+                        if (zb > 127u) zb = 127u;
+                        c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
+                        c32[1] = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
+                        c32[2] = ((uint32_t)ssrca << 16) | ((uint32_t)(sw >> 3) << 8) | (uint32_t)h;
+                        if (cw < 0) { c32[3] = p1w; c32[4] = p0w; c32[5] = p3w; c32[6] = p2w; }
+                        else        { c32[3] = p0w; c32[4] = p1w; c32[5] = p2w; c32[6] = p3w; }
+                        c32[7] = 0;
+                        HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
+                    }
+                    continue;
+                }
+            }
+        }
+        local_q = HW_EmitFlatQuadBanded(fctx, &sub_q, 0, h, is_ceil, ssrca, 0, local_q);
+        if (local_q >= fctx->qcap)
+            break;
+    }
+    fctx->proj_v = saved_pv;
+    fctx->size_wbits = saved_wbits;
+    return local_q;
+}
+
+/* A warp piece seen for the first time has no texture until the next frame
+ * (HW_WarpService). The row mapping shows a squashed, high-contrast wrong
+ * pattern for that frame (flicker while turning); draw an untextured
+ * polygon in the flat's most common colour and the sector's light instead.
+ * Returns -1 if the quad is outside VDP1's coordinate range (caller keeps
+ * the row mapping). */
+static HW_NOINLINE HW_COLD_OS int HW_EmitWarpPlaceholder(hw_flat_emit_ctx_t *fctx,
+                                                        const saturn_proj_v_t *pv0, const saturn_proj_v_t *pv1,
+                                                        const saturn_proj_v_t *pv2, const saturn_proj_v_t *pv3,
+                                                        int is_ceil, int local_q)
+{
+    const saturn_proj_v_t *pv[4] = { pv0, pv1, pv2, pv3 };
+    const uint32_t pmod = (PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu;
+    int x[4], y[4], i;
+    unsigned int cz = 0, zb;
+    aliased_uint32_t *t32;
+    for (i = 0; i < 4; i++)
+    {
+        x[i] = pv[i]->px;
+        y[i] = is_ceil ? pv[i]->py_c : pv[i]->py_f;
+        if ((unsigned int)(x[i] + 1000) > 2000u || (unsigned int)(y[i] + 1000) > 2000u)
+            return -1;
+        cz += (unsigned int)pv[i]->cz >> 2;
+    }
+    if (local_q >= fctx->qcap)
+        return local_q;
+    zb = cz >> 20;
+    if (zb > 127u) zb = 127u;
+    t32 = (aliased_uint32_t *)&fctx->cmd_s_out[local_q++];
+    t32[0] = 0x00040000u;                                   /* polygon */
+    t32[1] = ((0x00C0u | (pmod & 0x0600u)) << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u)
+           | (uint32_t)(is_ceil ? fctx->avg_ceil : fctx->avg_floor);
+    t32[2] = 0;
+    t32[3] = ((uint32_t)x[0] << 16) | (uint16_t)y[0];
+    t32[4] = ((uint32_t)x[1] << 16) | (uint16_t)y[1];
+    t32[5] = ((uint32_t)x[2] << 16) | (uint16_t)y[2];
+    t32[6] = ((uint32_t)x[3] << 16) | (uint16_t)y[3];
+    t32[7] = 0;
     return local_q;
 }
 
@@ -1960,6 +2171,23 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
 #endif
     fctx->avg_floor = (uint8_t)(avg_pack >> 8);
     fctx->avg_ceil  = (uint8_t)avg_pack;
+    fctx->size_wbits = HW_FLAT_SIZE_W64;
+    fctx->warp_ff = (uint8_t)(avg_pack >> 24);
+    fctx->warp_cf = (uint8_t)(avg_pack >> 16);
+    if ((avg_pack >> 16) != 0xFFFFu && quads && verts)
+    {
+        fctx->warp_gq0 = (uint32_t)(quads - saturn_baked_flat_quads);
+        fctx->warp_v0  = (uint32_t)(verts - saturn_baked_flat_verts);
+#ifndef SATURN_WIN32
+        fctx->warp_frame = *(volatile uint16_t *)((uintptr_t)&saturn_warp_frame | SATURN_WRAM_H_UNCACHED);
+        fctx->warp_room  = *(volatile uint8_t *)((uintptr_t)&saturn_warp_room | SATURN_WRAM_H_UNCACHED);
+#else
+        fctx->warp_frame = saturn_warp_frame;
+        fctx->warp_room  = saturn_warp_room;
+#endif
+    }
+    else
+        fctx->warp_ff = fctx->warp_cf = 0xFF;
 #if HW_FLAT_HOLE_BACKING
 #ifndef SATURN_WIN32
     fctx->hole_on = (uint8_t)(emit_ceil &&
@@ -2220,6 +2448,7 @@ vert_behind:
     const int alt_ok = (!emit_floor || alt_floor_srca != 0) && (!emit_ceil || alt_ceil_srca != 0);
 
     /* Phase 2: Assemble & emit quads using cached projected vertices */
+    const int warp_on = (fctx->warp_ff != 0xFF || fctx->warp_cf != 0xFF) && quv_ptr != NULL;
     for (int q = 0; q < q_count; q++, q_ptr++)
     {
         int qv0 = q_ptr->v[0];
@@ -2272,6 +2501,8 @@ vert_behind:
                 }
             }
         }
+        fctx->size_wbits = HW_FLAT_SIZE_W64;
+        const int q_is_warp = warp_on && (quv_ptr[q] & SATURN_QUV_WARP);
         const saturn_proj_v_t *pv0 = &proj_v[qv0];
         const saturn_proj_v_t *pv1 = &proj_v[qv1];
         const saturn_proj_v_t *pv2 = &proj_v[qv2];
@@ -2285,13 +2516,26 @@ vert_behind:
         /* Transposed pyramid a full NORMAL cell may switch to in the banded
          * emitter (LOD0 jobs carry the transposed pack as their alt SRCAs). */
         const int can_flip = (q_mode == SATURN_QUV_NORMAL) && !(fully_inside & HW_FLAT_USE_LOD1);
-        const uint16_t flip_c = can_flip ? alt_ceil_srca : 0;
-        const uint16_t flip_f = can_flip ? alt_floor_srca : 0;
+        uint16_t flip_c = can_flip ? alt_ceil_srca : 0;
+        uint16_t flip_f = can_flip ? alt_floor_srca : 0;
 
         if (__builtin_expect(min_x == -32768, 0))
         {
             if (max_x > -32768)
             {
+                if (__builtin_expect(q_is_warp, 0))
+                {
+                    /* own texture, drawn in column strips */
+                    uint32_t wq = HW_WarpApply(fctx, q, HW_NEAR_Z, emit_floor, emit_ceil, 0);
+                    if (wq)
+                    {
+                        if (emit_ceil)
+                            local_q = HW_EmitWarpStrips(fctx, qp, wq, 1, fctx->ceil_srca, local_q);
+                        if (emit_floor)
+                            local_q = HW_EmitWarpStrips(fctx, qp, wq, 0, fctx->floor_srca, local_q);
+                        continue;
+                    }
+                }
                 if (qpack_quv)
                 {
                     int st = (int)(qpack_quv >> 24), cnt = (int)((qpack_quv >> 16) & 0xFFu);
@@ -2310,7 +2554,14 @@ vert_behind:
         }
 
         if (max_x <= 0 || min_x >= vw || min_x >= max_x)
+        {
+            /* Warp quad just off the side (half a screen): ask for its
+             * texture now, so turning brings it in already made. */
+            if (__builtin_expect(q_is_warp, 0) && min_x < max_x &&
+                max_x > -(vw >> 1) && min_x < vw + (vw >> 1))
+                HW_WarpApply(fctx, q, HW_WarpDist(pv0, pv1, pv2, pv3), emit_floor, emit_ceil, 1);
             continue;
+        }
 
         int cl_min_x = (min_x < 0) ? 0 : min_x;
         int cl_max_x = (max_x > vw) ? vw : max_x;
@@ -2346,6 +2597,34 @@ vert_behind:
 
         if ((cw_c | cw_f) == 0)
             continue;
+
+        if (__builtin_expect(q_is_warp, 0))
+        {
+            uint32_t wq = HW_WarpApply(fctx, q, HW_WarpDist(pv0, pv1, pv2, pv3),
+                                       emit_floor, emit_ceil, 0);
+            if (wq)
+            {
+                if (cw_c != 0)
+                    local_q = HW_EmitWarpStrips(fctx, qp, wq, 1, fctx->ceil_srca, local_q);
+                if (cw_f != 0)
+                    local_q = HW_EmitWarpStrips(fctx, qp, wq, 0, fctx->floor_srca, local_q);
+                continue;
+            }
+            else if (fctx->warp_room)
+            {
+                /* texture arrives next frame: flat-colour placeholder */
+                int lc = local_q, ph_ok = 1;
+                if (cw_c != 0) { lc = HW_EmitWarpPlaceholder(fctx, pv0, pv1, pv2, pv3, 1, lc); ph_ok = lc >= 0; }
+                if (ph_ok && cw_f != 0) { lc = HW_EmitWarpPlaceholder(fctx, pv0, pv1, pv2, pv3, 0, lc); ph_ok = lc >= 0; }
+                if (ph_ok)
+                {
+                    local_q = lc;
+                    continue;
+                }
+                /* (a ceiling placeholder already written is overwritten
+                 * by the row-mapped quads below: local_q unchanged) */
+            }
+        }
 
         uint32_t qpack_base = 64u << 16;
         if (qpack_quv)
@@ -2536,6 +2815,206 @@ HW_ALWAYS_INLINE int HW_FlatAltVariant(int use_lod1, int subnum)
 #ifndef SATURN_WIN32
 static uint32_t hw_def_alt_pack = 0;    /* alt pack for HW_DeferMasterFlatJob */
 #endif
+static uint32_t hw_def_warp_bits = 0xFFFF0000u;   /* warp bits for HW_DeferMasterFlatJob */
+#ifndef HW_WARP_LOD0_DIST
+#define HW_WARP_LOD0_DIST 64    /* map units: full-res warp textures nearer than this */
+#endif
+
+HW_ALWAYS_INLINE int HW_WarpLen16(int dx, int dy)
+{
+    /* edge length in 1/16 units, max + min/2 (over-estimates <= 12%) */
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return (dx > dy) ? dx + (dy >> 1) : dy + (dx >> 1);
+}
+
+/* Master, start of each 3D frame (slave idle): make the textures the flat
+ * workers asked for last frame (HW_WarpApply), budgeted. */
+static HW_NOINLINE HW_COLD_OS void HW_WarpService(void)
+{
+    /* Pass 0: pieces with no texture at all get a coarse one first (level 3,
+     * at most 8 x 8 texels): cheap, so every newly visible piece is drawn
+     * with a world-aligned texture next frame instead of the row mapping
+     * (that flickered while turning: the budget couldn't make them all
+     * full size at once). Pass 1: the requested levels, with what budget
+     * remains; until then the coarse texture is drawn. */
+    int pass, r;
+    for (pass = 0; pass < 2; pass++)
+    for (r = 0; r < 2; r++)
+    {
+#ifndef SATURN_WIN32
+        volatile int *np = (volatile int *)((uintptr_t)&hw_warp_req_n[r] | SATURN_WRAM_H_UNCACHED);
+        const hw_warp_req_t *rq = (const hw_warp_req_t *)((uintptr_t)hw_warp_req[r] | SATURN_WRAM_H_UNCACHED);
+#else
+        volatile int *np = &hw_warp_req_n[r];
+        const hw_warp_req_t *rq = hw_warp_req[r];
+#endif
+        int n = *np, k;
+        if (n > HW_WARP_REQ_MAX) n = HW_WARP_REQ_MAX;
+        for (k = 0; k < n; k++)
+        {
+            const uint32_t gq = rq[k].gq, v_first = rq[k].v_first;
+            int lv = rq[k].lv;
+            const saturn_flat_quad_idx_t *qi;
+            int32_t wx[4], wy[4];
+            int i, w, h, l01, l32, l03, l12;
+            if (!saturn_baked_flat_quads || !saturn_baked_flat_verts)
+                continue;
+            if (!Saturn_Vdp1_WarpRoom(pass == 0 ? 64 : 256))
+                break;                              /* no VRAM / budget left */
+            if (pass == 0)
+            {
+                const uint32_t k1 = (gq << 1) | rq[k].is_ceil;
+                const saturn_warp_slot_t *e0 = &saturn_warp_tab[saturn_warp_slot(k1, 0)];
+                const saturn_warp_slot_t *e1 = &saturn_warp_tab[saturn_warp_slot(k1, 1)];
+                if ((e0->srca && e0->key == k1 + 1u) || (e1->srca && e1->key == k1 + 1u))
+                    continue;                       /* has a texture: refine in pass 1 */
+                lv = 3;
+            }
+            qi = &saturn_baked_flat_quads[gq];
+            for (i = 0; i < 4; i++)
+            {
+                uint32_t vi = v_first + qi->v[i];
+                const saturn_flat_vert_t *v = &saturn_baked_flat_verts[vi];
+                int fr = saturn_baked_flat_vfrac ? saturn_baked_flat_vfrac[vi] : 0;
+                wx[i] = (int32_t)v->x * 16 + (fr >> 4);
+                wy[i] = (int32_t)v->y * 16 + (fr & 15);
+            }
+            l01 = HW_WarpLen16(wx[1] - wx[0], wy[1] - wy[0]) >> lv;
+            l32 = HW_WarpLen16(wx[2] - wx[3], wy[2] - wy[3]) >> lv;
+            l03 = HW_WarpLen16(wx[3] - wx[0], wy[3] - wy[0]) >> lv;
+            l12 = HW_WarpLen16(wx[2] - wx[1], wy[2] - wy[1]) >> lv;
+            w = (((l01 > l32 ? l01 : l32) + 15) >> 4);
+            h = (((l03 > l12 ? l03 : l12) + 15) >> 4);
+            w = (w <= 8) ? 8 : (w + 15) & ~15;      /* 8, or 16-wide strips */
+            if (w > 64) w = 64;
+            if (h < 1) h = 1; else if (h > 64) h = 64;
+            Saturn_Vdp1_GetWarpSrca((int)gq, rq[k].is_ceil, rq[k].flat, lv, wx, wy, w, h);
+        }
+        if (pass == 1)
+            *np = 0;
+    }
+}
+
+/* Flat worker: the warped texture of visible warp quad `gq` (local quad
+ * index q_local) for the surfaces it draws. All found: switch the quad to
+ * them (fctx floor/ceil SRCA, size_wbits) and return its rows (qpack, h
+ * rows from 0). Any missing: queue a request, return 0 (row mapping this
+ * frame). Resolution level from the nearest corner depth. */
+static HW_NOINLINE HW_HOT_O2 uint32_t HW_WarpApply(hw_flat_emit_ctx_t *fctx, int q_local,
+                                                   fixed_t cz_min, int emit_floor, int emit_ceil,
+                                                   int prefetch)
+{
+    const uint32_t gq = fctx->warp_gq0 + (uint32_t)q_local;
+    const int d = cz_min >> FRACBITS;
+    const int lv = (d < HW_WARP_LOD0_DIST) ? 0 : (d < HW_WARP_LOD0_DIST * 2) ? 1
+                 : (d < HW_WARP_LOD0_DIST * 4) ? 2 : 3;
+    uint16_t srca[2] = { 0, 0 };
+    uint32_t wh = 0;
+    int c, missing = 0;
+    for (c = 0; c < 2; c++)
+    {
+        const int flat = c ? fctx->warp_cf : fctx->warp_ff;
+        const uint32_t k1 = (gq << 1) | (uint32_t)c;
+        volatile saturn_warp_slot_t *e;
+        if (!(c ? emit_ceil : emit_floor))
+            continue;
+        if (flat == 0xFF)
+            return 0;
+#ifndef SATURN_WIN32
+        e = (volatile saturn_warp_slot_t *)((uintptr_t)&saturn_warp_tab[saturn_warp_slot(k1, 0)] | SATURN_WRAM_H_UNCACHED);
+        if (e->key != k1 + 1u)
+            e = (volatile saturn_warp_slot_t *)((uintptr_t)&saturn_warp_tab[saturn_warp_slot(k1, 1)] | SATURN_WRAM_H_UNCACHED);
+#else
+        e = &saturn_warp_tab[saturn_warp_slot(k1, 0)];
+        if (e->key != k1 + 1u)
+            e = &saturn_warp_tab[saturn_warp_slot(k1, 1)];
+#endif
+        if (e->srca && e->key == k1 + 1u)
+        {
+            /* This piece's texture is resident: always draw with it (other
+             * level or previous animation frame included; falling back to
+             * the row mapping for a frame flickered on hardware while
+             * turning) and ask for the right one if it differs. Both
+             * surfaces must share one size, else the row mapping. */
+            uint32_t ewh = e->wh;
+            srca[c] = e->srca;
+            if (wh && wh != ewh)
+                missing = 1;
+            wh = ewh;
+            e->used = fctx->warp_frame;
+            if (e->lv == (uint8_t)lv && e->flat == (uint16_t)flat)
+                continue;
+        }
+        else
+            missing = 1;
+        {
+            const int r = (fctx == &hw_fctx_master) ? 1 : 0;
+#ifndef SATURN_WIN32
+            volatile int *np = (volatile int *)((uintptr_t)&hw_warp_req_n[r] | (r ? 0u : SATURN_WRAM_H_UNCACHED));
+            hw_warp_req_t *rq = (hw_warp_req_t *)((uintptr_t)hw_warp_req[r] | (r ? 0u : SATURN_WRAM_H_UNCACHED));
+#else
+            volatile int *np = &hw_warp_req_n[r];
+            hw_warp_req_t *rq = hw_warp_req[r];
+#endif
+            int n = *np;
+            if (n < HW_WARP_REQ_MAX && fctx->warp_room)
+            {
+                rq[n].gq      = gq;
+                rq[n].v_first = fctx->warp_v0;
+                rq[n].flat    = (uint16_t)flat;
+                rq[n].is_ceil = (uint8_t)c;
+                rq[n].lv      = (uint8_t)lv;
+                *np = n + 1;
+            }
+        }
+    }
+    if (prefetch)
+        return 0;           /* just off screen: requests only, nothing drawn */
+#ifdef SATURN_WIN32
+    if (missing || !wh || (emit_floor && !srca[0]) || (emit_ceil && !srca[1]))
+    {
+        static int log_on = -1;
+        if (log_on < 0) log_on = getenv("WARP_LOG") != NULL;
+        if (log_on)
+        {
+            printf("[WFB] q%u lv%d f%d c%d srca%u/%u wh%x req:%d/%d\n", gq, lv,
+                   emit_floor, emit_ceil, srca[0], srca[1], wh, hw_warp_req_n[0], hw_warp_req_n[1]);
+        }
+        saturn_warp_fallbacks++;
+    }
+    else
+        saturn_warp_hits++;
+#endif
+    if (missing || !wh || (emit_floor && !srca[0]) || (emit_ceil && !srca[1]))
+        return 0;
+    if (emit_floor) fctx->floor_srca = srca[0];
+    if (emit_ceil)  fctx->ceil_srca  = srca[1];
+    return wh;              /* w << 8 | h: draw with HW_EmitWarpStrips */
+}
+
+/* Master, at job submit: the job's HW_JOB_AVG_WORD warp bits (translated
+ * floor / ceiling flat in bits 31-24 / 23-16, 0xFF = none). */
+HW_ALWAYS_INLINE uint32_t HW_WarpJobBits(int subnum, int use_lod1, const sector_t *sec,
+                                         int emit_floor, int emit_ceil)
+{
+    uint32_t ff = 0xFF, cf = 0xFF;
+    if (saturn_baked_flat_subflags &&
+        (saturn_baked_flat_subflags[subnum] & (use_lod1 ? SATURN_SUBFLAG_WARP_LOD1 : SATURN_SUBFLAG_WARP)))
+    {
+        if (emit_floor)
+        {
+            int f = flattranslation ? flattranslation[sec->floorpic] : sec->floorpic;
+            if ((unsigned)f < 0xFFu && f < numflats) ff = (uint32_t)f;
+        }
+        if (emit_ceil)
+        {
+            int f = flattranslation ? flattranslation[sec->ceilingpic] : sec->ceilingpic;
+            if ((unsigned)f < 0xFFu && f < numflats) cf = (uint32_t)f;
+        }
+    }
+    return (ff << 24) | (cf << 16);
+}
 
 static hw_flat_sec_cache_t hw_flat_sec_cache = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -2600,7 +3079,7 @@ static HW_NOINLINE HW_COLD_OS void HW_DeferMasterFlatJob(
     mw[9]  = hw_solid_summary;
     mw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)s_any;
     mw[HW_JOB_ALT_SRCA_WORD] = hw_def_alt_pack;
-    mw[HW_JOB_AVG_WORD] = fc->avg_pack;
+    mw[HW_JOB_AVG_WORD] = fc->avg_pack | hw_def_warp_bits;
     if (s_any != 0)
     {
         const uint32_t *sm = hw_solid_mask;
@@ -2675,6 +3154,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
         }
     }
     hw_def_alt_pack = alt_pack;
+    uint32_t warp_bits = HW_WarpJobBits(subnum, use_lod1, sec, (int)emit_floor, (int)emit_ceil);
+    hw_def_warp_bits = warp_bits;
 
     uint32_t sky_flags = (uint32_t)fc->is_sky & allow_sky;
     uint32_t w3_pack = (emit_floor << 24) | (emit_ceil << 16) | ((u_flags & 19u) << 8) | sky_flags;
@@ -2733,7 +3214,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
             (uint32_t)fc->light_bits | ((uint32_t)sub_idx & 0x0FFFu);
     jw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)dirty;
     jw[HW_JOB_ALT_SRCA_WORD] = alt_pack;
-    jw[HW_JOB_AVG_WORD] = fc->avg_pack;
+    jw[HW_JOB_AVG_WORD] = fc->avg_pack | warp_bits;
 
     if (__builtin_expect(dirty != 0, 0))
     {
@@ -2834,6 +3315,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     }
     job.align_pad[1] = ((emit_floor ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->floorpic) : 0u) << 8)
                      | (emit_ceil ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->ceilingpic) : 0u);
+    job.align_pad[1] |= HW_WarpJobBits(subnum, use_lod1 && l_qcount > 0 && l_vcount > 0,
+                                       sec, emit_floor, emit_ceil);
 
     volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
     HW_Master_ProcessJob(ipc, &job);

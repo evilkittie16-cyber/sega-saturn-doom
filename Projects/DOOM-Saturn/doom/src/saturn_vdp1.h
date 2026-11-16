@@ -106,6 +106,41 @@ int  Saturn_Vdp1_GetFlatSrca(int flatnum);
 /* Lazily uploaded flat variants: 1 = transposed pyramid, 2 = LOD1 2x2 tile
  * pyramid. Same layout as the base flat pyramid. 0 = unavailable. */
 int  Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant);
+/* Warped per-piece flat texture (w x h, w multiple of 8) for baked quad
+ * `quad`; corners wx/wy in 1/16 map units, p0..p3. 0 = not available. */
+int  Saturn_Vdp1_GetWarpSrca(int quad, int is_ceil, int flatnum, int lv,
+                             const int32_t *wx, const int32_t *wy, int w, int h);
+/* Warp texture slots, 2-way: piece k1 = quad * 2 + is_ceil may sit in
+ * saturn_warp_slot(k1, 0) or saturn_warp_slot(k1, 1) (direct-mapped, quads
+ * 256 apart collided and one of them stayed unwarped: flicker). Master
+ * writes; the slave flat worker reads them uncached and stamps `used`. */
+#define SATURN_WARP_SLOTS 1024
+static inline int saturn_warp_slot(uint32_t k1, int way)
+{
+    return way ? (int)((k1 * 0x9E3779B1u) >> 22) : (int)(k1 & (SATURN_WARP_SLOTS - 1));
+}
+typedef struct {
+    uint32_t key;       /* (quad << 1 | is_ceil) + 1, 0 = empty */
+    uint16_t srca;      /* 0 = not resident */
+    uint16_t wh;        /* w << 8 | h */
+    uint16_t flat;      /* translated flat number */
+    uint8_t  lv;        /* resolution level */
+    uint8_t  pad;
+    uint16_t used;      /* saturn_warp_frame when last drawn / made */
+    uint16_t made;      /* saturn_warp_frame when (re)made */
+} saturn_warp_slot_t;
+extern saturn_warp_slot_t saturn_warp_tab[SATURN_WARP_SLOTS];
+void Saturn_Vdp1_WallLateCopy(int texnum);   /* master: optional wall copies made late */
+int  Saturn_Vdp1_WarpRoom(int bytes);        /* master: a warp texture of `bytes` fits now */
+extern volatile uint16_t  saturn_warp_frame;
+extern volatile uint8_t   saturn_warp_room;   /* VRAM left for warp textures this frame */
+/* Column strip width of a w-wide warp texture (w = 8 or a multiple of 16):
+ * each strip is its own sw x h texture, stored one after another. */
+static inline int saturn_warp_strip_w(int w)
+{
+    return (w <= 16) ? w : ((w & 31) ? 16 : 32);
+}
+void Saturn_Vdp1_WarpNewFrame(void);
 int  Saturn_Vdp1_FlatAvgColor(int flatnum);   /* raster-hole backing colour */
 void Saturn_Vdp1_PreloadFlat(int flatnum);
 void Saturn_Vdp1_ClearPages(void);
