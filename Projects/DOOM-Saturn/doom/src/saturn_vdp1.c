@@ -1238,6 +1238,48 @@ static int v1_evict(unsigned int target)
         }
     }
 
+    /* 2b. a texture's copies live or die together: protect every entry of
+     *    a tag that has one protected entry. A distant wall draws only its
+     *    half-width copy (srca_mono); evicting the unreferenced main copy
+     *    cleared tag->srca, so the next lookup re-uploaded BOTH copies -
+     *    every frame (E1M2 start, hardware E16/251: 30 KB/frame, ~26% of
+     *    the master in 5thPlanet). */
+    for (i = 0; i < n; i++)
+    {
+        const v1_tag_t *t;
+        int f;
+        if (v1_log_prot[i] != 1)
+            continue;
+        t = v1_log[i].tag;
+        for (f = 0; f < 3; f++)
+        {
+            unsigned short s = f == 0 ? t->srca : f == 1 ? t->srca_mono : t->srca_64;
+            unsigned int a;
+            int lo = 0, hi = n - 1;
+            if (s == 0 || s == V1_TAG_BAD)
+                continue;
+            a = (unsigned int)s << 3;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                unsigned int eo = (unsigned int)v1_log[mid].off32 << 5;
+                if (a < eo)
+                    hi = mid - 1;
+                else if (a >= eo + ((unsigned int)v1_log[mid].len32 << 5))
+                    lo = mid + 1;
+                else
+                {
+                    if (!v1_log_prot[mid] && v1_log[mid].tag == t)
+                    {
+                        v1_log_prot[mid] = 2;
+                        v1_log[mid].age  = v1_age;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /* 3. drop the oldest unprotected entries until enough is free and a
      *    hole fits the largest upload refused since the last eviction */
     {
@@ -1969,12 +2011,21 @@ void Saturn_Vdp1Wall_Reset(void)
 
     v1_tags_try_alloc();
     int v1_do_flush = v1_page_flush[0] || v1_log_full;
+    /* Low-water eviction that freed nothing is skipped until something is
+     * uploaded again (2026-11-16): with the arena near full and every
+     * entry in use, it rescanned both command tables in VDP1 VRAM (slow
+     * B-bus reads) every frame for nothing - ~5 ms/frame at E1M2 start.
+     * A refused upload (v1_want_evict) still always evicts. */
+    static unsigned int evict_idle_alloc = 0xFFFFFFFFu;
     if (!v1_do_flush && v1_frame_boundary
-        && (v1_want_evict || v1_free_total() < V1_EVICT_LOWWATER))
+        && (v1_want_evict
+            || (v1_free_total() < V1_EVICT_LOWWATER && saturn_v1_alloc_bytes != evict_idle_alloc)))
     {
+        unsigned int free_before = v1_free_total();
         v1_want_evict = 0;
         if (!v1_evict(V1_EVICT_TARGET))
             v1_do_flush = 1;    /* live list fragments the whole ring */
+        evict_idle_alloc = (v1_free_total() == free_before) ? saturn_v1_alloc_bytes : 0xFFFFFFFFu;
     }
     if (v1_do_flush)
     {
