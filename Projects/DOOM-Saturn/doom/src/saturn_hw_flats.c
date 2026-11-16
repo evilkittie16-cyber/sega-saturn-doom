@@ -6,9 +6,25 @@
  * Slave SH-2 Flat Quad Worker Pipeline
  * Offloads floor and ceiling quadrilateral transformation, clipping, and
  * projection to the Slave SH-2 CPU in parallel with Master seg rendering.
- * Located in Low Work RAM (0x00210000) for zero CPU-bus contention.
+ * IPC ring location (2026-11-15): HIGH Work RAM by default. It used to sit
+ * in Low Work RAM (0x00210000) "for zero CPU-bus contention", but both RAMs
+ * are on the same SH-2 bus, and Low WRAM is a 16-bit DRAM with 7 waits per
+ * transfer: every uncached 32-bit job word cost the master ~24 cycles, and
+ * HW_SubmitSlaveFlatJob averaged ~1300 cycles a call (~1 ms per heavy
+ * frame). The slave also reads each job in place, uncached.
+ * MEASURED (5thPlanet, E1M1 turning): submit 1317 -> 1163 cycles/call, heavy
+ * master 20.61 -> 20.44 ms - most of the call is I-cache misses, not the
+ * Low WRAM bus. Too small to justify the layout change unverified on
+ * hardware, so the default stays Low WRAM; -DHW_IPC_IN_WRAM_L=0 for HWRAM.
  * ========================================================================= */
+#ifndef HW_IPC_IN_WRAM_L
+#define HW_IPC_IN_WRAM_L 1
+#endif
+#if defined(SATURN_WIN32) || HW_IPC_IN_WRAM_L
 #define HW_SLAVE_BASE_UNCACHED   SATURN_WRAM_L_IPC_UNCACHED
+#else
+#define HW_SLAVE_BASE_UNCACHED   ((uintptr_t)&hw_slave_ipc_hwram | SATURN_WRAM_H_UNCACHED)
+#endif
 
 #define HW_JOB_WORDS_BEFORE_PAD (11 + HW_SOLID_WORDS)
 #define HW_JOB_PAD_WORDS (((HW_JOB_WORDS_BEFORE_PAD + 3) & ~3) - HW_JOB_WORDS_BEFORE_PAD)
@@ -83,6 +99,12 @@ typedef struct {
 _Static_assert(sizeof(hw_slave_ipc_t) <= 0x8000u, "hw_slave_ipc_t must fit below SATURN_WRAM_L_SLAVE_STACK_OFF");
 #elif defined(_MSC_VER)
 static_assert(sizeof(hw_slave_ipc_t) <= 0x8000u, "hw_slave_ipc_t must fit below SATURN_WRAM_L_SLAVE_STACK_OFF");
+#endif
+
+#if !defined(SATURN_WIN32) && !HW_IPC_IN_WRAM_L
+/* Accessed only through the uncached alias (HW_SLAVE_BASE_UNCACHED), so
+ * neither CPU's cache holds ring lines. 16-byte aligned for burst copies. */
+static hw_slave_ipc_t hw_slave_ipc_hwram __attribute__((aligned(16)));
 #endif
 
 /* HW_Slave_IsSpanOccluded defined below hw_flat_emit_ctx_t */
