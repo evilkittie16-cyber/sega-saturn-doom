@@ -609,6 +609,21 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     return coal_strips;
 }
 
+/* Wrap a strip's packed (SRCA << 16 | size) word back into the texture
+ * (2026-11-16 hang fix). The old test `cur >= base + wrap` overflows 32 bits
+ * when the texture sits high in VDP1 VRAM (SRCA >= ~0xF000 for wide
+ * textures): `base + wrap` wraps to a small value, the test is always true,
+ * and the `while` form spun forever (benchmark tour, E1M1; the fast paths'
+ * `if` form instead stepped to wrong texture columns). Comparing the
+ * offset from base cannot overflow. */
+#define HW_W2_WRAP(cur, base, wrap)                                     \
+    do {                                                                \
+        uint32_t w_ = (wrap);                                           \
+        if (w_ != 0u)                                                   \
+            while ((uint32_t)((cur) - (base)) >= w_)                    \
+                (cur) -= w_;                                            \
+    } while (0)
+
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
 {
@@ -663,7 +678,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
     uint32_t srca_v = (uint32_t)(srca + (ctx->cur_v << 1));
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
     uint32_t cmd_w2_step = (uint32_t)th << 17;
-    uint32_t cmd_w2_end  = cmd_w2_base + (uint32_t)num_strips * cmd_w2_step;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
 
     int cur_px_fp = 0, step_px_fp = 0;
@@ -813,8 +827,7 @@ next_strip_lin:
         s_ya0 = s_yb0;
         s_ya1 = s_yb1;
         cmd_w2_cur += cmd_w2_step;
-        while (cmd_w2_cur >= cmd_w2_end)
-            cmd_w2_cur -= (uint32_t)num_strips * cmd_w2_step;
+        HW_W2_WRAP(cmd_w2_cur, cmd_w2_base, (uint32_t)num_strips * cmd_w2_step);
     }
 
     unsigned int l_quads  = lin_flags >> 16;
@@ -873,7 +886,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
     uint32_t cmd_w2_step = (uint32_t)th << 17;
     uint32_t cmd_w2_wrap = (uint32_t)num_strips * cmd_w2_step;
-    uint32_t cmd_w2_end  = cmd_w2_base + cmd_w2_wrap;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
     uint32_t cmd_header1 = ctx->cmd_header1;
     uint32_t w_left_top  = ((uint32_t)s_px0 << 16) | (uint16_t)s_ya0;
@@ -905,7 +917,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
         w_left_top = w_right_top;
         w_left_bot = w_right_bot;
         cmd_w2_cur += cmd_w2_step;
-        if (__builtin_expect(cmd_w2_cur >= cmd_w2_end, 0))
+        if (__builtin_expect(cmd_w2_cur - cmd_w2_base >= cmd_w2_wrap, 0))   /* overflow-safe (see HW_W2_WRAP) */
             cmd_w2_cur -= cmd_w2_wrap;
     }
     else if (rem > 0)
@@ -951,7 +963,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
             w_left_top = w_right_top;
             w_left_bot = w_right_bot;
             cmd_w2_cur += cmd_w2_step;
-            if (__builtin_expect(cmd_w2_cur >= cmd_w2_end, 0))
+            if (__builtin_expect(cmd_w2_cur - cmd_w2_base >= cmd_w2_wrap, 0))   /* overflow-safe */
                 cmd_w2_cur -= cmd_w2_wrap;
         } while (--rem > 0);
     }
@@ -1044,7 +1056,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
     uint32_t srca_v = (uint32_t)(ctx->srca + (ctx->cur_v << 1));
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
     uint32_t cmd_w2_step = (uint32_t)th << 17;
-    uint32_t cmd_w2_end  = cmd_w2_base + (uint32_t)num_strips * cmd_w2_step;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
 
     int vcy_top   = HW_VIEW_CY - ctx->top_overlap;
@@ -1223,8 +1234,7 @@ next_strip_persp:
         if (cur_strip_idx >= num_strips)
             cur_strip_idx -= num_strips;
         cmd_w2_cur += cmd_w2_step;
-        while (cmd_w2_cur >= cmd_w2_end)
-            cmd_w2_cur -= (uint32_t)num_strips * cmd_w2_step;
+        HW_W2_WRAP(cmd_w2_cur, cmd_w2_base, (uint32_t)num_strips * cmd_w2_step);
     }
 
     unsigned int l_quads = persp_flags >> 16;
@@ -1293,7 +1303,6 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
     uint32_t cmd_w2_step = (uint32_t)th << 17;
     uint32_t cmd_w2_wrap = (uint32_t)num_strips * cmd_w2_step;
-    uint32_t cmd_w2_end  = cmd_w2_base + cmd_w2_wrap;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
     uint32_t cmd_header1 = ctx->cmd_header1;
     uint32_t w_left_top  = ((uint32_t)s_px0 << 16) | (uint16_t)s_ya0;
@@ -1354,7 +1363,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
             w_left_top = w_right_top;
             w_left_bot = w_right_bot;
             cmd_w2_cur += cmd_w2_step;
-            if (__builtin_expect(cmd_w2_cur >= cmd_w2_end, 0))
+            if (__builtin_expect(cmd_w2_cur - cmd_w2_base >= cmd_w2_wrap, 0))   /* overflow-safe */
                 cmd_w2_cur -= cmd_w2_wrap;
         } while (--rem > 0);
     }
