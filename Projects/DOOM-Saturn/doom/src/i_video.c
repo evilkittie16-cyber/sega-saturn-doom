@@ -759,6 +759,7 @@ static unsigned char hwsky_valid[2];       /* [0] page A, [1] page B */
 static unsigned int  hwsky_key[2];
 static unsigned char hwsky_lower[2];       /* lower-rows mode written */
 static unsigned char hwsky_back_on = 0;    /* the page about to flip uses it */
+static unsigned char hwsky_ever = 0;       /* a panorama was ever written (border window stays on) */
 
 static void hwsky_invalidate_all(void)
 {
@@ -782,6 +783,7 @@ static void hwsky_prepare(int page, unsigned char *dst)
     if (!hwsky_valid[page] || hwsky_key[page] != key)
     {
         Saturn_HW_SkyWritePanorama(dst, 0);
+        hwsky_ever = 1;
         hwsky_valid[page] = 1;
         hwsky_key[page]   = key;
         hwsky_lower[page] = lower;
@@ -4315,8 +4317,19 @@ void I_FinishUpdate(void)
             }
             else
             {
+                /* 2D frames: no line scroll, but KEEP window 0 on - the
+                 * panorama fills all 512 bitmap columns, so without it the
+                 * side borders show sky (pause menu). The borders are always
+                 * black, so the window never hides anything real. */
                 JO_VDP2_SCRCTL = (unsigned short)(JO_VDP2_SCRCTL & 0xFF00u);
-                JO_VDP2_WCTLA  = (unsigned short)(JO_VDP2_WCTLA & 0xFF00u);
+                if (hwsky_ever)
+                {
+                    *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
+                    *(volatile unsigned short *)0x25F800C2u = 0;
+                    *(volatile unsigned short *)0x25F800C4u = (unsigned short)((SATURN_BORDER_X + FB_W - 1) * 2);
+                    *(volatile unsigned short *)0x25F800C6u = (unsigned short)(SATURN_FB_LINES - 1);
+                    JO_VDP2_WCTLA = (unsigned short)((JO_VDP2_WCTLA & 0xFF00u) | 0x0003u);
+                }
             }
         }
         saturn_fb_front ^= 1;
