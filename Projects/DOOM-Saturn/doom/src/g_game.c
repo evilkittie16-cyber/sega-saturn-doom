@@ -164,8 +164,15 @@ void Saturn_G_InitNew(int skill, int episode, int map)
 #endif
 }
 
+#ifndef SATURN_BENCH
+#define SATURN_BENCH 0
+#endif
+
 void Saturn_G_Ticker(void)
 {
+#if SATURN_BENCH
+    return;     /* benchmark tour: frozen world (saturn_bench.c) */
+#endif
     /* r105 UI: pause + quit-to-title. d32xr's MARS P_CheckCheats only
      * handles cheats once ALREADY paused — the toggle itself is ours.
      * BT_PAUSE rides the Start button (i_system.c); edges come from
@@ -238,7 +245,30 @@ void Saturn_G_Display(void)
         return;
     }
     saturn_game_started = 1;
+#if SATURN_BENCH
+    {
+        extern int  Saturn_Bench_Done(void);
+        extern void Saturn_Bench_DrawSummary(void);
+        extern void Saturn_Bench_AfterRender(unsigned int render_ticks);
+        extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);
+        extern volatile unsigned int saturn_vbl_count;
+        unsigned int   vb0;
+        unsigned short tb0;
+        if (Saturn_Bench_Done())
+        {
+            Saturn_Bench_DrawSummary();
+            return;
+        }
+        do {
+            vb0 = saturn_vbl_count;
+            tb0 = SAT_FRT();
+        } while (saturn_vbl_count != vb0);
+        Saturn_HW_RenderPlayerView(0);
+        Saturn_Bench_AfterRender(Saturn_ProfSpan(tb0, vb0));
+    }
+#else
     Saturn_HW_RenderPlayerView(0);
+#endif
     {
         extern volatile unsigned int saturn_hw_prof_hud;
         extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);

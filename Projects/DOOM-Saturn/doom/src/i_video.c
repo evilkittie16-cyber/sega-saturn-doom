@@ -4319,10 +4319,11 @@ void I_FinishUpdate(void)
             {
                 /* 2D frames: no line scroll, but KEEP window 0 on - the
                  * panorama fills all 512 bitmap columns, so without it the
-                 * side borders show sky (pause menu). The borders are always
-                 * black, so the window never hides anything real. */
+                 * side borders show sky (pause menu, bench summary). The
+                 * borders are always black, so the window never hides
+                 * anything real. */
                 JO_VDP2_SCRCTL = (unsigned short)(JO_VDP2_SCRCTL & 0xFF00u);
-                if (hwsky_ever)
+                if (hwsky_valid[0] || hwsky_valid[1] || hwsky_ever)
                 {
                     *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
                     *(volatile unsigned short *)0x25F800C2u = 0;

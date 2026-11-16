@@ -41,6 +41,14 @@ int          saturn_hw_submax_num = -1;
 static unsigned int hw_submax_tot = 0, hw_submax_parts[5] = { 0, 0, 0, 0, 0 };
 static int          hw_submax_num = -1;
 
+/* Slowest-subsector latch (HUD row 2 "U n/total A F G P O"). It cost 5
+ * out-of-line Saturn_ProfSpan calls + timer reads per subsector (~150 per
+ * heavy frame) in EVERY build, so it is now on only in profiling builds or
+ * with -DHW_SUBMAX=1 (2026-11-16, walk rewrite stage A). Off: HUD shows U0. */
+#ifndef HW_SUBMAX
+#define HW_SUBMAX HW_PROF_SUBTIMERS
+#endif
+#if HW_SUBMAX
 #define HW_SUBPROF_MARK(slot)                                           \
     do {                                                                \
         unsigned int   v_ = saturn_vbl_count;                           \
@@ -48,11 +56,15 @@ static int          hw_submax_num = -1;
         sp_parts[slot] = Saturn_ProfSpan(sp_f, sp_v);                   \
         sp_f = f_; sp_v = v_;                                           \
     } while (0)
+#else
+#define HW_SUBPROF_MARK(slot) do { } while (0)
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
                                                          unsigned int *sp_parts);
 
 /* Walk a subsector (takes 2 register arguments: r4=subnum, r5=fully_inside) */
+#if HW_SUBMAX
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_inside)
 {
     unsigned int parts[5] = { 0, 0, 0, 0, 0 };
@@ -66,6 +78,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
             hw_submax_parts[i] = parts[i];
     }
 }
+#else
+#define HW_RenderSubsector(subnum, fully_inside) HW_RenderSubsector_Body((subnum), (fully_inside), NULL)
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
                                                          unsigned int *sp_parts)
@@ -77,8 +92,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     if ((unsigned)secnum >= HW_MAX_AP_SECTORS || saturn_visit_count >= CMDBUF_MAX_VISIT)
         return;
     hw_sec_fast_t *sf = &hw_sec_fast[secnum];
+#if HW_SUBMAX
     unsigned int   sp_v = saturn_vbl_count;
     unsigned short sp_f = SAT_FRT();
+#else
+    (void)sp_parts;
+#endif
 #if HW_PROF_SUBTIMERS
     unsigned short ts0 = SAT_FRT();
 #endif

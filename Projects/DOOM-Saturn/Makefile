@@ -71,6 +71,7 @@ SRCS = main.c \
        doom/src/saturn_menu.c \
        doom/src/saturn_inter.c \
        doom/src/saturn_demo.c \
+       doom/src/saturn_bench.c \
        doom/src/st_stub.c \
        doom/src/s_sound.c \
        doom/src/d32xr_stubs.c \
@@ -122,6 +123,9 @@ SATURN_PROF ?= 0
 ifeq ($(SATURN_PROF),1)
 CCFLAGS += -DHW_PROF_SUBTIMERS=1
 endif
+# Extra -D flags from the environment (profiling variants), e.g. "-DHW_SUBMAX=0".
+EXTRA_DEFS ?=
+CCFLAGS += $(EXTRA_DEFS)
 # JO_FS_MAX_FILES is 256 in Jo Engine v2026.1
 CCFLAGS += -fno-strict-aliasing
 

@@ -708,9 +708,12 @@ void D_DoomMain(void)
 #ifndef SATURN_AUTO_TOUR
 #define SATURN_AUTO_TOUR 0
 #endif
+#ifndef SATURN_BENCH
+#define SATURN_BENCH 0
+#endif
 #if !defined(SATURN_UI_MENU) || SATURN_UI_MENU != 0
         {
-            int skip_menu = SATURN_AUTO_TOUR;
+            int skip_menu = SATURN_AUTO_TOUR || SATURN_BENCH;
 #ifdef SATURN_WIN32
             extern int g_win32_test_mode;
             FILE *f_cmd = fopen("agent_cmd.txt", "r");
@@ -1102,6 +1105,13 @@ void D_DoomLoop(void)
         {
             extern int Saturn_AutoTour_Step(void);
             if (Saturn_AutoTour_Step())
+                continue;
+        }
+#endif
+#if SATURN_BENCH
+        {
+            extern int Saturn_Bench_Step(void);
+            if (Saturn_Bench_Step())
                 continue;
         }
 #endif

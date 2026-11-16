@@ -1399,10 +1399,27 @@ HW_ALWAYS_INLINE void HW_EmitWallStrips(hw_wall_emit_ctx_t *ctx)
     int s_min = u_start >> 4;
     int s_max = (u_end - 1) >> 4;
 
+    /* Walk rewrite stage B1 (2026-11-16): the _Linear / _Persp fast paths are
+     * specializations of the _General loops (same arithmetic, stricter gate)
+     * that add ~1.9 KB to the hot path. Default: General only, to test
+     * whether less code beats the faster special case.
+     * MEASURED (5thPlanet E1M1 turning, heavy views): master 20.52 -> 20.65
+     * ms, i.e. no gain - the General loop is slower per strip and that
+     * cancels the code saved. Fast paths stay on (default 1). */
+#ifndef HW_STRIP_FASTPATH
+#define HW_STRIP_FASTPATH 1
+#endif
+#if HW_STRIP_FASTPATH
     if (__builtin_expect(!ctx->persp_strips, 1))
         HW_EmitWallStrips_Linear(ctx, s_min, s_max);
     else
         HW_EmitWallStrips_Persp(ctx, s_min, s_max);
+#else
+    if (__builtin_expect(!ctx->persp_strips, 1))
+        HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+    else
+        HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+#endif
 }
 
 HW_ALWAYS_INLINE int HW_NeedPerspectiveStrips(int dx, int u_span, fixed_t cz0, fixed_t cz1, int tw)
@@ -3523,8 +3540,17 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fa
     if (cz_fmin > min_cz)
         min_cz = cz_fmin;
 #if HW_DBG_FLAT_LOD
-    int use_lod1 = ((true_min_cz >= (256 << FRACBITS) && max_cz >= (320 << FRACBITS)) ||
-                    (true_min_cz >= (176 << FRACBITS) && max_cz >= (448 << FRACBITS)))
+    /* LOD1 (128-unit flat cells) thresholds, camera-depth units; overridable
+     * for the 2026-11-16 E1M8 experiment (the slave transforms ~4000 LOD0
+     * flat vertices/frame in the arena). */
+#ifndef HW_LOD1_MIN_A
+#define HW_LOD1_MIN_A 256
+#define HW_LOD1_MAX_A 320
+#define HW_LOD1_MIN_B 176
+#define HW_LOD1_MAX_B 448
+#endif
+    int use_lod1 = ((true_min_cz >= (HW_LOD1_MIN_A << FRACBITS) && max_cz >= (HW_LOD1_MAX_A << FRACBITS)) ||
+                    (true_min_cz >= (HW_LOD1_MIN_B << FRACBITS) && max_cz >= (HW_LOD1_MAX_B << FRACBITS)))
                    ? (int)HW_FLAT_USE_LOD1 : 0;
 #else
     int use_lod1 = 0;

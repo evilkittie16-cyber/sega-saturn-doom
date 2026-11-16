@@ -777,6 +777,54 @@ static void v1m_end_write(void)
 }
 #endif
 
+/* Benchmark tour (saturn_bench.c, 2026-11-16): wait for the list committed
+ * last to be drawn and return VDP1's draw time in FRT ticks (0 = not
+ * available / timed out). It spins, so only the frozen-world benchmark
+ * calls it. Timing: the change requested at vblank N happens at the end of
+ * that vblank, when VDP1 starts the list; it sets EDSR.CEF when it fetches
+ * the END command. */
+volatile int          saturn_bench_vdp1_want  = 0;   /* set by saturn_bench.c */
+volatile unsigned int saturn_bench_vdp1_ticks = 0;
+
+unsigned int Saturn_Vdp1_BenchDrawTime(void)
+{
+#if SATURN_V1_MANUAL && !defined(SATURN_WIN32)
+    extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);
+    extern volatile unsigned int saturn_vbl_count;
+    volatile unsigned char *frt = (volatile unsigned char *)0xFFFFFE12u;
+    unsigned int guard = 4000000u;
+    unsigned int v0;
+    unsigned short f0;
+
+    if (!saturn_v1_manual)
+        return 0xFFFF0000u;
+    while ((v1m_pending || v1m_writing) && --guard)
+        ;                                       /* change not requested yet */
+    if (!guard)
+        return 0xFFFF0001u;
+    /* The frame change clears CEF (EDSR >>= 1) and starts the draw; until
+     * then CEF still holds the previous draw's 1. Start the clock when it
+     * drops. */
+    while ((V1_EDSR & 2u) && --guard)
+        ;
+    if (!guard)
+        return 0xFFFF0002u;
+    do {
+        v0 = saturn_vbl_count;
+        unsigned char hi = frt[0];
+        unsigned char lo = frt[1];
+        f0 = (unsigned short)((hi << 8) | lo);
+    } while (saturn_vbl_count != v0);
+    while (!(V1_EDSR & 2u) && --guard)
+        ;                                       /* CEF: END fetched */
+    if (!guard)
+        return 0xFFFF0003u;
+    return Saturn_ProfSpan(f0, v0);
+#else
+    return 0u;
+#endif
+}
+
 static void v1_vblank_callback(void)
 {
     /* QUAD-DRAW FORENSICS (2026-09-07): sample the command table the
@@ -2598,6 +2646,17 @@ void Saturn_Vdp1Wall_Frame(void)
         {
             v1m_blank_shown = 0;
             v1m_end_write();        /* the vblank callback requests the change */
+            {
+                /* Benchmark tour: time this list's VDP1 draw right after
+                 * the commit (later, the draw may already be over). */
+                extern volatile int          saturn_bench_vdp1_want;
+                extern volatile unsigned int saturn_bench_vdp1_ticks;
+                if (saturn_bench_vdp1_want)
+                {
+                    saturn_bench_vdp1_ticks = Saturn_Vdp1_BenchDrawTime();
+                    saturn_bench_vdp1_want = 0;
+                }
+            }
         }
 #endif
 #endif
