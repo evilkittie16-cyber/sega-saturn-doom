@@ -624,8 +624,26 @@ static void v1_patch_slot3_ex(int from_vblank)
  * vblank it poisoned CRAM entries 120..123 with 0x5555 pink
  * (170,82,170), and those are exactly the nukage/computer-panel
  * texel indices, so all dark mid-range surfaces speckled pink. */
+/* 2D screens (pause, menus, intermission): sprite layer at priority 0 =
+ * not displayed (2026-11-16). Clearing it with blank VDP1 lists depends on
+ * the manual frame-change handshake, and on hardware the last 3D frame
+ * still sometimes stayed over the pause menu. Set by Saturn_Vdp1_Enter2D,
+ * cleared by the next 3D commit. */
+static volatile int v1_hide_sprites = 0;
+
 static void v1_write_priority_regs(void)
 {
+    if (v1_hide_sprites)
+    {
+        *(volatile unsigned short *)0x25F800E0u = 0x0020u;
+        *(volatile unsigned short *)0x25F800F0u = 0x0000u;
+        *(volatile unsigned short *)0x25F800F2u = 0x0000u;
+        *(volatile unsigned short *)0x25F800F4u = 0x0000u;
+        *(volatile unsigned short *)0x25F800F6u = 0x0000u;
+        *(volatile unsigned short *)0x25F800F8u = 0x0603u;
+        *(volatile unsigned short *)0x25F800FCu = 0x0004u;
+        return;
+    }
     /* Jo's own proven value (core.c:278 writes 0x506 once at init):
      * priority 5 in the fields that matter, layering identical to what
      * the game has always displayed (these vblank writes never reached
@@ -2647,6 +2665,7 @@ void Saturn_Vdp1Wall_Frame(void)
          * flip the CPU to the other page */
         v1_page_committed = 1;
         v1_have_frame = 1;
+        v1_hide_sprites = 0;
         v1_patch_slot3();
         v1_write_priority_regs();
 #if SATURN_V1_MANUAL
@@ -2758,6 +2777,8 @@ void Saturn_Vdp1_Enter2D(void)
     saturn_game_started = 0;
     saturn_vdp2_plane_active = 0;
     saturn_v1w_spr = 0;
+    v1_hide_sprites = 1;
+    v1_write_priority_regs();
     v1q_count = 0;
     saturn_cmd_m_count = 0;
     saturn_cmd_s_count = 0;
