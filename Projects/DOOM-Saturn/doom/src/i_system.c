@@ -520,8 +520,10 @@ int I_ReadControls(void)
 
     if (players && consoleplayer >= 0 && consoleplayer < MAXPLAYERS)
     {
+        extern unsigned int saturn_controls_seq;
         players[consoleplayer].oldticbuttons = players[consoleplayer].ticbuttons;
         players[consoleplayer].ticbuttons    = buttons;
+        saturn_controls_seq++;      /* Saturn_G_Ticker: edges once per read */
     }
     return buttons;
 }

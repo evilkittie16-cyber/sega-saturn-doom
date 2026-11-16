@@ -168,6 +168,12 @@ void Saturn_G_InitNew(int skill, int episode, int map)
 #define SATURN_BENCH 0
 #endif
 
+/* Bumped by I_ReadControls (i_system.c) on every pad read. The pad is read
+ * once per frame but the game may run 2+ tics per frame; the pause toggle
+ * uses it to see each press once. (Defined here: the Windows harness
+ * compiles g_game.c but not i_system.c.) */
+unsigned int saturn_controls_seq = 0;
+
 void Saturn_G_Ticker(void)
 {
 #if SATURN_BENCH
@@ -183,7 +189,15 @@ void Saturn_G_Ticker(void)
         extern void Saturn_Pause_Init(void);
         extern void Saturn_Pause_Tick(int edges);
         player_t *p = &players[consoleplayer];
-        int       edges = p->ticbuttons & ~p->oldticbuttons;
+        /* Edges once per pad read (2026-11-16): the pad is read once per
+         * frame, but at 30 FPS two tics run per frame and both saw the same
+         * Start edge - the first paused, the second (Saturn_Pause_Tick, Start
+         * = select on "Resume") unpaused at once: "the pause menu sometimes
+         * doesn't appear". */
+        static unsigned int pause_last_seq = 0xFFFFFFFFu;
+        int       edges = (saturn_controls_seq != pause_last_seq)
+                          ? (p->ticbuttons & ~p->oldticbuttons) : 0;
+        pause_last_seq = saturn_controls_seq;
 
         if (!gamepaused)
         {
