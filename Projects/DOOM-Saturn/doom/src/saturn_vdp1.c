@@ -2613,12 +2613,19 @@ void Saturn_Vdp1Wall_Frame(void)
             /* No 3D this frame (automap, intermission, ...): manual mode has
              * no automatic erase, so draw one blank list to clear the last
              * 3D frame off the sprite layer, once. */
-            if (!v1m_blank_shown)
+            /* TWICE (2026-11-16): VDP1 draws a list into the BACK buffer,
+             * which becomes visible only at the NEXT frame change. One blank
+             * list was drawn but never shown, so the last 3D frame stayed on
+             * the sprite layer over the pause menu and the intermission
+             * (hardware: menu invisible, level end looked stuck). The second
+             * blank's change brings the first one to the front. Each waits
+             * for the previous change (pending is cleared by the vblank). */
+            if (v1m_blank_shown < 2 && !v1m_pending)
             {
                 extern void Saturn_CmdBuf_DeliverBlank(void);
                 v1m_begin_write();
                 Saturn_CmdBuf_DeliverBlank();
-                v1m_blank_shown = 1;
+                v1m_blank_shown++;
                 v1m_end_write();
             }
         }

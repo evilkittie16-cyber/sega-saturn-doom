@@ -563,6 +563,21 @@ void Saturn_HUD_Draw(void)
     if (!stbar_dirty && face_dirty && !hud_stbar_linear)
         stbar_dirty = 1;
 
+    /* New level (2026-11-16): the intermission drew over I_VideoBuffer's
+     * status-bar rows, but none of the cached stats changed, so only the
+     * face/numbers were repainted and the WIMAP picture stayed visible
+     * behind them (hardware photo, E1M2 start). Redraw the whole bar once
+     * per level load. */
+    {
+        extern volatile unsigned int saturn_load_count;
+        static unsigned int hud_last_load = 0xFFFFFFFFu;
+        if (saturn_load_count != hud_last_load)
+        {
+            hud_last_load = saturn_load_count;
+            stbar_dirty = 1;
+        }
+    }
+
     if (stbar_dirty)
     {
         saturn_stbar_dirty_latch = 2;

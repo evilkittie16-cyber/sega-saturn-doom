@@ -511,10 +511,12 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
 /* ---- Interactive In-Game Pause Menu ---- */
 static int pause_cursor = 0;
 static int pause_warp_map = 1;
+static int pause_bg_drawn = 0;   /* TITLEPIC background already in I_VideoBuffer */
 
 void Saturn_Pause_Init(void)
 {
     pause_cursor = 0;
+    pause_bg_drawn = 0;
     if (saturn_map >= 1 && saturn_map <= 9)
         pause_warp_map = saturn_map;
     S_StartSound(0, sfx_swtchn);
@@ -619,12 +621,20 @@ void Saturn_Pause_Draw(void)
 
     Saturn_Vdp1_Enter2D();
 
-    /* Draw background over the 3D viewport rows (0..167) while keeping the status bar (168..223) */
-    Saturn_ClearRect(0, 0, DOOM_SCREENWIDTH, 168, 0);
-    if (!s_title_patch)
-        s_title_patch = Saturn_CachePatchBig("TITLEPIC");
-    if (s_title_patch)
-        Saturn_DrawPatch(0, 0, s_title_patch, 0, 168);
+    /* Draw background over the 3D viewport rows (0..167) while keeping the
+     * status bar (168..223). Only once per pause (2026-11-16): redrawing the
+     * full TITLEPIC + clear every frame cost ~100 ms/frame on the SH-2
+     * (pause ran at ~6 FPS); I_VideoBuffer keeps it, and only the menu box
+     * below changes. */
+    if (!pause_bg_drawn)
+    {
+        Saturn_ClearRect(0, 0, DOOM_SCREENWIDTH, 168, 0);
+        if (!s_title_patch)
+            s_title_patch = Saturn_CachePatchBig("TITLEPIC");
+        if (s_title_patch)
+            Saturn_DrawPatch(0, 0, s_title_patch, 0, 168);
+        pause_bg_drawn = 1;
+    }
     Saturn_ClearRect(44, 6, 232, 156, 0);
 
     draw_centered(12, p);
