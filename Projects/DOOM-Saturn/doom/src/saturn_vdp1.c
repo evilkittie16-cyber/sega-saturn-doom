@@ -827,6 +827,14 @@ unsigned int Saturn_Vdp1_BenchDrawTime(void)
 
 static void v1_vblank_callback(void)
 {
+#ifndef SATURN_WIN32
+    {
+        /* latch pad presses every field (i_system.c): a press shorter
+         * than a slow frame is otherwise never sampled */
+        extern void Saturn_PadVblankSample(void);
+        Saturn_PadVblankSample();
+    }
+#endif
     /* QUAD-DRAW FORENSICS (2026-09-07): sample the command table the
      * moment our callback runs, BEFORE re-patching. SGL's slot-3 word:
      *   0x8000 = SGL's END rebuild already ran (rebuild is AFTER this

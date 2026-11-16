@@ -1641,10 +1641,10 @@ int I_ReadControls(void)
 
     if (players && consoleplayer >= 0 && consoleplayer < MAXPLAYERS)
     {
-        extern unsigned int saturn_controls_seq;   /* g_game.c: pause edges once per read */
+        extern unsigned int saturn_pad_edges;   /* g_game.c: latched presses for the pause menu */
+        saturn_pad_edges |= (unsigned int)buttons & ~(unsigned int)players[consoleplayer].ticbuttons;
         players[consoleplayer].oldticbuttons = players[consoleplayer].ticbuttons;
         players[consoleplayer].ticbuttons = buttons;
-        saturn_controls_seq++;
     }
 
     return buttons;

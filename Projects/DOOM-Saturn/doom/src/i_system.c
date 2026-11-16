@@ -394,6 +394,43 @@ byte *I_AllocHigh(int length)
     return (byte *)jo_malloc(length);
 }
 
+/* Pad presses latched at every vblank (2026-11-16). I_ReadControls only runs
+ * inside the tic loop, and on a slow frame the owed tics run in one burst at
+ * the end, so a press shorter than the frame was never sampled: "the pause
+ * menu works intermittently" (pause frames are slow; standing vs moving
+ * changes the frame time). Called from the VDP1 vblank callback. */
+static volatile unsigned short saturn_pad_rise = 0;   /* jo key bits pressed since last read */
+
+void Saturn_PadVblankSample(void)
+{
+    static unsigned short prev_held = 0;
+    unsigned short raw = 0xFFFF;
+    if (jo_inputs[0].id != 0xFF && jo_inputs[0].id != 0 && jo_inputs[0].data != 0)
+        raw = jo_inputs[0].data;
+    unsigned short held = (unsigned short)~raw;
+    saturn_pad_rise |= (unsigned short)(held & ~prev_held);
+    prev_held = held;
+}
+
+static int saturn_keys_to_bt(unsigned short k)
+{
+    int b = 0;
+    if (k & JO_KEY_RIGHT) b |= BT_MOVERIGHT;
+    if (k & JO_KEY_LEFT)  b |= BT_MOVELEFT;
+    if (k & JO_KEY_UP)    b |= BT_MOVEUP;
+    if (k & JO_KEY_DOWN)  b |= BT_MOVEDOWN;
+    if (k & JO_KEY_A)     b |= BT_ATTACK;
+    if (k & JO_KEY_B)     b |= BT_USE;
+    if (k & JO_KEY_C)     b |= BT_SPEED;
+    if (k & JO_KEY_START) b |= BT_START | BT_PAUSE;
+    if (k & JO_KEY_L)     b |= BT_STRAFELEFT;
+    if (k & JO_KEY_R)     b |= BT_STRAFERIGHT;
+    if (k & JO_KEY_X)     b |= BT_PWEAPN;
+    if (k & JO_KEY_Y)     b |= BT_NWEAPN;
+    if (k & JO_KEY_Z)     b |= BT_AUTOMAP;
+    return b;
+}
+
 int I_ReadControls(void)
 {
     unsigned short raw_data = 0xFFFF;
@@ -520,10 +557,16 @@ int I_ReadControls(void)
 
     if (players && consoleplayer >= 0 && consoleplayer < MAXPLAYERS)
     {
-        extern unsigned int saturn_controls_seq;
+        extern unsigned int saturn_pad_edges;
+        /* presses latched per vblank (Saturn_PadVblankSample) ONLY - also
+         * taking this read's own edge would count a press twice when the read
+         * sees it before the next vblank sample does. Saturn_G_Ticker consumes
+         * them once. */
+        unsigned short rise = saturn_pad_rise;
+        saturn_pad_rise = (unsigned short)(saturn_pad_rise & ~rise);
+        saturn_pad_edges |= (unsigned int)saturn_keys_to_bt(rise);
         players[consoleplayer].oldticbuttons = players[consoleplayer].ticbuttons;
         players[consoleplayer].ticbuttons    = buttons;
-        saturn_controls_seq++;      /* Saturn_G_Ticker: edges once per read */
     }
     return buttons;
 }
