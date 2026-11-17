@@ -130,7 +130,13 @@ extern uint8_t *saturn_wram_l_geom_end;             /* end of flats+walls this l
  * (i_wad.c, 0x002F0000). Keeps the queue out of the full High WRAM BSS. */
 #define SATURN_WRAM_L_DEFER_OFF     0x000E4000u
 #define SATURN_WRAM_L_DEFER_ADDR    (SATURN_WRAM_L_BASE + SATURN_WRAM_L_DEFER_OFF)
-#define SATURN_WRAM_L_DEFER_SIZE    0x0000C000u
+#define SATURN_WRAM_L_DEFER_SIZE    0x0000B800u
+
+/* 0x002EF800 - 0x002EFFFF: v1_evict candidate list (master only, 2 KB;
+ * High WRAM BSS is within ~0.5 KB of its 0x060C0000 ceiling). */
+#define SATURN_WRAM_L_EVICT_OFF     0x000EF800u
+#define SATURN_WRAM_L_EVICT_ADDR    ((void *)(SATURN_WRAM_L_BASE + SATURN_WRAM_L_EVICT_OFF))
+#define SATURN_WRAM_L_EVICT_SIZE    0x00000800u
 
 /* --- 3. Hardware Register & Video Domains (B-Bus) --- */
 #ifndef SATURN_WIN32

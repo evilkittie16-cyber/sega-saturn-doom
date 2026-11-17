@@ -115,6 +115,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
         return;
     }
     HW_VS(7);
+#if HW_VIS_STATS
+    hw_vis_ssmap[subnum >> 3] |= (uint8_t)(1u << (subnum & 7));
+#endif
 
     if (sf->is_sky)
     {
@@ -728,6 +731,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     } while (__builtin_expect(saturn_vbl_count != vb0, 0));
 #if HW_VIS_STATS
     HW_VS(0);
+    for (int s = 0; s < (int)sizeof(hw_vis_ssmap); s++)
+        hw_vis_ssmap[s] = 0;
     {
         unsigned int n = 0;
         for (int s = 0; s < numsubsectors; s++)

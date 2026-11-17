@@ -209,6 +209,29 @@ static void bench_place_camera(int view)
         mo->angle += (angle_t)(bench_turn_n++ * (unsigned int)(BENCH_HOLD_TURN) * (ANG90 / 90u));
     }
 #endif
+#if BENCH_HOLD && defined(BENCH_HOLD_WALK)
+    {
+        /* walking hold: BENCH_HOLD_WALK units further along the view angle at
+         * every placement, looping back to the start after BENCH_HOLD_WALKN */
+#ifndef BENCH_HOLD_WALKN
+#define BENCH_HOLD_WALKN 32
+#endif
+        static unsigned int bench_walk_n = 0;
+        fixed_t d = (fixed_t)((bench_walk_n++ % (BENCH_HOLD_WALKN)) * (BENCH_HOLD_WALK)) << FRACBITS;
+        unsigned int fa = mo->angle >> ANGLETOFINESHIFT;
+        P_UnsetThingPosition(mo);
+        mo->x += FixedMul(d, finecosine(fa));
+        mo->y += FixedMul(d, finesine(fa));
+        P_SetThingPosition(mo);
+        if (mo->subsector)
+        {
+            sector_t *sec = SSEC_SECTOR(mo->subsector);
+            mo->floorz = sec->floorheight;
+            mo->ceilingz = sec->ceilingheight;
+            mo->z = mo->floorz;
+        }
+    }
+#endif
     mo->momx = mo->momy = mo->momz = 0;
     players[0].viewz = mo->z + VIEWHEIGHT;
     players[0].viewheight = VIEWHEIGHT;
@@ -336,8 +359,8 @@ int Saturn_Bench_Step(void)
         bench_measured = 0;
         bench_frame = 0;
 #if BENCH_HOLD
-#ifdef BENCH_HOLD_TURN
-        bench_place_camera(0);  /* turning hold: next angle step */
+#if defined(BENCH_HOLD_TURN) || defined(BENCH_HOLD_WALK)
+        bench_place_camera(0);  /* turning / walking hold: next step */
 #endif
         return 0;               /* stay on the held view */
 #endif

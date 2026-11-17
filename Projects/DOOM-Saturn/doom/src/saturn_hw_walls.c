@@ -2277,6 +2277,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
 
     if (__builtin_expect(ctx->was_near_clipped, 0))
     {
+        HW_VS(12);
         HW_EmitSubdividedBakedSeg(ctx, (dx >= 24 && saturn_wall_subdivision));
 #if HW_PROF_SUBTIMERS
         hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
@@ -2320,6 +2321,8 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
             ((unsigned int)(u_start ^ (u_start + u_span - 1)) > 15u) &&
             HW_NeedPerspectiveStrips(dx, u_span, p0->cz, p1->cz, tw))
         {
+            HW_VS(13);
+            if (p0->cz >= (512 << FRACBITS) && p1->cz >= (512 << FRACBITS)) HW_VS(17);
             HW_EmitSubdividedBakedSeg(ctx, 1);
 #if HW_PROF_SUBTIMERS
             hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
@@ -2366,6 +2369,30 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         }
     }
 
+#if HW_VIS_STATS
+    /* wall-path census: [14] linear strips [15] mono [16] linear, min cz >= 512
+     * [18] linear, min cz >= 256 [19] sum dx of linear >= 512 [20] linear >= 512
+     * with u range inside one 64-texel period [21] ... inside one 32 period
+     * [22] linear >= 512 with tw >= 128 [23] linear >= 512 with tw == 64 */
+    if (!mono_tw)
+    {
+        fixed_t czmin = (p0->cz < p1->cz) ? p0->cz : p1->cz;
+        int u_end = u_start + u_span - 1;
+        HW_VS(14);
+        if (czmin >= (256 << FRACBITS)) HW_VS(18);
+        if (czmin >= (512 << FRACBITS))
+        {
+            HW_VS(16);
+            hw_vis_stats[19] += (uint32_t)dx;
+            if ((u_start >> 6) == (u_end >> 6)) HW_VS(20);
+            if ((u_start >> 5) == (u_end >> 5)) HW_VS(21);
+            if (tw >= 128) HW_VS(22);
+            else if (tw == 64) HW_VS(23);
+        }
+    }
+    else
+        HW_VS(15);
+#endif
     if (!mono_tw)
         HW_EmitSubdividedBakedSeg(ctx, 0);
     else

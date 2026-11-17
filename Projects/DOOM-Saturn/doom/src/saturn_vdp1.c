@@ -255,6 +255,9 @@ static int             v1_page_flush[2] = { 1, 1 };
 #endif
 #define V1_OPT_RESERVE    (32u * 1024u)   /* headroom kept when adding optional wall copies */
 #define V1_LOG_MAX        1024
+#if defined(__GNUC__) && !defined(__cplusplus)
+_Static_assert(V1_LOG_MAX * 2 <= SATURN_WRAM_L_EVICT_SIZE, "v1_evict candidate list must fit SATURN_WRAM_L_EVICT");
+#endif
 typedef struct {
     unsigned short off32;   /* VRAM byte offset / 32 */
     unsigned short len32;   /* rounded length / 32 */
@@ -1330,55 +1333,101 @@ static int v1_evict(unsigned int target)
 
     /* 3. drop the oldest unprotected entries until enough is free and a
      *    hole fits the largest upload refused since the last eviction */
+    /* Textures uploaded in the last two frames but not (yet) in a command -
+     * e.g. flat variant pyramids the master requests for every nearby
+     * floor, which the slave only sometimes uses - are needed again next
+     * frame. Evicting them for the free-space target alone re-uploaded
+     * ~65 KB every frame at E1M2 (0,160): the uploads ate exactly the space
+     * the eviction freed, a self-sustaining thrash (56 ms/frame). Only a
+     * refused upload (need > 0) may take them (pass 1).
+     *
+     * One pass per class (2026-11-17): candidates are collected once,
+     * sorted oldest first and dropped in that order (marked 3), then the
+     * log is compacted once. The old loop rescanned the whole log (with an
+     * uncached warp-slot read per entry) and shifted it down for every
+     * victim - ~8 ms per eviction with ~700 entries (E1M1 courtyard walk). */
     {
+        unsigned short *cand = (unsigned short *)SATURN_WRAM_L_EVICT_ADDR;   /* V1_LOG_MAX entries */
         const unsigned int need = (v1_want_bytes + 31u) & ~31u;
-        for (;;)
+        int pass, k, nc, gap;
+        for (pass = 0; pass < 2; pass++)
         {
-            int pos, victim = -1;
-            unsigned int best = 0xFFFFFFFFu;
-            if (v1_free_total() >= target && (need == 0 || v1_find_gap(need, &pos)))
+            if (pass == 1 && need == 0)
                 break;
-            /* Textures uploaded in the last two frames but not (yet) in a
-             * command - e.g. flat variant pyramids the master requests for
-             * every nearby floor, which the slave only sometimes uses - are
-             * needed again next frame. Evicting them for the free-space
-             * target alone re-uploaded ~65 KB every frame at E1M2 (0,160):
-             * the uploads ate exactly the space the eviction freed, a
-             * self-sustaining thrash (56 ms/frame). Only a refused upload
-             * (need > 0) may take them. */
+            nc = 0;
             for (i = 0; i < n; i++)
             {
-                if (!v1_log_prot[i] && v1_log[i].age < v1_age_mark_prev && v1_log[i].age < best &&
-                    !v1_warp_recent(v1_log[i].tag))
+                if (v1_log_prot[i])
+                    continue;
+                if (pass == 0 && (v1_log[i].age >= v1_age_mark_prev || v1_warp_recent(v1_log[i].tag)))
+                    continue;
+                cand[nc++] = (unsigned short)i;
+            }
+            /* shell sort by age, ties by index (= the old first-found order) */
+            for (gap = nc >> 1; gap > 0; gap >>= 1)
+            {
+                for (k = gap; k < nc; k++)
                 {
-                    best = v1_log[i].age;
-                    victim = i;
+                    unsigned short c = cand[k];
+                    unsigned int   ca = v1_log[c].age;
+                    int j = k;
+                    while (j >= gap && (v1_log[cand[j - gap]].age > ca ||
+                                        (v1_log[cand[j - gap]].age == ca && cand[j - gap] > c)))
+                    {
+                        cand[j] = cand[j - gap];
+                        j -= gap;
+                    }
+                    cand[j] = c;
                 }
             }
-            if (victim < 0 && need != 0)
+            for (k = 0; k < nc; k++)
             {
-                for (i = 0; i < n; i++)
+                int v = cand[k];
+                if (v1_free_total() >= target)
                 {
-                    if (!v1_log_prot[i] && v1_log[i].age < best)
+                    if (need == 0)
+                        break;
+                    /* first-fit hole for the refused upload, skipping
+                     * entries already dropped (marked 3) */
                     {
-                        best = v1_log[i].age;
-                        victim = i;
+                        unsigned int prev_end = v1_page_base[0];
+                        int fits = 0;
+                        for (i = 0; i < n && !fits; i++)
+                        {
+                            unsigned int eo, ee;
+                            if (v1_log_prot[i] == 3)
+                                continue;
+                            eo = (unsigned int)v1_log[i].off32 << 5;
+                            ee = eo + ((unsigned int)v1_log[i].len32 << 5);
+                            if (eo >= prev_end && eo - prev_end >= need)
+                                fits = 1;
+                            if (ee > prev_end)
+                                prev_end = ee;
+                        }
+                        if (fits || prev_end + need <= V1_PAGE0_END)
+                            break;
                     }
                 }
+                v1_entry_drop(&v1_log[v]);
+                saturn_v1_evicted_bytes += (unsigned int)v1_log[v].len32 << 5;
+                v1_used_bytes -= (unsigned int)v1_log[v].len32 << 5;
+                v1_log_prot[v] = 3;
             }
-            if (victim < 0)
-                break;
-            v1_entry_drop(&v1_log[victim]);
-            saturn_v1_evicted_bytes += (unsigned int)v1_log[victim].len32 << 5;
-            v1_used_bytes -= (unsigned int)v1_log[victim].len32 << 5;
-            for (i = victim; i + 1 < n; i++)
-            {
-                v1_log[i] = v1_log[i + 1];
-                v1_log_prot[i] = v1_log_prot[i + 1];
-            }
-            n--;
-            v1_log_n = n;
+            if (k < nc)
+                break;          /* target reached inside this pass */
         }
+        /* compact: drop the marked entries, keep offset order */
+        k = 0;
+        for (i = 0; i < n; i++)
+        {
+            if (v1_log_prot[i] == 3)
+                continue;
+            v1_log[k] = v1_log[i];
+            v1_log_prot[k] = v1_log_prot[i];
+            k++;
+        }
+        n = k;
+        v1_log_n = n;
     }
     v1_want_bytes = 0;
     Saturn_Vdp1_ClearTexCacheMRU();
@@ -2117,15 +2166,32 @@ void Saturn_Vdp1Wall_Reset(void)
      * B-bus reads) every frame for nothing - ~5 ms/frame at E1M2 start.
      * A refused upload (v1_want_evict) still always evicts. */
     static unsigned int evict_idle_alloc = 0xFFFFFFFFu;
+    /* An unproductive low-water eviction (freed < V1_EVICT_MIN_GAIN) also
+     * waits V1_EVICT_BACKOFF frames (2026-11-17): walking through the E1M1
+     * courtyard kept the arena below low water with everything used in the
+     * last two frames, so it re-scanned both command tables in VDP1 VRAM
+     * (~1200 B-bus reads + a search each) almost every frame to free a few
+     * KB - ~2.7 ms/frame of master time while moving. */
+#ifndef V1_EVICT_BACKOFF
+#define V1_EVICT_BACKOFF  8u
+#endif
+#define V1_EVICT_MIN_GAIN (8u * 1024u)
+    static unsigned int evict_backoff = 0;
+    if (v1_frame_boundary && evict_backoff)
+        evict_backoff--;
     if (!v1_do_flush && v1_frame_boundary
         && (v1_want_evict
-            || (v1_free_total() < V1_EVICT_LOWWATER && saturn_v1_alloc_bytes != evict_idle_alloc)))
+            || (v1_free_total() < V1_EVICT_LOWWATER && saturn_v1_alloc_bytes != evict_idle_alloc
+                && !evict_backoff)))
     {
         unsigned int free_before = v1_free_total();
+        int refused = v1_want_evict;
         v1_want_evict = 0;
         if (!v1_evict(V1_EVICT_TARGET))
             v1_do_flush = 1;    /* live list fragments the whole ring */
         evict_idle_alloc = (v1_free_total() == free_before) ? saturn_v1_alloc_bytes : 0xFFFFFFFFu;
+        if (!refused && v1_free_total() < free_before + V1_EVICT_MIN_GAIN)
+            evict_backoff = V1_EVICT_BACKOFF;
     }
     if (v1_do_flush)
     {
@@ -2439,7 +2505,14 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     src = Saturn_FlatData(flatnum);
     if (!src)
         return 0;
-    off = v1_arena_alloc_soft(5440, 32768u, tag);
+    /* Above low water like the warp textures and late wall copies
+     * (2026-11-17): with a 32 KB reserve these optional variants kept the
+     * arena below V1_EVICT_LOWWATER, so eviction ran every few frames and
+     * refused wall uploads while walking through the E1M1 courtyard. */
+#ifndef V1_FLAT_VAR_RESERVE
+#define V1_FLAT_VAR_RESERVE (V1_EVICT_LOWWATER + 8u * 1024u)
+#endif
+    off = v1_arena_alloc_soft(5440, V1_FLAT_VAR_RESERVE, tag);
     if (off == 0)
         return 0;
     {

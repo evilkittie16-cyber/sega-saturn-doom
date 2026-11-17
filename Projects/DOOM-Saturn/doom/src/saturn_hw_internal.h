@@ -149,7 +149,8 @@ HW_NOINLINE void _hw_purge_cache(void)
 #define HW_VIS_STATS 0
 #endif
 #if HW_VIS_STATS
-volatile uint32_t hw_vis_stats[12];
+volatile uint32_t hw_vis_stats[24];
+volatile uint8_t  hw_vis_ssmap[128];   /* bitmap: subsectors rendered last frame */
 #define HW_VS(i) (hw_vis_stats[i]++)
 #else
 #define HW_VS(i) ((void)0)
