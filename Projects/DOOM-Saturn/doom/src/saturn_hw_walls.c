@@ -1,4 +1,4 @@
-/* saturn_hw_walls.c — 2D Map-Space AABB Frustum & 1D Solid-Span Culling,
+﻿/* saturn_hw_walls.c â€” 2D Map-Space AABB Frustum & 1D Solid-Span Culling,
  * Subsector Pillar Pair Projection, Near-Plane Seg Clipper, 1D Vertical Strip
  * & Monolithic VDP1 Wall Quad Emitters, and Subsector Flat Aperture Evaluator.
  */
@@ -424,8 +424,10 @@ typedef struct {
     int      count;
 } hw_solid_snap_t;
 
-#if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
-/* Low WRAM (saturn_memmap.h): the High WRAM BSS has no room for ~37 KB */
+#if HW_DEFER_WALLS && !defined(SATURN_WIN32)
+/* Low WRAM (saturn_memmap.h): the High WRAM BSS has no room for ~37 KB
+ * (2026-11-17: also without HW_SLAVE_WALLS - the BSS copy overran the
+ * 0x060C0000 ceiling by 38 KB) */
 #define HW_DEFER_REC_BYTES  ((uint32_t)sizeof(hw_wall_rec_t) * HW_DEFER_REC_CAP)
 #define HW_DEFER_SUB_BYTES  ((uint32_t)sizeof(hw_wall_sub_t) * HW_DEFER_SUB_CAP)
 #define HW_DEFER_SNAP_BYTES ((uint32_t)sizeof(hw_solid_snap_t) * HW_DEFER_SNAP_CAP)
@@ -677,6 +679,16 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
     int wall_slow     = (!band_all_vis) | has_occl | wall_needs_clamp;
     int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
 
+#if HW_VIS_STATS
+    /* [34] linear-general walls [35] can_coal [36] wall_slow [37] partial
+     * first [38] partial last [39] none of these (simple fast wall) */
+    HW_VS(34);
+    if (can_coal) HW_VS(35);
+    if (wall_slow) HW_VS(36);
+    if (partial_first) HW_VS(37);
+    if (partial_last) HW_VS(38);
+    if (!can_coal && !wall_slow && !partial_first && !partial_last && ctx->last_clip_x0 == -1) HW_VS(39);
+#endif
     uint32_t lin_flags = (uint32_t)can_coal |
                          ((uint32_t)first_slow << 1) |
                          ((uint32_t)band_all_vis << 2) |
@@ -1954,6 +1966,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
 #if HW_AP_1D
     return;     /* D32XR-style walk: solid columns only, no vertical aperture */
 #endif
+    HW_ORACLE_SKIP();
     if (ctx->seg_sx >= ctx->seg_ex || (unsigned)bsec_idx >= HW_MAX_AP_SECTORS)
         return;
 
@@ -2047,6 +2060,22 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
 #else
 #define HW_HOT_O2_NOTHREAD HW_HOT_O2
 #endif
+/* HW_WALL_FUSE (2026-11-17, I-cache work): fold the single-caller wall chain
+ * EmitWallFromCtx -> EmitBakedWallQuads -> EmitMonolithicBakedSeg into
+ * HW_EmitVisibleBakedSeg (no calls, values stay in registers). */
+#ifndef HW_WALL_FUSE
+#define HW_WALL_FUSE 1      /* 5thPlanet: master -0.3..-0.6 ms, pixel-identical */
+#endif
+#ifndef HW_WALL_TINY
+#define HW_WALL_TINY 0
+#endif
+#if HW_WALL_FUSE && defined(__GNUC__)
+#define HW_WFUSE    inline __attribute__((always_inline))
+#define HW_WFUSE_O2 HW_HOT_O2_NOTHREAD
+#else
+#define HW_WFUSE    HW_NOINLINE
+#define HW_WFUSE_O2 HW_HOT_O2
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_EmitSubdividedBakedSeg(
     hw_wall_emit_ctx_t *ctx, int persp_strips)
@@ -2122,7 +2151,7 @@ static HW_NOINLINE HW_COLD_OS int HW_ClipSegNearPlane(
     return 1;
 }
 
-static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
+static HW_WFUSE HW_WFUSE_O2 void HW_EmitMonolithicBakedSeg(
     hw_wall_emit_ctx_t *ctx, int mono_tw, int mono_base_srca, int needs_clip)
 {
     if (__builtin_expect(saturn_cmd_m_count + 16 >= CMDBUF_M_CAP, 0))
@@ -2266,7 +2295,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
     }
 }
 
-static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t *ctx)
+static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t *ctx)
 {
 #if HW_PROF_SUBTIMERS
     unsigned short twq0 = SAT_FRT();
@@ -2452,7 +2481,7 @@ static HW_NOINLINE HW_COLD_OS void HW_OccludeZeroHeightSeg(
     }
 }
 
-static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
+static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
     hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg);
 
 static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
@@ -2666,12 +2695,55 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     ctx->yb1         = (int16_t)yb1;
     ctx->top_overlap = (uint8_t)top_overlap;
     ctx->bot_overlap = (uint8_t)bot_overlap;
+#if HW_VIS_STATS
+    /* size census (2026-11-17, distance-LOD study): [24] walls emitted
+     * [25] width <= 2 px [26] width <= 4 [27] height <= 3 px (before the
+     * overlap pad) [28] w<=4 || h<=3 ("tiny") [29] quads, all walls
+     * [30] quads from tiny walls [31] tiny with both ends cz >= 1024
+     * [32] tiny with both ends cz >= 512 [33] tiny, cz < 512 */
+    uint16_t census_m0 = saturn_cmd_m_count;
+    int c_w = ctx->p1->px - ctx->p0->px;
+    int c_h0 = (ya1 - bot_overlap) - (ya0 + top_overlap);
+    int c_h1 = (yb1 - bot_overlap) - (yb0 + top_overlap);
+    int c_h = (c_h0 > c_h1) ? c_h0 : c_h1;
+    int c_tiny = (c_w <= 4 || c_h <= 3);
+    HW_VS(24);
+    if (c_w <= 2) HW_VS(25);
+    if (c_w <= 4) HW_VS(26);
+    if (c_h <= 3) HW_VS(27);
+    if (c_tiny)
+    {
+        HW_VS(28);
+        if (ctx->p0->cz >= (1024 << FRACBITS) && ctx->p1->cz >= (1024 << FRACBITS)) HW_VS(31);
+        if (ctx->p0->cz >= (512 << FRACBITS) && ctx->p1->cz >= (512 << FRACBITS)) HW_VS(32);
+        else HW_VS(33);
+    }
+#endif
+#if HW_WALL_TINY
+    /* distance LOD study: far walls only a few pixels big are not drawn
+     * (occlusion above still counts them) - measurement upper bound */
+    {
+        int t_w = ctx->p1->px - ctx->p0->px;
+        int t_h0 = (ya1 - bot_overlap) - (ya0 + top_overlap);
+        int t_h1 = (yb1 - bot_overlap) - (yb0 + top_overlap);
+        if ((t_w <= 4 || (t_h0 <= 3 && t_h1 <= 3)) &&
+            ctx->p0->cz >= (512 << FRACBITS) && ctx->p1->cz >= (512 << FRACBITS))
+            return;
+    }
+#endif
     HW_EmitWallFromCtx(ctx, seg);
+#if HW_VIS_STATS
+    {
+        uint32_t nq = (uint32_t)(uint16_t)(saturn_cmd_m_count - census_m0);
+        hw_vis_stats[29] += nq;
+        if (c_tiny) hw_vis_stats[30] += nq;
+    }
+#endif
 }
 
 /* Texture + quad emission for the wall described by hw_wctx (immediate
  * path above, or pass 2 from a hw_wall_rec_t). */
-static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
+static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
     hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
 {
     uint8_t seg_flags = seg->flags;

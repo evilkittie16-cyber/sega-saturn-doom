@@ -66,6 +66,8 @@ static inline unsigned short Saturn_HW_ReadFRT(void)
 #define HW_NOINLINE __attribute__((noinline))
 #ifdef HW_SIZE_OPT   /* experiment: whole renderer at -Os (I-cache footprint) */
 #define HW_HOT_O2
+#elif defined(HW_REORDER)  /* experiment 2026-11-17: let GCC move unlikely blocks out of the hot path */
+#define HW_HOT_O2   __attribute__((optimize("O2")))
 #else
 #define HW_HOT_O2   __attribute__((optimize("O2", "no-reorder-blocks")))
 #endif
@@ -149,7 +151,7 @@ HW_NOINLINE void _hw_purge_cache(void)
 #define HW_VIS_STATS 0
 #endif
 #if HW_VIS_STATS
-volatile uint32_t hw_vis_stats[24];
+volatile uint32_t hw_vis_stats[40];
 volatile uint8_t  hw_vis_ssmap[128];   /* bitmap: subsectors rendered last frame */
 #define HW_VS(i) (hw_vis_stats[i]++)
 #else
@@ -160,6 +162,39 @@ volatile uint8_t  hw_vis_ssmap[128];   /* bitmap: subsectors rendered last frame
  * only; hidden polygons behind window frames/steps are drawn and covered. */
 #ifndef HW_AP_1D
 #define HW_AP_1D 0
+#endif
+/* HW_ORACLE (measurement only, bench hold builds, 2026-11-17): upper bound
+ * for baked visible lists. Frames < HW_ORACLE_START render normally and
+ * record the rendered subsectors (order, flat flags, aperture outputs);
+ * later frames replay that list with no BSP walk, no subsector aperture
+ * test, no solid/portal occlusion. HW_ORACLE=2 also adds every PVS
+ * subsector the normal walk reached but culled (a conservative set). */
+#ifndef HW_ORACLE
+#define HW_ORACLE 0
+#endif
+/* HW_WALLS_ONLY (test builds, 2026-11-17): render walls only - no floor /
+ * ceiling jobs, no sprites, no weapon. The BSP walk and visibility stay
+ * (walls need occlusion). For isolating and tuning the wall path. */
+#ifndef HW_WALLS_ONLY
+#define HW_WALLS_ONLY 0
+#endif
+#if HW_ORACLE
+typedef struct {
+    uint16_t subnum;
+    int16_t  flags;            /* flat_flags, or -2 = culled in the record frame */
+    int16_t  yt_att, yb_att, ytop_min, ybot_max;
+    uint8_t  ytop, ybot, fully, pad;
+} hw_oracle_t;
+#define HW_ORACLE_CAP 1024
+#define hw_oracle_list ((hw_oracle_t *)SATURN_WRAM_L_DEFER_ADDR)
+#ifndef HW_ORACLE_START
+#define HW_ORACLE_START 400
+#endif
+static int hw_oracle_on = 0, hw_oracle_n = 0, hw_oracle_rec_n = 0, hw_oracle_frame = 0;
+static const hw_oracle_t *hw_oracle_cur = NULL;
+#define HW_ORACLE_SKIP() do { if (hw_oracle_on) return; } while (0)
+#else
+#define HW_ORACLE_SKIP() do { } while (0)
 #endif
 #ifndef HW_DBG_APERTURE
 #define HW_DBG_APERTURE  1  /* 1 = enable vertical portal ytop/ybot aperture, 0 = disable */
