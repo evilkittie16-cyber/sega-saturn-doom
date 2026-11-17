@@ -331,6 +331,10 @@ extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 
 static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
 {
+#if HW_AP_1D
+    (void)sx_ex; (void)ytop; (void)ybot; (void)yt_yb_att;
+    return;
+#endif
     hw_aperture_state_t *ap = HW_APERTURE;
     int sx = sx_ex >> 16;
     int ex = (int16_t)sx_ex;

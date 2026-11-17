@@ -73,15 +73,34 @@ static inline unsigned short Saturn_HW_ReadFRT(void)
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
+/* HW_SLAVE_WALLS (2026-11-16): the slave SH-2 also emits deferred walls
+ * (pass 2 of HW_DEFER_WALLS) from its own copy of the emitters
+ * (saturn_hw_slave_walls.c), taking subsectors whenever its flat queue is
+ * empty; the master takes the rest. Needs HW_DEFER_WALLS. */
+#ifndef HW_SLAVE_WALLS
+#define HW_SLAVE_WALLS 0
+#endif
+#if HW_SLAVE_WALLS
+#ifndef HW_DEFER_WALLS
+#define HW_DEFER_WALLS 1
+#endif
+#endif
+
 #ifndef SATURN_WIN32
 /* SH7604 Hardware Manual: Software must not write to CCR (0xFFFFFE92) to purge cache
  * while executing from cached memory (Area 3: 0x06000000).
  * Always invoke via HW_PURGE_L1_CACHE() which branches to the uncached Area 1 alias
  * (0x26000000), purges L1, waits 8 pipeline cycles, and returns safely. */
+/* Slave CCR mode kept by every purge: 0x01 = 4KB 4-way cache, 0x09 = TW
+ * mode (2KB 2-way cache + ways 0/1 as 2KB RAM at 0xC0000000). Only the
+ * slave calls _hw_purge_cache. */
+#ifndef HW_SLAVE_CCR
+#define HW_SLAVE_CCR 0x01u
+#endif
 HW_NOINLINE void _hw_purge_cache(void)
 {
     /* 0x11 = Bit 4 (CP: Cache Purge) | Bit 0 (CE: Cache Enable, full 4KB 4-way mode) */
-    (*(volatile unsigned char *)0xFFFFFE92u) = 0x11u;
+    (*(volatile unsigned char *)0xFFFFFE92u) = (unsigned char)(0x10u | HW_SLAVE_CCR);
     __asm__ volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
 }
 #define HW_PURGE_L1_CACHE() \
@@ -120,6 +139,26 @@ HW_NOINLINE void _hw_purge_cache(void)
 #endif
 #ifndef HW_DBG_OCCLUSION
 #define HW_DBG_OCCLUSION 1  /* 1 = enable 1D solid-wall span occlusion, 0 = disable */
+#endif
+/* HW_VIS_STATS (measurement only): visibility funnel, cumulative, read with
+ * sdbg `m`. [0] frames [1] PVS-visible subsectors [2] BSP boxes tested
+ * [3] box frustum culls [4] box occlusion culls [5] leaves reached
+ * [6] leaf aperture culls [7] leaves rendered [8] rendered leaves with no
+ * output at all [9] rendered leaves with only a flat job */
+#ifndef HW_VIS_STATS
+#define HW_VIS_STATS 0
+#endif
+#if HW_VIS_STATS
+volatile uint32_t hw_vis_stats[12];
+#define HW_VS(i) (hw_vis_stats[i]++)
+#else
+#define HW_VS(i) ((void)0)
+#endif
+/* HW_AP_1D (experiment, 2026-11-17): D32XR-style walk. Portal (vertical
+ * top/bottom) apertures are never recorded, so culling is solid columns
+ * only; hidden polygons behind window frames/steps are drawn and covered. */
+#ifndef HW_AP_1D
+#define HW_AP_1D 0
 #endif
 #ifndef HW_DBG_APERTURE
 #define HW_DBG_APERTURE  1  /* 1 = enable vertical portal ytop/ybot aperture, 0 = disable */

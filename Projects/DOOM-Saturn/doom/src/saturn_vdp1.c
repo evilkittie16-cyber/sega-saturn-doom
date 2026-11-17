@@ -667,6 +667,18 @@ static void v1_write_priority_regs(void)
 }
 
 extern void Saturn_VDP2_Plane_VBlank(void);
+extern volatile int saturn_v2p_last, saturn_v2p_pending, saturn_v2p_drawing, saturn_v2p_shown;
+#if defined(HW_VDP2_PLANE_TEST) && HW_VDP2_PLANE_TEST
+extern volatile uint32_t saturn_v2p_list_ang[3], saturn_v2p_frame_ang;
+#define V2P_LIST_COMMIT()  (saturn_v2p_list_ang[0] = saturn_v2p_frame_ang)
+#define V2P_LIST_CHANGE(d) do { if (d) saturn_v2p_list_ang[2] = saturn_v2p_list_ang[1]; \
+                                saturn_v2p_list_ang[1] = saturn_v2p_list_ang[0]; } while (0)
+#define V2P_LIST_REDRAW()  (saturn_v2p_list_ang[0] = saturn_v2p_list_ang[1])
+#else
+#define V2P_LIST_COMMIT()  ((void)0)
+#define V2P_LIST_CHANGE(d) ((void)0)
+#define V2P_LIST_REDRAW()  ((void)0)
+#endif
 
 /* MANUAL FRAME-CHANGE MODE (SATURN_V1_MANUAL, 2026-11-15).
  *
@@ -725,6 +737,13 @@ static void v1m_request_change(void)
     V1_FBCR = 0x0003u;              /* FCM=1 FCT=1: change at the next field */
     v1m_draw_table = v1m_pending_table;   /* the callback re-points slot 3 next */
     v1m_pending = 0;
+    /* At this change the list drawn last goes on screen and the pending one
+     * starts drawing: the VDP2 ground plane follows (saturn_vdp2_plane.c). */
+    V2P_LIST_CHANGE(v1m_drawing);
+    if (v1m_drawing)
+        saturn_v2p_shown = saturn_v2p_drawing;
+    saturn_v2p_drawing = saturn_v2p_pending;
+    saturn_v2p_pending = -1;
     v1m_drawing = 1;
     v1m_trig_seq = v1m_seq;
 }
@@ -761,6 +780,8 @@ static void v1m_vblank(void)
         {
             v1m_pending_table = v1m_draw_table;   /* redraw the last list */
             v1m_pending = 1;
+            saturn_v2p_pending = saturn_v2p_drawing;
+            V2P_LIST_REDRAW();
         }
     }
     if (v1m_pending && !v1m_writing && v1m_draw_done())
@@ -795,6 +816,8 @@ static unsigned int v1m_begin_write(void)
 static void v1m_end_write(void)
 {
     v1m_pending_table = saturn_v1_write_table;
+    saturn_v2p_pending = saturn_v2p_last;   /* this list's VDP2 plane slot */
+    V2P_LIST_COMMIT();
     v1m_pending = 1;
     v1m_writing = 0;
 }
@@ -3094,10 +3117,12 @@ void Saturn_Vdp1_Show2D(void)
 void Saturn_Vdp1_Enter2D(void)
 {
     extern int saturn_game_started;
-    extern int saturn_vdp2_plane_active;
 
     saturn_game_started = 0;
-    saturn_vdp2_plane_active = 0;
+    /* (saturn_vdp2_plane_active is no longer cleared here: that switched the
+     * RBG0 floor off for good after a pause. 2D pages hide RBG0 through the
+     * flip -- saturn_vdp2_rbg0_on, i_video.c -- and every level load resets
+     * the plane in Saturn_HW_RenderInit.) */
     saturn_v1w_spr = 0;
     /* Hide the sprite layer when the 2D page is SHOWN (I_FinishUpdate ->
      * Saturn_Vdp1_Show2D), not now: the first pause frame loads and draws

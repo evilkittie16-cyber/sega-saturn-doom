@@ -101,6 +101,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
 #if HW_PROF_SUBTIMERS
     unsigned short ts0 = SAT_FRT();
 #endif
+    HW_VS(5);
     int flat_flags = HW_CheckSubsectorAperture(subnum, sf, fully_inside & 3);
     HW_SUBPROF_MARK(0);
 #if HW_PROF_SUBTIMERS
@@ -110,8 +111,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     if (flat_flags < 0)
     {
         saturn_hw_occl_culls++;
+        HW_VS(6);
         return;
     }
+    HW_VS(7);
 
     if (sf->is_sky)
     {
@@ -182,6 +185,17 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     hw_prof_spr_acc += HW_ProfDelta(ts2, ts3);
 #endif
 
+#if HW_VIS_STATS
+    {
+        int out_m = (saturn_cmd_m_count != m_start)
+#if HW_DEFER_WALLS
+                    || (hw_defer_nrec != defer_rec0)
+#endif
+                    ;
+        if (!out_m)
+            HW_VS((flat_flags & (int)HW_FLAT_ALLOW_BOTH) ? 9 : 8);
+    }
+#endif
 #ifndef SATURN_WIN32
     r32[0] = ((uint32_t)m_start << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
 #else
@@ -608,6 +622,12 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     saturn_hw_flat_quads = 0;
     saturn_hw_slave_timeout = 0;
     saturn_hw_prof_slave_wait = 0;
+#ifdef SATURN_BENCH
+    extern volatile uint32_t saturn_slave_busy_ticks;
+    extern uint32_t saturn_hw_prof_slave_busy;
+    uint32_t sbusy0 = *(volatile uint32_t *)((uint32_t)&saturn_slave_busy_ticks | 0x20000000u);
+    saturn_hw_prof_slave_busy = 0;
+#endif
     saturn_hw_bsp_abort = 0;
     saturn_hw_occl_culls = 0;
     saturn_hw_seg_iter = 0;
@@ -663,6 +683,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             jo_core_exec_on_slave(HW_Slave_FlatWorker);
         }
 
+#if HW_FLAT_STEAL
+        HW_StealBegin(ipc);
+#endif
         ipc->viewx = hw_viewx;
         ipc->viewy = hw_viewy;
         ipc->viewz = hw_viewz;
@@ -692,6 +715,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_frame_slave_enabled = 0;
     hw_cur_sub_ranges = saturn_sub_ranges;
 #endif
+    HW_SlaveWalls_BeginFrame(hw_frame_slave_enabled);   /* HW_SLAVE_WALLS */
 
     /* Walk BSP tree and emit visible walls, flats & sprites in exact topological order */
     extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);
@@ -702,6 +726,15 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         vb0 = saturn_vbl_count;
         tb0 = SAT_FRT();
     } while (__builtin_expect(saturn_vbl_count != vb0, 0));
+#if HW_VIS_STATS
+    HW_VS(0);
+    {
+        unsigned int n = 0;
+        for (int s = 0; s < numsubsectors; s++)
+            n += (!pvs_row || (pvs_row[s >> 3] & hw_bit_lut[s & 7])) ? 1u : 0u;
+        hw_vis_stats[1] += n;
+    }
+#endif
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
     HW_EmitDeferredWalls();         /* pass 2: wall quads + sprites */
     saturn_hw_prof_segs = hw_prof_segs_acc;
@@ -762,6 +795,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             bg_drawn = 1;
         }
 
+#if HW_FLAT_STEAL
+        HW_StealFlatJobs(ipc);   /* take floor jobs from the back instead of spinning */
+#endif
         unsigned short twait0;
         unsigned int vwait0;
         do {
@@ -784,8 +820,16 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             saturn_slave_enabled = 0; /* Disable Slave to prevent cascading frame hangs */
             *(volatile unsigned char *)((uint32_t)&saturn_slave_enabled | SATURN_WRAM_H_UNCACHED) = 0;
         }
+#if HW_FLAT_STEAL
+        if (wait_guard > 0)
+            HW_StealFinish(ipc);
+#endif
         saturn_hw_prof_slave_wait = Saturn_ProfSpan(twait0, vwait0);
-        
+#ifdef SATURN_BENCH
+        saturn_hw_prof_slave_busy =
+            *(volatile uint32_t *)((uint32_t)&saturn_slave_busy_ticks | 0x20000000u) - sbusy0;
+#endif
+
         int slave_final = ipc->quad_count;
         if (slave_final > HW_SLAVE_FLAT_Q_CAP)
             slave_final = HW_SLAVE_FLAT_Q_CAP;
@@ -809,6 +853,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
 #else
     saturn_hw_flat_quads = saturn_cmd_s_count;
 #endif
+    HW_SlaveWalls_Finish();     /* walls neither CPU took yet (HW_SLAVE_WALLS) */
     {
         unsigned short tc0;
         unsigned int vc0;

@@ -125,6 +125,13 @@ extern uint8_t *saturn_wram_l_geom_end;             /* end of flats+walls this l
 #define SATURN_WRAM_L_SHADOW_FB_UNCACHED ((uint8_t *)(SATURN_WRAM_L_UNCACHED_BASE + SATURN_WRAM_L_SHADOW_FB_OFF))
 #define SATURN_WRAM_L_SHADOW_FB_SIZE  0x00014000u     /* 80 KB (352 * 224 = 78,848 B) */
 
+/* 0x002E4000 - 0x002EFFFF: deferred-wall queue (HW_SLAVE_WALLS: records,
+ * subsector headers, occlusion snapshots; 48 KB). Below the CD scratch
+ * (i_wad.c, 0x002F0000). Keeps the queue out of the full High WRAM BSS. */
+#define SATURN_WRAM_L_DEFER_OFF     0x000E4000u
+#define SATURN_WRAM_L_DEFER_ADDR    (SATURN_WRAM_L_BASE + SATURN_WRAM_L_DEFER_OFF)
+#define SATURN_WRAM_L_DEFER_SIZE    0x0000C000u
+
 /* --- 3. Hardware Register & Video Domains (B-Bus) --- */
 #ifndef SATURN_WIN32
 #define SATURN_VDP1_VRAM            0x25C00000u     /* 512 KB VDP1 VRAM */
