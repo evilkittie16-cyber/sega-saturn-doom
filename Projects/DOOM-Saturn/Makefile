@@ -59,6 +59,7 @@ SRCS = main.c \
        doom/src/saturn_vdp1.c \
        doom/src/saturn_cmdbuf.c \
        doom/src/saturn_hw_render.c \
+       doom/src/saturn_hw_slave_walls.c \
        doom/src/saturn_vdp2_plane.c \
        doom/src/saturn_baked_flats.c \
        doom/src/saturn_baked_segs.c \
@@ -172,6 +173,13 @@ HW_RENDER_FLAGS = $(CCFLAGS_OPT)
 endif
 doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c $(SATURN_HW_DEPS)
 	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+
+# Slave copy of the wall emitters (HW_SLAVE_WALLS; empty object otherwise).
+# Every global is weakened so the duplicated header globals bind to the
+# master object's definitions (saturn_hw_slave_walls.c).
+doom/src/saturn_hw_slave_walls.o: doom/src/saturn_hw_slave_walls.c $(SATURN_HW_DEPS)
+	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+	sh-elf-objcopy --weaken $@
 
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@

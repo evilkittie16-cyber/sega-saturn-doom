@@ -49,6 +49,7 @@
 #include "saturn_vdp1.h"   /* VDP1 scaled-sprite wall prototype */
 #include "saturn_memmap.h"
 #include "saturn_light_lut.h" /* saturn_bank_row[] for the shaded CRAM banks */
+#include "saturn_vdp2_plane.h" /* saturn_vdp2_ramctl: whole RAMCTL value */
 
 /* Under JO_COMPILE_USING_SGL=1, jo_engine's vdp1_command_pipeline.c body
  * is excluded (#if !JO_COMPILE_USING_SGL). The non-SGL helpers
@@ -634,9 +635,11 @@ static void saturn_vdp2_init_display(void)
      * - CHCTLA: NBG0 256-color (bits 6:4 = 001), 512x256 bitmap (bits 3:2 = 00), BM enable (bit 1 = 1) -> 0x0012
      * - MPOFN: NBG0 map/bitmap offset = 0 (Page A at 0x25E00000)
      * - CYCA0L/U, CYCA1L/U: 2 slots of NBG0 bitmap read (0x4) + 6 slots CPU read/write (0xE) */
-    JO_VDP2_RAMCTL = (JO_VDP2_RAMCTL & ~0x000Fu) | 0x0100u;
-    JO_VDP2_CHCTLA = (JO_VDP2_CHCTLA & 0xFF00u) | 0x0012u;
-    JO_VDP2_MPOFN  = (JO_VDP2_MPOFN & ~0x0007u) | 0x0000u;
+    /* VDP2 registers are write-only: written whole (NBG1-3 fields unused = 0;
+     * RAMCTL from saturn_vdp2_ramctl, which carries the RBG0 plane's bank roles) */
+    JO_VDP2_RAMCTL = saturn_vdp2_ramctl;
+    JO_VDP2_CHCTLA = 0x0012u;
+    JO_VDP2_MPOFN  = 0x0000u;
     JO_VDP2_CYCA0L = 0x44EEu;
     JO_VDP2_CYCA0U = 0xEEEEu;
     JO_VDP2_CYCA1L = 0x44EEu;
@@ -4289,15 +4292,18 @@ void I_FinishUpdate(void)
 
             JO_VDP2_BKTAU  = (unsigned short)((bk_addr >> 16) & 0x0007u);
             JO_VDP2_BKTAL  = (unsigned short)(bk_addr & 0xFFFFu);
-            JO_VDP2_RAMCTL = (JO_VDP2_RAMCTL & ~0x000Fu) | 0x0100u;
-            JO_VDP2_CHCTLA = (JO_VDP2_CHCTLA & 0xFF00u) | 0x0012u;
-            JO_VDP2_MPOFN  = (JO_VDP2_MPOFN & ~0x0007u) | mpofn_bits;
+            JO_VDP2_RAMCTL = saturn_vdp2_ramctl;   /* whole: write-only register */
+            JO_VDP2_CHCTLA = 0x0012u;
+            JO_VDP2_MPOFN  = mpofn_bits;
             JO_VDP2_CYCA0L = 0x44EEu;
             JO_VDP2_CYCA0U = 0xEEEEu;
             JO_VDP2_CYCA1L = 0x44EEu;
             JO_VDP2_CYCA1U = 0xEEEEu;
+            /* RBG0 ground plane only under a 3D page (hwsky_back_on: the
+             * page is a 3D frame) -- never over the pause menu / 2D screens */
+            saturn_vdp2_rbg0_on = (unsigned char)(saturn_vdp2_plane_active && hwsky_back_on);
             JO_VDP2_BGON   = (unsigned short)(JO_NBG0_SCREEN
-                             | (saturn_vdp2_plane_active ? JO_RBG0_SCREEN : 0));
+                             | (saturn_vdp2_rbg0_on ? JO_RBG0_SCREEN : 0));
             /* VDP2 hardware sky: NBG0 line scroll (LSCX) + line zoom (LZMX),
              * 8-line interval (LSS = 3), table in the shown page's rows 224..;
              * window 0 keeps NBG0 inside the 320-px view (display x 16..335,
@@ -4308,12 +4314,16 @@ void I_FinishUpdate(void)
                 unsigned int lsta = ((fb_addr & 0x7FFFFu) + HWSKY_TABLE_OFS) >> 1;
                 JO_VDP2_LSTA0U = (unsigned short)((lsta >> 16) & 0x0007u);
                 JO_VDP2_LSTA0L = (unsigned short)(lsta & 0xFFFFu);
-                JO_VDP2_SCRCTL = (unsigned short)((JO_VDP2_SCRCTL & 0xFF00u) | 0x003Au);
+                /* whole writes (write-only registers; NBG1 fields unused = 0) */
+                JO_VDP2_SCRCTL = 0x003Au;
                 *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
                 *(volatile unsigned short *)0x25F800C2u = 0;
                 *(volatile unsigned short *)0x25F800C4u = (unsigned short)((SATURN_BORDER_X + FB_W - 1) * 2);
                 *(volatile unsigned short *)0x25F800C6u = (unsigned short)(SATURN_FB_LINES - 1);
-                JO_VDP2_WCTLA  = (unsigned short)((JO_VDP2_WCTLA & 0xFF00u) | 0x0003u);
+                JO_VDP2_WCTLA  = 0x0003u;
+                /* window 0 also keeps the RBG0 plane inside the 320-px view
+                 * (RBG0 = WCTLC low byte, same W0E|W0A encoding as NBG0) */
+                JO_VDP2_WCTLC  = 0x0003u;
             }
             else
             {
@@ -4322,14 +4332,21 @@ void I_FinishUpdate(void)
                  * side borders show sky (pause menu, bench summary). The
                  * borders are always black, so the window never hides
                  * anything real. */
-                JO_VDP2_SCRCTL = (unsigned short)(JO_VDP2_SCRCTL & 0xFF00u);
+                JO_VDP2_SCRCTL = 0x0000u;
+                {
+                    /* this 2D page replaces the last 3D frame: hide the
+                     * sprite layer now, not when the 2D screen started
+                     * (saturn_vdp1.c Saturn_Vdp1_Show2D) */
+                    extern void Saturn_Vdp1_Show2D(void);
+                    Saturn_Vdp1_Show2D();
+                }
                 if (hwsky_valid[0] || hwsky_valid[1] || hwsky_ever)
                 {
                     *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
                     *(volatile unsigned short *)0x25F800C2u = 0;
                     *(volatile unsigned short *)0x25F800C4u = (unsigned short)((SATURN_BORDER_X + FB_W - 1) * 2);
                     *(volatile unsigned short *)0x25F800C6u = (unsigned short)(SATURN_FB_LINES - 1);
-                    JO_VDP2_WCTLA = (unsigned short)((JO_VDP2_WCTLA & 0xFF00u) | 0x0003u);
+                    JO_VDP2_WCTLA = 0x0003u;
                 }
             }
         }

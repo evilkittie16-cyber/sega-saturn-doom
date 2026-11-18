@@ -1214,7 +1214,15 @@ void I_FinishUpdate(void)
             players[0].mo->x = wx * FRACUNIT;
             players[0].mo->y = wy * FRACUNIT;
         }
-        players[0].mo->angle = (angle_t)(((unsigned long long)g_pos_ang << 32) / 360u);
+        {
+            /* POS_TURN=d: turn d degrees (may be fractional) per frame */
+            static double s_turn = -1.0;
+            if (s_turn < 0.0) { const char *e = getenv("POS_TURN"); s_turn = e ? atof(e) : 0.0; }
+            double a = (double)g_pos_ang + s_turn * s_pos_step;
+            while (a < 0) a += 360.0;
+            while (a >= 360.0) a -= 360.0;
+            players[0].mo->angle = (angle_t)(a / 360.0 * 4294967296.0);
+        }
         {
             subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
             if (ss) {
@@ -1251,6 +1259,24 @@ void I_FinishUpdate(void)
                        g_vdp1_od_total_cyc ? g_vdp1_od_hidden_cyc * 100.0 / g_vdp1_od_total_cyc : 0.0);
             }
         }
+        if (getenv("POS_DUMP"))
+        {
+            char fn[64];
+            sprintf(fn, "posf_%03d.bmp", s_pos_step);
+            SaveFramebufferBMP(fn, s_combined_fb, COMBINED_W, COMBINED_H);
+        }
+        {
+            extern unsigned int saturn_warp_hits, saturn_warp_fallbacks;
+            static unsigned int lh = 0, lf = 0;
+            printf("[WARPF] hit:%u fallback:%u\n", saturn_warp_hits - lh, saturn_warp_fallbacks - lf);
+            lh = saturn_warp_hits; lf = saturn_warp_fallbacks;
+        }
+        {
+            extern unsigned int saturn_v1_warp_gens, saturn_v1_warp_miss;
+            extern unsigned int saturn_v1_warp_miss_c, saturn_v1_warp_miss_b, saturn_v1_warp_miss_a;
+            extern int v1_warp_budget; printf("[WARP] bud:%d gens:%u miss:%u (slot %u budget %u alloc %u)\n", v1_warp_budget, saturn_v1_warp_gens, saturn_v1_warp_miss,
+                   saturn_v1_warp_miss_c, saturn_v1_warp_miss_b, saturn_v1_warp_miss_a);
+        }
         printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) badsrca:%u variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
                s_pos_step, players[0].mo->x >> FRACBITS, players[0].mo->y >> FRACBITS,
                g_telemetry.avg_err_pct,
@@ -1269,7 +1295,7 @@ void I_FinishUpdate(void)
         s_last_ev = saturn_v1_evictions;
         s_last_evb = saturn_v1_evicted_bytes;
         (void)saturn_vdp1_bus_tex_bytes;
-        if (++s_pos_step == (g_walk_frames > 0 ? g_walk_frames + 10 : 20)) {
+        if (++s_pos_step == (g_walk_frames > 0 ? g_walk_frames + 10 : (getenv("POS_FRAMES") ? atoi(getenv("POS_FRAMES")) : 20))) {
             SaveFramebufferBMP("pos_triple.bmp", s_combined_fb, COMBINED_W, COMBINED_H);
             {
                 /* Raw VDP1 VRAM of the final frame (command words are host-endian

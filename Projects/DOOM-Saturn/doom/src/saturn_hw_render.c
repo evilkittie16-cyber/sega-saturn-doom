@@ -22,6 +22,9 @@
 #include "saturn_hw_sprites.c"
 #include "saturn_hw_flats.c"
 #include "saturn_hw_walls.c"
+#if HW_ORACLE && HW_DEFER_WALLS
+#error "HW_ORACLE keeps its list in the deferred-wall region"
+#endif
 
 static unsigned int hw_prof_ap_acc = 0;
 static unsigned int hw_prof_fsub_acc = 0;
@@ -101,17 +104,69 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
 #if HW_PROF_SUBTIMERS
     unsigned short ts0 = SAT_FRT();
 #endif
-    int flat_flags = HW_CheckSubsectorAperture(subnum, sf, fully_inside & 3);
+    HW_VS(5);
+    int flat_flags;
+#if HW_ORACLE
+    if (hw_oracle_on)
+    {
+        hw_aperture_state_t *ap = HW_APERTURE;
+        const hw_oracle_t *o = hw_oracle_cur;
+        if (o->flags == -2)
+        {
+            int vh = HW_VIEW_H;
+            flat_flags = (fully_inside & 3) | (int)HW_FLAT_ALLOW_BOTH;
+            ap->cur_sub_yt_attach = 0;
+            ap->cur_sub_yb_attach = (int16_t)vh;
+            ap->cur_sub_ytop = 0;
+            ap->cur_sub_ybot = (uint8_t)vh;
+            ap->cur_ytop_min = 0;
+            ap->cur_ybot_max = (int16_t)vh;
+        }
+        else
+        {
+            flat_flags = o->flags;
+            ap->cur_sub_yt_attach = o->yt_att;
+            ap->cur_sub_yb_attach = o->yb_att;
+            ap->cur_sub_ytop = o->ytop;
+            ap->cur_sub_ybot = o->ybot;
+            ap->cur_ytop_min = o->ytop_min;
+            ap->cur_ybot_max = o->ybot_max;
+        }
+    }
+    else
+#endif
+    flat_flags = HW_CheckSubsectorAperture(subnum, sf, fully_inside & 3);
     HW_SUBPROF_MARK(0);
 #if HW_PROF_SUBTIMERS
     unsigned short ts1 = SAT_FRT();
     hw_prof_ap_acc += HW_ProfDelta(ts0, ts1);
 #endif
+#if HW_ORACLE
+    if (!hw_oracle_on && hw_oracle_rec_n < HW_ORACLE_CAP && (flat_flags >= 0 || HW_ORACLE == 2))
+    {
+        hw_aperture_state_t *ap = HW_APERTURE;
+        hw_oracle_t *o = &hw_oracle_list[hw_oracle_rec_n++];
+        o->subnum = (uint16_t)subnum;
+        o->fully = (uint8_t)fully_inside;
+        o->flags = (int16_t)((flat_flags >= 0) ? flat_flags : -2);
+        o->yt_att = ap->cur_sub_yt_attach;
+        o->yb_att = ap->cur_sub_yb_attach;
+        o->ytop = ap->cur_sub_ytop;
+        o->ybot = ap->cur_sub_ybot;
+        o->ytop_min = ap->cur_ytop_min;
+        o->ybot_max = ap->cur_ybot_max;
+    }
+#endif
     if (flat_flags < 0)
     {
         saturn_hw_occl_culls++;
+        HW_VS(6);
         return;
     }
+    HW_VS(7);
+#if HW_VIS_STATS
+    hw_vis_ssmap[subnum >> 3] |= (uint8_t)(1u << (subnum & 7));
+#endif
 
     if (sf->is_sky)
     {
@@ -127,7 +182,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     r32[1] = 0;
     ranges[visit_idx].subnum = (uint16_t)subnum;
 
-    if (flat_flags & (int)HW_FLAT_ALLOW_BOTH)
+    if (!HW_WALLS_ONLY && (flat_flags & (int)HW_FLAT_ALLOW_BOTH))
     {
         sector_t *sec = &sectors[secnum];
 #ifndef SATURN_WIN32
@@ -170,7 +225,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     uint16_t spr_m0 = saturn_cmd_m_count;
     hw_defer_on = 0;
 #endif
-    if (__builtin_expect(sf->has_things != 0, 0))
+    if (!HW_WALLS_ONLY && __builtin_expect(sf->has_things != 0, 0))
     {
         sector_t *sec = &sectors[secnum];
         if (HW_SubsectorHasThings(sec, (uint32_t)secnum, subnum))
@@ -182,6 +237,17 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     hw_prof_spr_acc += HW_ProfDelta(ts2, ts3);
 #endif
 
+#if HW_VIS_STATS
+    {
+        int out_m = (saturn_cmd_m_count != m_start)
+#if HW_DEFER_WALLS
+                    || (hw_defer_nrec != defer_rec0)
+#endif
+                    ;
+        if (!out_m)
+            HW_VS((flat_flags & (int)HW_FLAT_ALLOW_BOTH) ? 9 : 8);
+    }
+#endif
 #ifndef SATURN_WIN32
     r32[0] = ((uint32_t)m_start << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
 #else
@@ -514,6 +580,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_slave_dirty_words = 0;
     hw_def_flat_count = 0;
     hw_frame_flat_jobs = 0;
+    Saturn_Vdp1_WarpNewFrame();
+    HW_WarpService();       /* textures the flat workers asked for last frame */
     {
         static int16_t last_ap_vh = -1;
         hw_aperture_state_t *ap = HW_APERTURE;
@@ -535,6 +603,13 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             {
                 if (!(dirty & hw_bit_lut[w]))
                     continue;
+#if HW_AP_HALF
+                int x_w0 = w << 4;      /* column pairs */
+                aliased_uint32_t *yt32 = (aliased_uint32_t *)&ap->ytop[x_w0];
+                aliased_uint32_t *yb32 = (aliased_uint32_t *)&ap->ybot[x_w0];
+                yt32[0] = 0; yt32[1] = 0; yt32[2] = 0; yt32[3] = 0;
+                yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
+#else
                 int x_w0 = w << 5;
                 aliased_uint32_t *yt32 = (aliased_uint32_t *)&ap->ytop[x_w0];
                 aliased_uint32_t *yb32 = (aliased_uint32_t *)&ap->ybot[x_w0];
@@ -542,6 +617,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
                 yt32[4] = 0; yt32[5] = 0; yt32[6] = 0; yt32[7] = 0;
                 yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
                 yb32[4] = yb4; yb32[5] = yb4; yb32[6] = yb4; yb32[7] = yb4;
+#endif
                 hw_ap_words[w].yt_min = 0;
                 hw_ap_words[w].yb_max = vh;
                 hw_ap_words[w].yt_max = 0;
@@ -606,6 +682,12 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     saturn_hw_flat_quads = 0;
     saturn_hw_slave_timeout = 0;
     saturn_hw_prof_slave_wait = 0;
+#ifdef SATURN_BENCH
+    extern volatile uint32_t saturn_slave_busy_ticks;
+    extern uint32_t saturn_hw_prof_slave_busy;
+    uint32_t sbusy0 = *(volatile uint32_t *)((uint32_t)&saturn_slave_busy_ticks | 0x20000000u);
+    saturn_hw_prof_slave_busy = 0;
+#endif
     saturn_hw_bsp_abort = 0;
     saturn_hw_occl_culls = 0;
     saturn_hw_seg_iter = 0;
@@ -617,7 +699,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     saturn_hw_flat_lod_saved_quads = 0;
 
     /* Queue player weapon directly into saturn_cmd_w */
-    HW_RenderPlayerWeapon();
+    if (!HW_WALLS_ONLY)
+        HW_RenderPlayerWeapon();
 
     /* raster-hole backing polygons only when the sky shows (saturn_hw_flats.c) */
     hw_hole_backing_on = saturn_hw_sky_visible;     /* last frame's value */
@@ -661,6 +744,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             jo_core_exec_on_slave(HW_Slave_FlatWorker);
         }
 
+#if HW_FLAT_STEAL
+        HW_StealBegin(ipc);
+#endif
         ipc->viewx = hw_viewx;
         ipc->viewy = hw_viewy;
         ipc->viewz = hw_viewz;
@@ -690,6 +776,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_frame_slave_enabled = 0;
     hw_cur_sub_ranges = saturn_sub_ranges;
 #endif
+    HW_SlaveWalls_BeginFrame(hw_frame_slave_enabled);   /* HW_SLAVE_WALLS */
 
     /* Walk BSP tree and emit visible walls, flats & sprites in exact topological order */
     extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);
@@ -700,7 +787,39 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         vb0 = saturn_vbl_count;
         tb0 = SAT_FRT();
     } while (__builtin_expect(saturn_vbl_count != vb0, 0));
+#if HW_VIS_STATS
+    HW_VS(0);
+    for (int s = 0; s < (int)sizeof(hw_vis_ssmap); s++)
+        hw_vis_ssmap[s] = 0;
+    {
+        unsigned int n = 0;
+        for (int s = 0; s < numsubsectors; s++)
+            n += (!pvs_row || (pvs_row[s >> 3] & hw_bit_lut[s & 7])) ? 1u : 0u;
+        hw_vis_stats[1] += n;
+    }
+#endif
+#if HW_ORACLE
+    if (!hw_oracle_on && ++hw_oracle_frame >= HW_ORACLE_START && hw_oracle_rec_n > 0)
+    {
+        hw_oracle_n = hw_oracle_rec_n;
+        hw_oracle_on = 1;
+    }
+    if (hw_oracle_on)
+    {
+        for (int i = 0; i < hw_oracle_n; i++)
+        {
+            hw_oracle_cur = &hw_oracle_list[i];
+            HW_RenderSubsector(hw_oracle_cur->subnum, hw_oracle_cur->fully);
+        }
+    }
+    else
+    {
+        hw_oracle_rec_n = 0;
+        HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
+    }
+#else
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
+#endif
     HW_EmitDeferredWalls();         /* pass 2: wall quads + sprites */
     saturn_hw_prof_segs = hw_prof_segs_acc;
     saturn_hw_prof_ap = hw_prof_ap_acc;
@@ -760,6 +879,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             bg_drawn = 1;
         }
 
+#if HW_FLAT_STEAL
+        HW_StealFlatJobs(ipc);   /* take floor jobs from the back instead of spinning */
+#endif
         unsigned short twait0;
         unsigned int vwait0;
         do {
@@ -782,8 +904,16 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             saturn_slave_enabled = 0; /* Disable Slave to prevent cascading frame hangs */
             *(volatile unsigned char *)((uint32_t)&saturn_slave_enabled | SATURN_WRAM_H_UNCACHED) = 0;
         }
+#if HW_FLAT_STEAL
+        if (wait_guard > 0)
+            HW_StealFinish(ipc);
+#endif
         saturn_hw_prof_slave_wait = Saturn_ProfSpan(twait0, vwait0);
-        
+#ifdef SATURN_BENCH
+        saturn_hw_prof_slave_busy =
+            *(volatile uint32_t *)((uint32_t)&saturn_slave_busy_ticks | 0x20000000u) - sbusy0;
+#endif
+
         int slave_final = ipc->quad_count;
         if (slave_final > HW_SLAVE_FLAT_Q_CAP)
             slave_final = HW_SLAVE_FLAT_Q_CAP;
@@ -807,6 +937,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
 #else
     saturn_hw_flat_quads = saturn_cmd_s_count;
 #endif
+    HW_SlaveWalls_Finish();     /* walls neither CPU took yet (HW_SLAVE_WALLS) */
     {
         unsigned short tc0;
         unsigned int vc0;

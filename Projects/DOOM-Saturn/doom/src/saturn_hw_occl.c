@@ -157,6 +157,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSpanOcclusion(int x0, int x1)
 /* Defer solid span masking until subsector completion so walls never occlude flats in the same subsector */
 static HW_NOINLINE HW_HOT_O2 void HW_MarkSubSolidSpan(int x0, int x1)
 {
+    HW_ORACLE_SKIP();
     int x1_m1 = x1 - 1;
     int w0 = (int)((unsigned int)x0 >> 5);
     int b0 = x0 & 31;
@@ -329,8 +330,25 @@ extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_PORTAL_SEGS    ((hw_portal_seg_t *)hw_wram_h_portal_segs)
 #define HW_SKY_COL_BAM    (HW_WRAM_L_SCRATCH->sky_col_bam)
 
+/* HW_AP_HALF (2026-11-17, the 32X idea): the per-column window limits
+ * ytop[]/ybot[] are kept per PAIR of screen columns (index = x >> 1, 16 per
+ * 32-column word). Conservative both ways: a portal span narrows only pairs
+ * entirely inside it, and lookups skip a pair only when both of its columns
+ * are solid, so nothing visible is culled; a few hidden pieces may be drawn.
+ * The solid-column bitmask and the per-word summaries stay full resolution. */
+#ifndef HW_AP_HALF
+#define HW_AP_HALF 0
+#endif
+#if HW_AP_HALF
+#define HW_AP_PAIR_SOLID(sm, h) ((((sm) >> (((h) & 15) << 1)) & 3u) == 3u)
+#endif
+
 static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
 {
+#if HW_AP_1D
+    (void)sx_ex; (void)ytop; (void)ybot; (void)yt_yb_att;
+    return;
+#endif
     hw_aperture_state_t *ap = HW_APERTURE;
     int sx = sx_ex >> 16;
     int ex = (int16_t)sx_ex;
@@ -397,6 +415,17 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             const uint8_t *ybot = ap->ybot;
             yt_min = HW_VIEW_H;
             yb_max = 0;
+#if HW_AP_HALF
+            for (int h = sx >> 1; h <= (ex_m1 >> 1); h++)
+            {
+                if (HW_AP_PAIR_SOLID(sm, h))
+                    continue;
+                int yt = ytop[h];
+                int yb = ybot[h];
+                if (yt < yt_min) yt_min = yt;
+                if (yb > yb_max) yb_max = yb;
+            }
+#else
             uint32_t m = sm >> b0;
             for (int x = sx; x <= ex_m1; x++, m >>= 1)
             {
@@ -407,6 +436,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
                 if (yt < yt_min) yt_min = yt;
                 if (yb > yb_max) yb_max = yb;
             }
+#endif
         }
         return (yt_min >= yb_max) ? -1 : ((yt_min << 16) | (uint16_t)yb_max);
     }
@@ -451,10 +481,22 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             }
             else
             {
-                uint32_t m = hw_solid_mask[w0] >> b0;
                 const uint8_t *ytop = ap->ytop;
                 const uint8_t *ybot = ap->ybot;
                 int x_end = (w0 << 5) + 31;
+#if HW_AP_HALF
+                uint32_t sm0 = hw_solid_mask[w0];
+                for (int h = sx >> 1; h <= (x_end >> 1); h++)
+                {
+                    if (HW_AP_PAIR_SOLID(sm0, h))
+                        continue;
+                    int yt = ytop[h];
+                    int yb = ybot[h];
+                    if (yt < yt_min) yt_min = yt;
+                    if (yb > yb_max) yb_max = yb;
+                }
+#else
+                uint32_t m = hw_solid_mask[w0] >> b0;
                 for (int x = sx; x <= x_end; x++, m >>= 1)
                 {
                     if (m & 1u)
@@ -464,6 +506,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
                     if (yt < yt_min) yt_min = yt;
                     if (yb > yb_max) yb_max = yb;
                 }
+#endif
             }
         }
     }
@@ -479,10 +522,22 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             }
             else
             {
-                uint32_t m = hw_solid_mask[w1];
                 const uint8_t *ytop = ap->ytop;
                 const uint8_t *ybot = ap->ybot;
                 int x_start = w1 << 5;
+#if HW_AP_HALF
+                uint32_t sm1 = hw_solid_mask[w1];
+                for (int h = x_start >> 1; h <= (ex_m1 >> 1); h++)
+                {
+                    if (HW_AP_PAIR_SOLID(sm1, h))
+                        continue;
+                    int yt = ytop[h];
+                    int yb = ybot[h];
+                    if (yt < yt_min) yt_min = yt;
+                    if (yb > yb_max) yb_max = yb;
+                }
+#else
+                uint32_t m = hw_solid_mask[w1];
                 for (int x = x_start; x <= ex_m1; x++, m >>= 1)
                 {
                     if (m & 1u)
@@ -492,6 +547,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
                     if (yt < yt_min) yt_min = yt;
                     if (yb > yb_max) yb_max = yb;
                 }
+#endif
             }
         }
     }
@@ -570,12 +626,27 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
             aw->yb_min = 0;
             continue;
         }
+        int min_yt = vh, max_yt = 0;
+        int min_yb = vh, max_yb = 0;
+#if HW_AP_HALF
+        int h_start = w << 4;
+        int h_end = h_start + 16;
+        if (h_end > ((vw + 1) >> 1)) h_end = (vw + 1) >> 1;
+        for (int h = h_start; h < h_end; h++)
+        {
+            if (sm != 0 && HW_AP_PAIR_SOLID(sm, h))
+                continue;
+            int yt = ytop[h];
+            int yb = ybot[h];
+            if (yt < min_yt) min_yt = yt;
+            if (yt > max_yt) max_yt = yt;
+            if (yb < min_yb) min_yb = yb;
+            if (yb > max_yb) max_yb = yb;
+        }
+#else
         int x_start = w << 5;
         int x_end = x_start + 32;
         if (x_end > vw) x_end = vw;
-
-        int min_yt = vh, max_yt = 0;
-        int min_yb = vh, max_yb = 0;
         if (sm == 0)
         {
             for (int x = x_start; x < x_end; x++)
@@ -603,6 +674,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
                 if (yb > max_yb) max_yb = yb;
             }
         }
+#endif
         if (min_yt > max_yb)
         {
             min_yt = max_yt = vh;
@@ -677,6 +749,27 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
     int yb_req  = yb_att + 2;
     unsigned int yb_span = (yb_req >= yb_base) ? (unsigned int)(yb_req - new_yb) : 0u;
 
+#if HW_AP_HALF
+    /* pairs fully inside [x_s, x_e) only; a closed pair closes both columns */
+    {
+        int h_s = (x_s + 1) >> 1;
+        int h_e = x_e >> 1;
+        for (int h = h_s; h < h_e; h++)
+        {
+            int yt = ytop[h];
+            int yb = ybot[h];
+            int mod = 0;
+            if (do_yt && (unsigned int)(yt - yt_req) < yt_span)  { yt = new_yt; ytop[h] = (uint8_t)new_yt; mod = 1; }
+            if (do_yb && (unsigned int)(yb - yb_base) < yb_span) { yb = new_yb; ybot[h] = (uint8_t)new_yb; mod = 1; }
+            if (mod)
+            {
+                w_mod = 1;
+                if (__builtin_expect(yt >= yb, 0))
+                    newly_closed |= 3u << ((h & 15) << 1);
+            }
+        }
+    }
+#else
     if (!do_yb)
     {
         if (yt_span > 0u)
@@ -728,6 +821,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
             }
         }
     }
+#endif
     if (__builtin_expect(newly_closed != 0, 0))
     {
         if (HW_CommitPortalClosedWord(w, newly_closed))
@@ -791,15 +885,25 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
                     if (is_full_word)
                     {
                         uint32_t yt4 = (uint32_t)(uint8_t)new_yt * 0x01010101u;
+#if HW_AP_HALF
+                        aliased_uint32_t *yt32 = (aliased_uint32_t *)&ytop[x_w0 >> 1];
+                        yt32[0] = yt4; yt32[1] = yt4; yt32[2] = yt4; yt32[3] = yt4;
+#else
                         aliased_uint32_t *yt32 = (aliased_uint32_t *)&ytop[x_w0];
                         yt32[0] = yt4; yt32[1] = yt4; yt32[2] = yt4; yt32[3] = yt4;
                         yt32[4] = yt4; yt32[5] = yt4; yt32[6] = yt4; yt32[7] = yt4;
+#endif
                         aw->yt_min = aw->yt_max = (int16_t)new_yt;
                     }
                     else
                     {
+#if HW_AP_HALF
+                        for (int h = (x_s + 1) >> 1; h < (x_e >> 1); h++)
+                            ytop[h] = (uint8_t)new_yt;
+#else
                         for (int x = x_s; x < x_e; x++)
                             ytop[x] = (uint8_t)new_yt;
+#endif
                         if (aw->yt_min == aw->yt_max)
                             aw->yt_max = (int16_t)new_yt;
                         else
@@ -815,15 +919,25 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
                     if (is_full_word)
                     {
                         uint32_t yb4 = (uint32_t)(uint8_t)new_yb * 0x01010101u;
+#if HW_AP_HALF
+                        aliased_uint32_t *yb32 = (aliased_uint32_t *)&ybot[x_w0 >> 1];
+                        yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
+#else
                         aliased_uint32_t *yb32 = (aliased_uint32_t *)&ybot[x_w0];
                         yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
                         yb32[4] = yb4; yb32[5] = yb4; yb32[6] = yb4; yb32[7] = yb4;
+#endif
                         aw->yb_min = aw->yb_max = (int16_t)new_yb;
                     }
                     else
                     {
+#if HW_AP_HALF
+                        for (int h = (x_s + 1) >> 1; h < (x_e >> 1); h++)
+                            ybot[h] = (uint8_t)new_yb;
+#else
                         for (int x = x_s; x < x_e; x++)
                             ybot[x] = (uint8_t)new_yb;
+#endif
                         if (aw->yb_min == aw->yb_max)
                             aw->yb_min = (int16_t)new_yb;
                         else

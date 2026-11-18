@@ -984,8 +984,10 @@ void Saturn_HW_RenderInit(void)
     /* Expand BSP node bboxes so subsector flats are never culled prematurely */
     Saturn_ExpandNodeBBoxesWithFlats();
 
-    /* VDP2 RBG0 ground plane deactivated: large outdoor sectors render via Large LOD VDP1 quads */
-    saturn_vdp2_plane_active = 0;
+    /* VDP2 RBG0 ground plane: this level's dominant static floor group, if
+     * any (saturn_vdp2_plane.c; HW_VDP2_PLANE_TEST=2 shows the alignment
+     * checker texture instead of the flat). */
+    Saturn_VDP2_Plane_SelectForLevel();
 }
 
 void Saturn_HW_ForceSkyRepaint(void)

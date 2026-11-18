@@ -69,6 +69,8 @@ const saturn_flat_quad_idx_t        *saturn_baked_flat_quads     = NULL;
 const uint8_t                       *saturn_baked_flat_vfrac     = NULL;
 const uint16_t                      *saturn_baked_flat_quv       = NULL;
 const uint8_t                       *saturn_baked_flat_subflags  = NULL;
+const saturn_flat_chunk_t           *saturn_baked_flat_chunks    = NULL;
+const uint16_t                      *saturn_baked_flat_sub_chunk = NULL;
 int                                  saturn_baked_flat_numsubsectors = 0;
 
 /* QUV1 extension block (tools/bake_flats.py quad_uv): sits at
@@ -85,6 +87,8 @@ static void Saturn_BakedFlats_FindQuv(uint32_t len)
 
     saturn_baked_flat_quv      = NULL;
     saturn_baked_flat_subflags = NULL;
+    saturn_baked_flat_chunks    = NULL;
+    saturn_baked_flat_sub_chunk = NULL;
     if (of < 64 || of + h->numvertexes > len)
         return;
     qo = (of + h->numvertexes + 3u) & ~3u;
@@ -108,6 +112,25 @@ static void Saturn_BakedFlats_FindQuv(uint32_t len)
 #endif
     saturn_baked_flat_quv      = (const uint16_t *)(cur_blob + qo + 12u);
     saturn_baked_flat_subflags = cur_blob + so;
+
+#ifndef SATURN_WIN32   /* big-endian blob as-is; the Windows build ignores chunks */
+    /* CHK1 block right after the subflags (optional). */
+    {
+        uint32_t co = (so + ns + 3u) & ~3u;
+        if (co + 12u > len)
+            return;
+        b = cur_blob + co;
+        if (b[0] != 'C' || b[1] != 'H' || b[2] != 'K' || b[3] != '1')
+            return;
+        uint32_t nc = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
+        uint32_t cs = ((uint32_t)b[8] << 24) | ((uint32_t)b[9] << 16) | ((uint32_t)b[10] << 8) | b[11];
+        uint32_t ro = (co + 12u + ns * 2u + 3u) & ~3u;
+        if (cs != ns || nc < 2u || nc > 16384u || ro + nc * 16u > len)
+            return;
+        saturn_baked_flat_sub_chunk = (const uint16_t *)(cur_blob + co + 12u);
+        saturn_baked_flat_chunks    = (const saturn_flat_chunk_t *)(cur_blob + ro);
+    }
+#endif
 }
 
 #define cur_sub_q_first saturn_baked_flat_q_first

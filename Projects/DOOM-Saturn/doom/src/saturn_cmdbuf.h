@@ -65,6 +65,13 @@ _Static_assert(sizeof(vdp1_cmd_t) == 32, "vdp1_cmd_t must be exactly 32 bytes");
 #define CMDBUF_S_CAP         1024
 #define HW_SLAVE_FLAT_Q_CAP  768   /* Slave flat quad budget; remaining 256 for Master stealing */
 #define CMDBUF_W_CAP         4
+/* HW_SLAVE_WALLS: the slave's wall quads live in saturn_cmd_m after the
+ * master's CMDBUF_M_CAP slots (indices CMDBUF_M_CAP .. + CMDBUF_SW_CAP). */
+#if defined(HW_SLAVE_WALLS) && HW_SLAVE_WALLS
+#define CMDBUF_SW_CAP        512
+#else
+#define CMDBUF_SW_CAP        0
+#endif
 #define CMDBUF_MAX_VISIT     384
 
 #if HW_SLAVE_FLAT_Q_CAP >= CMDBUF_S_CAP
@@ -96,6 +103,7 @@ extern sub_range_t *saturn_sub_ranges;
 extern volatile uint16_t saturn_cmd_m_count;
 extern volatile uint16_t saturn_cmd_s_count;
 extern volatile uint16_t saturn_cmd_w_count;
+extern volatile uint16_t saturn_cmd_sw_count;   /* slave wall quads (HW_SLAVE_WALLS) */
 extern int saturn_visit_count;
 extern uint8_t saturn_cmd_m_needs_ytrim;
 

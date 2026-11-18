@@ -174,7 +174,11 @@ static int  scratch_used = 0;
 __attribute__((aligned(16))) unsigned int saturn_master_oclut[3072];
 __attribute__((aligned(16))) uint32_t     hw_wram_h_sub_flat_info[608 * 4];
 __attribute__((aligned(16))) uint32_t     hw_wram_h_proj_verts_slave[960 * 4];
+#if defined(HW_SLAVE_WALLS) && HW_SLAVE_WALLS
+__attribute__((aligned(16))) uint32_t     hw_wram_h_slave_stack[640];   /* + wall emitters */
+#else
 __attribute__((aligned(16))) uint32_t     hw_wram_h_slave_stack[224];
+#endif
 __attribute__((aligned(16))) uint32_t     hw_wram_h_portal_segs[336 * 3];
 byte *I_TempBuffer(int size)
 {
