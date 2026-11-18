@@ -199,8 +199,18 @@ static void *hram_alloc(int size)
 
     if (hram_ok)
     {
+        /* Fence off everything fixed in the tier window: the shadow
+         * framebuffer, the deferred-wall queue and the v1_evict list
+         * (contiguous 0x2D0000..0x2EFFFF). 2026-11-18 bug: only the shadow FB
+         * was skipped, so texture/patch data landed in 0x2E4000+ (E1M1 tier
+         * top 0x2EE300) and was overwritten by deferred-wall records (garbage
+         * rows in the E1M1 courtyard window walls) - and, in default builds,
+         * could be by the evict candidate list. Overflow goes to Z_Malloc. */
         const unsigned int fb_lo = SATURN_WRAM_L_BASE + SATURN_WRAM_L_SHADOW_FB_OFF - SATURN_HRAM_BASE;
-        const unsigned int fb_hi = fb_lo + SATURN_WRAM_L_SHADOW_FB_SIZE;
+        const unsigned int fb_hi = SATURN_WRAM_L_BASE + SATURN_WRAM_L_EVICT_OFF + SATURN_WRAM_L_EVICT_SIZE - SATURN_HRAM_BASE;
+        _Static_assert(SATURN_WRAM_L_SHADOW_FB_OFF + SATURN_WRAM_L_SHADOW_FB_SIZE == SATURN_WRAM_L_DEFER_OFF &&
+                       SATURN_WRAM_L_DEFER_OFF + SATURN_WRAM_L_DEFER_SIZE == SATURN_WRAM_L_EVICT_OFF,
+                       "tier fence assumes shadow FB, defer queue and evict list are contiguous");
         if (hram_used < fb_hi && hram_used + (unsigned int)adv > fb_lo)
             hram_used = fb_hi;
     }

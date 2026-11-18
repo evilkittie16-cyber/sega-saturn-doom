@@ -3478,7 +3478,15 @@ static void HW_DeferCloseSub(int visit_idx, int subnum, int rec_first,
     hw_defer_nsub++;
 #if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
     if (hw_sw_on)
+    {
+        /* Mark the visit's m range pending: pass 2 (slave, or master in
+         * Finish) rewrites it with the real walls+sprites range. Until then
+         * HW_StealPick (HW_FLAT_STEAL) must not take it as an empty m range
+         * for a stolen floor job, or one side's write would drop the
+         * other's quads. */
+        ((volatile sub_range_t *)((uint32_t)hw_cur_sub_ranges | SATURN_WRAM_H_UNCACHED))[visit_idx].m_count = HW_RANGE_PENDING;
         HW_WALL_IPC()->ready = hw_defer_nsub;   /* records + header written above */
+    }
 #endif
 }
 

@@ -135,10 +135,11 @@ typedef struct {
 #ifndef HW_FLAT_STEAL
 #define HW_FLAT_STEAL 1
 #endif
-#if HW_SLAVE_WALLS
-#undef HW_FLAT_STEAL
-#define HW_FLAT_STEAL 0
-#endif
+/* With HW_SLAVE_WALLS the slave may not have emitted a deferred visit's
+ * walls yet when the master steals: HW_DeferCloseSub marks such m ranges
+ * with this (2026-11-18; before, SLAVE_WALLS forced HW_FLAT_STEAL off,
+ * which cost E1M8 its steal/split balance). */
+#define HW_RANGE_PENDING 0xFFFFu
 #define HW_STEAL_FAR   0x4000u   /* "no limit": far beyond any frame's job count */
 #define HW_STEAL_SNAPS 64        /* master keeps solid-mask snapshots of the last N jobs */
 
