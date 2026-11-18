@@ -601,6 +601,20 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitSubSolidMask(void)
     return touched_words;
 }
 
+#if HW_ASM_RESCAN
+/* saturn_hw_asm.s; bit-identical to the C below (HW_AP_HALF=0 only). */
+extern void hw_asm_rescan(uint32_t touched, const uint32_t *solid_mask,
+                          hw_ap_word_t *ap_words, const uint8_t *ytop);
+_Static_assert(offsetof(hw_aperture_state_t, ybot) - offsetof(hw_aperture_state_t, ytop) == 352,
+               "hw_asm_rescan assumes ybot = ytop + 352");
+_Static_assert(HW_VIEW_W == 320 && HW_AP_HALF == 0, "hw_asm_rescan assumes 10x32 full-res columns");
+HW_ALWAYS_INLINE void HW_RescanApertureWords(uint32_t touched_words)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    ap->dirty_words |= touched_words;
+    hw_asm_rescan(touched_words, hw_solid_mask, hw_ap_words, ap->ytop);
+}
+#else
 static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
@@ -686,6 +700,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
         aw->yb_min = (int16_t)min_yb;
     }
 }
+#endif /* HW_ASM_RESCAN */
 
 static HW_NOINLINE HW_COLD_OS int HW_CommitPortalClosedWord(int w, uint32_t newly_closed)
 {

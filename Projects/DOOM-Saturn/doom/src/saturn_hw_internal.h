@@ -75,6 +75,20 @@ static inline unsigned short Saturn_HW_ReadFRT(void)
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
+/* HW_ASM (2026-11-18): hand-written SH-2 kernels in saturn_hw_asm.s replace
+ * hot renderer functions (bit-identical). Saturn only; per-kernel switches
+ * HW_ASM_<NAME> default to HW_ASM. */
+#ifndef HW_ASM
+#if defined(_MSC_VER) || !defined(SATURN)
+#define HW_ASM 0
+#else
+#define HW_ASM 1
+#endif
+#endif
+#ifndef HW_ASM_RESCAN
+#define HW_ASM_RESCAN HW_ASM
+#endif
+
 /* HW_SLAVE_WALLS (2026-11-16): the slave SH-2 also emits deferred walls
  * (pass 2 of HW_DEFER_WALLS) from its own copy of the emitters
  * (saturn_hw_slave_walls.c), taking subsectors whenever its flat queue is

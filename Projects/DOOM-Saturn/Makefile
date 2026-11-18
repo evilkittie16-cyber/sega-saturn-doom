@@ -145,8 +145,8 @@ CCFLAGS += -ffunction-sections
 LDFILE := ./doom_hot.linker
 endif
 
-OBJS += doom/src/saturn_draw.o
-game.elf: doom/src/saturn_draw.o
+OBJS += doom/src/saturn_draw.o doom/src/saturn_hw_asm.o
+game.elf: doom/src/saturn_draw.o doom/src/saturn_hw_asm.o
 
 CCFLAGS_OPT = $(filter-out -Os,$(CCFLAGS)) -O2
 
@@ -208,6 +208,8 @@ doom/src/i_wad.o: doom/src/i_wad.c
 doom/src/d32xr_stubs.o: doom/src/d32xr_stubs.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) $(DIVLUT_DEFS) -ffixed-r2 -ffixed-r3 -ffixed-r6 -ffixed-r7 -o $@
 doom/src/saturn_draw.o: doom/src/saturn_draw.s
+	$(CC) $< $(DFLAGS) -c -o $@
+doom/src/saturn_hw_asm.o: doom/src/saturn_hw_asm.s
 	$(CC) $< $(DFLAGS) -c -o $@
 
 # Replace the jo_engine_makefile's broken `$(TARGET2):` rule.
