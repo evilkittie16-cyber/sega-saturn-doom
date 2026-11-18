@@ -120,10 +120,23 @@ int saturn_tex_dirty = 1;
 #define SATURN_HRAM_BASE   (SATURN_WRAM_L_BASE + 0x00080000u)
 #define SATURN_HRAM_SIZE   0x00080000u
 #define SATURN_RTBL_SIZE   0x10000u
-#define SATURN_HWRAM_WANT  49152u
+/* High WRAM texture/flat/sprite source tier (hw_base, tried before the
+ * 16-bit Low WRAM tier and the very slow RAM cart). 2026-11-18: Jo 2026.1
+ * gives jo_malloc the High WRAM between its work area and the stack
+ * (zone 2, 0x060D5F00..0x060FBC00, ~138 KB free in game), so a large tier
+ * fits there; see SATURN_T0_OFF. */
+#ifndef SATURN_HWRAM_WANT
+#define SATURN_HWRAM_WANT  114688u   /* 112 KB (2026-11-18; was 48 KB with the tier off) */
+#endif
 
+/* T0 = the High WRAM tier. ON since 2026-11-18 (5thPlanet, 12 static views
+ * pixel-identical and 0.1-0.5 ms faster; turning with SATURN_FLAT_FASTCOPY:
+ * courtyard 33.7 -> 26.8 ms/frame, E1M7 26.1 -> 22.7, E1M2 start 39.2 -> 36.5). */
 #ifndef SATURN_T0_OFF
-#define SATURN_T0_OFF 1
+#define SATURN_T0_OFF 0
+#endif
+#ifndef SATURN_FLAT_FASTCOPY
+#define SATURN_FLAT_FASTCOPY 1
 #endif
 #ifndef SATURN_T1_OFF
 #define SATURN_T1_OFF 0
@@ -751,7 +764,24 @@ byte *Saturn_FlatDataExact(int f)
     if (!flat_cache[f])
     {
         if (flatpixels && flatpixels[f].data[0]) {
-            flat_cache[f] = (byte *)flatpixels[f].data[0];
+            byte *src = (byte *)flatpixels[f].data[0];
+#if !defined(SATURN_WIN32) && SATURN_FLAT_FASTCOPY
+            /* 2026-11-18: flatpixels live in the zone = the RAM cart
+             * (A-bus, ~23 cycles per access); the warp-texture and flat-
+             * variant builders read flat texels one by one while the
+             * player turns. Keep a copy in the fast tier (High WRAM, else
+             * Low WRAM) for the level. */
+            if (((uint32_t)src & 0x07000000u) == 0x02000000u)
+            {
+                byte *dst = (byte *)hram_alloc(4096);
+                if (dst)
+                {
+                    D_memcpy(dst, src, 4096);
+                    src = dst;
+                }
+            }
+#endif
+            flat_cache[f] = src;
             return flat_cache[f];
         }
 
