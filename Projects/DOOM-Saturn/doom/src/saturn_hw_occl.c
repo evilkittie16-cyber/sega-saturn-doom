@@ -644,20 +644,61 @@ extern void hw_asm_rescan(uint32_t touched, const uint32_t *solid_mask,
 _Static_assert(offsetof(hw_aperture_state_t, ybot) - offsetof(hw_aperture_state_t, ytop) == 352,
                "hw_asm_rescan assumes ybot = ytop + 352");
 _Static_assert(HW_VIEW_W == 320 && HW_AP_HALF == 0, "hw_asm_rescan assumes 10x32 full-res columns");
+#if HW_ASM_CHECK
+/* Check build: C reference into a scratch copy. [0] calls, [1] mismatching
+ * calls, [2] first touched mask, [3] first bad word, [4..5] C / asm words. */
+static void HW_RescanApertureWords_C(uint32_t touched_words, hw_ap_word_t *out);
+static volatile uint32_t hw_asm_chk_rescan[8];
+#endif
 HW_ALWAYS_INLINE void HW_RescanApertureWords(uint32_t touched_words)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     ap->dirty_words |= touched_words;
+#if HW_ASM_CHECK
+    hw_ap_word_t ref[HW_SOLID_WORDS];
+    memcpy(ref, hw_ap_words, sizeof(ref));
+    HW_RescanApertureWords_C(touched_words, ref);
+#endif
     hw_asm_rescan(touched_words, hw_solid_mask, hw_ap_words, ap->ytop);
+#if HW_ASM_CHECK
+    hw_asm_chk_rescan[0]++;
+    for (int w = 0; w < HW_SOLID_WORDS; w++)
+    {
+        if (memcmp(&ref[w], &hw_ap_words[w], sizeof(hw_ap_word_t)) != 0)
+        {
+            if (hw_asm_chk_rescan[1]++ == 0)
+            {
+                const uint32_t *c = (const uint32_t *)&ref[w];
+                const uint32_t *a = (const uint32_t *)&hw_ap_words[w];
+                hw_asm_chk_rescan[2] = touched_words;
+                hw_asm_chk_rescan[3] = (uint32_t)w;
+                hw_asm_chk_rescan[4] = c[0];
+                hw_asm_chk_rescan[5] = c[1];
+                hw_asm_chk_rescan[6] = a[0];
+                hw_asm_chk_rescan[7] = a[1];
+            }
+            break;
+        }
+    }
+#endif
 }
+#define HW_RESCAN_C_SIG static void HW_RescanApertureWords_C(uint32_t touched_words, hw_ap_word_t *out_words)
 #else
-static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
+#define HW_RESCAN_C_SIG static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
+#endif
+#if !HW_ASM_RESCAN || HW_ASM_CHECK
+HW_RESCAN_C_SIG
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     const int vw = HW_VIEW_W;
     const int vh = saturn_view_h;
     const int req_words = (HW_VIEW_W + 31) >> 5;
+#if HW_ASM_RESCAN
+    hw_ap_word_t *aw_base = out_words;   /* check build: scratch copy */
+#else
+    hw_ap_word_t *aw_base = hw_ap_words;
     ap->dirty_words |= touched_words;
+#endif
     const uint8_t * __restrict ytop = ap->ytop;
     const uint8_t * __restrict ybot = ap->ybot;
 
@@ -666,7 +707,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
         uint32_t wbit = hw_bit_lut[w];
         if (!(touched_words & wbit))
             continue;
-        hw_ap_word_t *aw = &hw_ap_words[w];
+        hw_ap_word_t *aw = &aw_base[w];
         uint32_t sm = hw_solid_mask[w];
         if (sm == 0xFFFFFFFFu)
         {
@@ -736,7 +777,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
         aw->yb_min = (int16_t)min_yb;
     }
 }
-#endif /* HW_ASM_RESCAN */
+#endif /* !HW_ASM_RESCAN || HW_ASM_CHECK */
 
 static HW_NOINLINE HW_COLD_OS int HW_CommitPortalClosedWord(int w, uint32_t newly_closed)
 {

@@ -3163,6 +3163,55 @@ static HW_NOINLINE HW_HOT_O2 void HW_WalkSubsectorBakedSegs(
     }
 }
 
+#ifndef HW_ASM_WALK
+#define HW_ASM_WALK (HW_ASM && HW_ASM_SPANAP && !HW_DEFER_WALLS && !HW_VIS_STATS && !HW_WALL_TINY)
+#endif
+#if HW_ASM_WALK
+/* Compact rewrite stage A: seg walk + pillar projection/cull + the front of
+ * HW_EmitVisibleBakedSeg in saturn_hw_asm.s (hw_asm_walk); layout there. */
+extern void hw_asm_walk(const baked_seg_t *seg, const baked_seg_t *seg_end,
+                        const saturn_wl_pillar_t *pillars, const void *const *ctx);
+_Static_assert(!HW_DEFER_WALLS && !HW_VIS_STATS && !HW_WALL_TINY, "hw_asm_walk: default build only");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, needs_near_clip) == 7 &&
+               offsetof(hw_wall_emit_ctx_t, seg_sx) == 8 &&
+               offsetof(hw_wall_emit_ctx_t, ya0) == 16 &&
+               offsetof(hw_wall_emit_ctx_t, wall_h) == 28 &&
+               offsetof(hw_wall_emit_ctx_t, cur_v) == 30 &&
+               offsetof(hw_wall_emit_ctx_t, sec_ceiling) == 32 &&
+               offsetof(hw_wall_emit_ctx_t, p0) == 40 &&
+               offsetof(hw_wall_emit_ctx_t, seg) == 48 &&
+               offsetof(hw_wall_emit_ctx_t, dz_top) == 52 &&
+               offsetof(hw_wall_emit_ctx_t, dz_bot) == 56, "hw_asm_walk: hw_wctx layout");
+_Static_assert(sizeof(baked_seg_t) == 16 && offsetof(baked_seg_t, flags) == 3 &&
+               offsetof(baked_seg_t, tex_64) == 4 && offsetof(baked_seg_t, mid_static_v_offset) == 6 &&
+               offsetof(baked_seg_t, back_sec_idx) == 14, "hw_asm_walk: baked_seg_t layout");
+_Static_assert(sizeof(hw_trans_pillar_t) == 16 && offsetof(hw_trans_pillar_t, cz) == 4 &&
+               offsetof(hw_trans_pillar_t, s) == 8 && offsetof(hw_trans_pillar_t, px) == 12,
+               "hw_asm_walk: hw_trans_pillar_t layout");
+_Static_assert(offsetof(hw_frust_t, cz_origin) == 44 && offsetof(hw_frust_t, cx_origin) == 48,
+               "hw_asm_walk: hw_frust layout");
+_Static_assert(offsetof(hw_sec_fast_t, dz_floor) == 4 && offsetof(hw_sec_fast_t, is_sky) == 12,
+               "hw_asm_walk: hw_sec_fast_t layout");
+_Static_assert(HW_FAR_Z == (1 << 30) && HW_VIEW_W == 320, "hw_asm_walk: constants");
+
+static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx_Call(hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
+{
+    HW_EmitWallFromCtx(ctx, seg);
+}
+
+static const void *const hw_asm_walk_ctx[29] = {
+    &hw_wctx, &hw_cam_x, &hw_cam_y, local_trans_pillars,
+    hw_pil_gen, &hw_cur_pil_gen, &hw_cur_pfrac, &hw_frust,
+    saturn_master_oclut, hw_solid_mask, hw_mask_left, hw_mask_right,
+    hw_ap_words, &hw_solid_count, &hw_aperture_state, &saturn_view_h,
+    &saturn_view_cy, hw_sec_fast, &saturn_cmd_m_needs_ytrim, hw_asm_spanap_ctx,
+    (const void *)HW_TransformPillar_Shifted, (const void *)HW_CheckSpanOcclusion,
+    (const void *)HW_OccludeZeroHeightSeg, (const void *)HW_ClipSegNearPlane,
+    (const void *)HW_MarkSubSolidSpan, (const void *)HW_RecordSegPortalAperture,
+    (const void *)HW_EmitWallFromCtx_Call, &hw_p0_clipped, &hw_p1_clipped
+};
+#endif /* HW_ASM_WALK */
+
 /* Master Blueprint: Zero-Runtime-Math 1D LOD Subsector Wall Renderer (Phase 3)
  * Fast Culling & Pillar Projection Loop (< 400 bytes, zero register spills):
  * rejects ~72% of segs in registers and dispatches surviving visible segs to HW_EmitVisibleBakedSeg. */
@@ -3228,7 +3277,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
     hw_wctx.ytop_min     = 0;
     hw_wctx.ybot_max     = (int16_t)HW_VIEW_H;
 
+#if HW_ASM_WALK
+    hw_asm_walk(seg, seg_end, pillars, hw_asm_walk_ctx);
+#else
     HW_WalkSubsectorBakedSegs(seg, seg_end, pillars);
+#endif
 #if HW_PROF_SUBTIMERS
     unsigned short tw1 = SAT_FRT();
     hw_prof_wseg_acc += HW_ProfDelta(tw0, tw1);
