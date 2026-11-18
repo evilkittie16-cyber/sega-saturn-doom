@@ -2615,7 +2615,8 @@ static unsigned int v1_warp_used_of(int slot)
  * (HW_WarpService skips the corner work when there isn't). */
 int Saturn_Vdp1_WarpRoom(int bytes)
 {
-    return v1_tag[0] && v1_free_total() >= (unsigned int)bytes + V1_WARP_RESERVE && v1_warp_budget >= bytes;
+    return v1_tag[0] && v1_free_total() >= (unsigned int)bytes + V1_WARP_RESERVE &&
+           (v1_warp_budget >= bytes || v1_warp_budget >= V1_WARP_BUDGET);
 }
 
 /* Called once per rendered 3D frame (saturn_hw_render.c frame setup),
@@ -2680,7 +2681,10 @@ int Saturn_Vdp1_GetWarpSrca(int quad, int is_ceil, int flatnum, int lv,
         (uint16_t)(saturn_warp_frame - e->made) <= 3u)
         return (int)tag->srca;  /* re-made under 4 frames ago: keep it (only one
                                  * previous copy stays protected, srca_mono) */
-    if (v1_warp_budget < w * h)
+    /* An untouched budget always allows one texture, even one bigger than
+     * the budget (2026-11-18: with a budget below the largest piece, e.g.
+     * 2048 < 64x64, near pieces were never refined and stayed coarse). */
+    if (v1_warp_budget < w * h && v1_warp_budget < V1_WARP_BUDGET)
     {
         saturn_v1_warp_miss++; saturn_v1_warp_miss_b++;
         return 0;
