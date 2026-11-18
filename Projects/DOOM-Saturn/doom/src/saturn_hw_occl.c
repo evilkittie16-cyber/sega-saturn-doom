@@ -393,7 +393,42 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int y
     }
 }
 
-static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
+#if HW_ASM_SPANAP
+/* saturn_hw_asm.s; layout documented there. */
+extern int hw_asm_spanap(int sx, int ex, const void *const *ctx);
+static const void *const hw_asm_spanap_ctx[8] = {
+    hw_solid_mask, hw_ap_words, hw_aperture_state.ytop,
+    &hw_aperture_state.dirty_words, &hw_solid_summary,
+    hw_mask_left, hw_mask_right, &saturn_view_h
+};
+#if HW_ASM_CHECK
+/* Check build: run the C reference too. [0] calls, [1] mismatches,
+ * [2..5] first mismatch sx, ex, C result, asm result. */
+static int HW_GetSpanAperture_C(int sx, int ex);
+static volatile uint32_t hw_asm_chk_spanap[8];
+#endif
+HW_ALWAYS_INLINE int HW_GetSpanAperture(int sx, int ex)
+{
+    int r = hw_asm_spanap(sx, ex, hw_asm_spanap_ctx);
+#if HW_ASM_CHECK
+    int c = HW_GetSpanAperture_C(sx, ex);
+    hw_asm_chk_spanap[0]++;
+    if (r != c && hw_asm_chk_spanap[1]++ == 0)
+    {
+        hw_asm_chk_spanap[2] = (uint32_t)sx;
+        hw_asm_chk_spanap[3] = (uint32_t)ex;
+        hw_asm_chk_spanap[4] = (uint32_t)c;
+        hw_asm_chk_spanap[5] = (uint32_t)r;
+    }
+#endif
+    return r;
+}
+#define HW_SPANAP_C_NAME HW_GetSpanAperture_C
+#else
+#define HW_SPANAP_C_NAME HW_GetSpanAperture
+#endif
+#if !HW_ASM_SPANAP || HW_ASM_CHECK
+static HW_NOINLINE HW_HOT_O2 int HW_SPANAP_C_NAME(int sx, int ex)
 {
     const hw_aperture_state_t *ap = HW_APERTURE;
     int ex_m1 = ex - 1;
@@ -553,6 +588,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
     }
     return (yt_min >= yb_max) ? -1 : ((yt_min << 16) | (uint16_t)yb_max);
 }
+#endif /* !HW_ASM_SPANAP || HW_ASM_CHECK */
 
 static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitSubSolidMask(void)
 {

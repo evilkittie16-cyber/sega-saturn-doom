@@ -85,8 +85,19 @@ static inline unsigned short Saturn_HW_ReadFRT(void)
 #define HW_ASM 1
 #endif
 #endif
+#ifndef HW_ASM_CHECK
+#define HW_ASM_CHECK 0   /* 1: run C beside each asm kernel, count mismatches */
+#endif
 #ifndef HW_ASM_RESCAN
 #define HW_ASM_RESCAN HW_ASM
+#endif
+#ifndef HW_ASM_SPANAP
+#define HW_ASM_SPANAP HW_ASM
+#endif
+#ifndef HW_ASM_SUBAP
+/* Off: verified bit-identical, but the asm front half + C tail split was a
+ * net loss (master busy w +0.16, p2 +0.19, m1a +0.09 ms vs off, 2026-11-18). */
+#define HW_ASM_SUBAP 0
 #endif
 
 /* HW_SLAVE_WALLS (2026-11-16): the slave SH-2 also emits deferred walls

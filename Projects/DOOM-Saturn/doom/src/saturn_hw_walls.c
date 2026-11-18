@@ -3939,8 +3939,147 @@ static HW_NOINLINE HW_COLD_OS int HW_CheckPortalSubsectorStepCull(
     return 1;
 }
 
+#if HW_ASM_SUBAP
+/* Front half in saturn_hw_asm.s (hw_asm_subap); layout documented there. */
+typedef struct {
+    int32_t max_cz, s_max, s_min, ytop_min, ybot_max, sx, ex, flags;
+} hw_subap_out_t;
+extern int hw_asm_subap(const saturn_flat_bbox_t *fb, int fully_inside,
+                        hw_subap_out_t *o, const void *const *ctx);
+_Static_assert(offsetof(hw_frust_t, Nx) == 12 && offsetof(hw_frust_t, Ny) == 14 &&
+               offsetof(hw_frust_t, cz_off12) == 36 && offsetof(hw_frust_t, cx_off12) == 40,
+               "hw_asm_subap hw_frust offsets");
+_Static_assert(offsetof(hw_aperture_state_t, aperture_active) == 2 &&
+               offsetof(hw_aperture_state_t, cur_ytop_min) == 20, "hw_asm_subap ap offsets");
+#ifndef HW_LOD1_MIN_A   /* same defaults as in HW_CheckSubsectorAperture_C */
+#define HW_LOD1_MIN_A 192
+#define HW_LOD1_MAX_A 240
+#define HW_LOD1_MIN_B 132
+#define HW_LOD1_MAX_B 336
+#endif
+_Static_assert(HW_NEAR_Z_UNITS == 4 && HW_FAR_Z_UNITS == 16384 && HW_VIEW_CX == 160 &&
+               HW_DBG_FLAT_LOD && HW_LOD1_MIN_A == 192 && HW_LOD1_MAX_A == 240 &&
+               HW_LOD1_MIN_B == 132 && HW_LOD1_MAX_B == 336,
+               "hw_asm_subap constants");
+static const void *const hw_asm_subap_ctx[11] = {
+    &hw_cam_x, &hw_cam_y, &hw_frust, saturn_master_oclut, &hw_solid_count,
+    &hw_aperture_state, hw_solid_mask, hw_mask_left, hw_mask_right,
+    hw_ap_words, &saturn_view_h
+};
+
+static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture_A(int subnum, hw_sec_fast_t *sf, int fully_inside)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    const saturn_flat_bbox_t *fb = saturn_baked_flat_bboxes ? &saturn_baked_flat_bboxes[subnum] : NULL;
+    hw_subap_out_t o;
+    int r = hw_asm_subap(fb, fully_inside, &o, hw_asm_subap_ctx);
+    if (r <= 0)
+    {
+        if (r < 0)
+            return -1;
+        int vh = HW_VIEW_H;
+        ap->cur_sub_yt_attach = 0;
+        ap->cur_sub_yb_attach = (int16_t)vh;
+        ap->cur_sub_ytop      = 0;
+        ap->cur_sub_ybot      = (uint8_t)vh;
+        return fully_inside | (int)HW_FLAT_ALLOW_BOTH;
+    }
+    if (__builtin_expect(r >= 2, 0))
+    {
+        if (r == 2)
+        {
+            if (!HW_CheckNearSubsectorFrustum(fb))
+                return -1;
+        }
+        else
+        {
+            int ap_pack = HW_EvalSubsectorSpanSlow(o.sx, o.ex);
+            if (ap_pack < 0)
+                return -1;
+            o.ytop_min = ap_pack >> 16;
+            o.ybot_max = (int16_t)ap_pack;
+        }
+    }
+    int ytop_min = o.ytop_min;
+    int ybot_max = o.ybot_max;
+    int s_max = o.s_max;
+    int s_min = o.s_min;
+    int any_behind = (o.flags >> 8) & 1;
+    uint32_t keep = (uint32_t)o.flags & (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK);
+
+    /* == the tail of HW_CheckSubsectorAperture_C below */
+    int vh = HW_VIEW_H;
+    ap->cur_sub_yt_attach = 0;
+    ap->cur_sub_yb_attach = (int16_t)vh;
+    ap->cur_sub_ytop      = 0;
+    ap->cur_sub_ybot      = (uint8_t)vh;
+    ap->cur_ytop_min      = (int16_t)ytop_min;
+    ap->cur_ybot_max      = (int16_t)ybot_max;
+    int check_ap = 0;
+    if (ytop_min > 0 || ybot_max < vh)
+    {
+        int pad = (s_max < 8192) ? 1 : 2;
+        check_ap = 1;
+        ap->cur_sub_ytop = (ytop_min > pad) ? (uint8_t)(ytop_min - pad) : 0;
+        ap->cur_sub_ybot = (ybot_max + pad < vh) ? (uint8_t)(ybot_max + pad) : (uint8_t)vh;
+    }
+
+    int near_or_psec = (any_behind || sf == hw_psec_fast);
+    if (__builtin_expect((check_ap || near_or_psec) && !s_min, 0))
+        s_min = HW_FastDiv(o.max_cz);
+
+    uint32_t packed = (near_or_psec ? HW_FLAT_NEAR_OR_PSEC : 0u) |
+                      (check_ap     ? HW_FLAT_CHECK_AP     : 0u) | keep;
+    int flat_flags = HW_EvalSubsectorFlatAperture(sf, packed, s_max, s_min);
+    if (__builtin_expect(flat_flags >= 0 && check_ap && !near_or_psec &&
+                         !(flat_flags & (int)HW_FLAT_ALLOW_FLOOR) &&
+                         (sf->is_sky || !(flat_flags & (int)HW_FLAT_ALLOW_CEIL)), 0))
+    {
+        if (HW_CheckPortalSubsectorStepCull(subnum, sf, s_min))
+            return -1;
+    }
+    return flat_flags;
+}
+
+#if HW_ASM_CHECK
+/* Check build: C reference first, then asm (the shared flat/attach updates
+ * are monotone, so the second call sees the same inputs). [0] calls,
+ * [1] mismatches, [2..5] first mismatch subnum, C result, asm result,
+ * aperture-header diff. */
+static int HW_CheckSubsectorAperture_C(int subnum, hw_sec_fast_t *sf, int fully_inside);
+static volatile uint32_t hw_asm_chk_subap[8];
+static HW_NOINLINE int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int fully_inside)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    int c = HW_CheckSubsectorAperture_C(subnum, sf, fully_inside);
+    uint32_t h0[6];
+    memcpy(h0, ap, 24);
+    int a = HW_CheckSubsectorAperture_A(subnum, sf, fully_inside);
+    uint32_t h1[6];
+    memcpy(h1, ap, 24);
+    /* cur_sub_ytop/ybot (+0,+1), attaches (+4..7), cur_ytop_min/ybot_max (+20..23) */
+    uint32_t hd = (c >= 0) ? (((h0[0] ^ h1[0]) & 0xFFFF0000u) | (h0[1] ^ h1[1]) | (h0[5] ^ h1[5])) : 0;
+    hw_asm_chk_subap[0]++;
+    if ((a != c || hd) && hw_asm_chk_subap[1]++ == 0)
+    {
+        hw_asm_chk_subap[2] = (uint32_t)subnum;
+        hw_asm_chk_subap[3] = (uint32_t)c;
+        hw_asm_chk_subap[4] = (uint32_t)a;
+        hw_asm_chk_subap[5] = hd;
+    }
+    return a;
+}
+#else
+#define HW_CheckSubsectorAperture HW_CheckSubsectorAperture_A
+#endif
+#define HW_SUBAP_C_NAME HW_CheckSubsectorAperture_C
+#else
+#define HW_SUBAP_C_NAME HW_CheckSubsectorAperture
+#endif /* HW_ASM_SUBAP */
+
+#if !HW_ASM_SUBAP || HW_ASM_CHECK
 /* Walk a subsector: returns flat_flags = (fully_inside & 3) | ((allow_floor | (allow_ceil << 1) | use_lod1) << 2), or -1 if culled */
-static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int fully_inside)
+static HW_NOINLINE HW_HOT_O2 int HW_SUBAP_C_NAME(int subnum, hw_sec_fast_t *sf, int fully_inside)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     int default_flags = fully_inside | (int)HW_FLAT_ALLOW_BOTH;
@@ -4159,4 +4298,5 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fa
     }
     return flat_flags;
 }
+#endif /* !HW_ASM_SUBAP || HW_ASM_CHECK */
 
