@@ -4664,3 +4664,521 @@ _hw_asm_marksub:
 
 	.align	2
 .Lo_ctx:	.long	_hw_asm_occ_ctx
+! ===================================================================
+! hw_asm_subsec(subnum r4, sf r5, fully_inside r6) -> flat_flags or -1:
+! the whole HW_CheckSubsectorAperture (saturn_hw_walls.c, stage D1).
+! Front half = hw_asm_subap (out struct at @r15), then the tail and
+! HW_EvalSubsectorFlatAperture inline. Rare paths stay C. Table
+! hw_asm_subsec_ctx: [0] &saturn_baked_flat_bboxes [4] &hw_aperture_state
+! [8] &saturn_view_h [12] &saturn_view_cy [16] hw_asm_subap_ctx
+! [20] &hw_psec_fast [24] saturn_master_oclut
+! [28] HW_CheckNearSubsectorFrustum [32] HW_EvalSubsectorSpanSlow
+! [36] HW_CheckPortalSubsectorStepCull
+! regs: r9 sf, r10 ap, r11 s_max, r12 s_min, r13 fully_inside, then the
+! packed flat flags, r14 vh. frame: 0..31 subap out (0 max_cz 4 s_max
+! 8 s_min 12 ytop_min 16 ybot_max 20 sx 24 ex 28 flags), 32 subnum,
+! 36 fb, 40 pad, 56 vcy
+! Eval regs: r8 allow (bit0 floor, bit1 ceil), r6 yf_max, r7 yc_min,
+! r5 ytop_min, r4 ybot_max, r3 pad
+! ===================================================================
+	.align	2
+	.global	_hw_asm_subsec
+_hw_asm_subsec:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-60,r15
+	mov.l	r4,@(32,r15)
+	mov	r5,r9
+	mov	r6,r13
+	mov.l	.Lv_ctx,r7
+	mov.l	@(4,r7),r10		! ap
+	mov.l	@(8,r7),r0
+	mov.l	@r0,r14			! vh
+	mov.l	@(12,r7),r0
+	mov.l	@r0,r0
+	mov.l	r0,@(56,r15)		! vcy
+	mov.l	@r7,r0
+	mov.l	@r0,r0			! saturn_baked_flat_bboxes
+	tst	r0,r0
+	bt	.Lv_def
+	shll2	r4
+	add	r4,r4
+	add	r0,r4			! fb
+	mov.l	r4,@(36,r15)
+	mov	r13,r5
+	mov	r15,r6
+	mov.l	@(16,r7),r7		! hw_asm_subap_ctx
+	mov.l	.Lv_subap,r0
+	jsr	@r0
+	nop
+	cmp/pz	r0
+	bf	.Lv_cull
+	tst	r0,r0
+	bt	.Lv_def
+	mov	#2,r1
+	cmp/ge	r1,r0
+	bf	.Lv_tail
+	cmp/eq	r1,r0
+	bf	.Lv_slow
+	mov.l	.Lv_ctx,r0		! 2: HW_CheckNearSubsectorFrustum(fb)
+	mov.l	@(28,r0),r0
+	jsr	@r0
+	mov.l	@(36,r15),r4
+	tst	r0,r0
+	bt	.Lv_cull
+	bra	.Lv_tail
+	nop
+.Lv_slow:
+	mov.l	.Lv_ctx,r0		! 3: HW_EvalSubsectorSpanSlow(sx, ex)
+	mov.l	@(32,r0),r0
+	mov.l	@(20,r15),r4
+	jsr	@r0
+	mov.l	@(24,r15),r5
+	cmp/pz	r0
+	bf	.Lv_cull
+	mov	r0,r1
+	shlr16	r1			! ap_pack >> 16 (ap_pack >= 0)
+	mov.l	r1,@(12,r15)
+	exts.w	r0,r0
+	mov.l	r0,@(16,r15)
+	bra	.Lv_tail
+	nop
+.Lv_def:
+	mov	#0,r0
+	mov.w	r0,@(4,r10)		! cur_sub_yt_attach = 0
+	mov.b	r0,@r10			! cur_sub_ytop = 0
+	mov	r14,r0
+	mov.w	r0,@(6,r10)		! cur_sub_yb_attach = vh
+	mov.b	r0,@(1,r10)		! cur_sub_ybot = vh
+	mov	r13,r0
+	bra	.Lv_ret
+	or	#12,r0			! fully_inside | HW_FLAT_ALLOW_BOTH
+.Lv_cull:
+	bra	.Lv_ret
+	mov	#-1,r0
+! ---- tail ----
+.Lv_tail:
+	mov.l	@(4,r15),r11		! s_max
+	mov.l	@(8,r15),r12		! s_min
+	mov	#0,r0
+	mov.w	r0,@(4,r10)
+	mov.b	r0,@r10
+	mov	r14,r0
+	mov.w	r0,@(6,r10)
+	mov.b	r0,@(1,r10)
+	mov.l	@(12,r15),r1		! ytop_min
+	mov.l	@(16,r15),r2		! ybot_max
+	mov	#20,r0
+	mov.w	r1,@(r0,r10)		! cur_ytop_min
+	mov	#22,r0
+	mov.w	r2,@(r0,r10)		! cur_ybot_max
+	mov	#32,r0
+	shll8	r0			! 8192
+	cmp/ge	r0,r11
+	movt	r3
+	add	#1,r3			! pad = s_max < 8192 ? 1 : 2
+	mov.l	r3,@(40,r15)
+	mov.l	@(28,r15),r0
+	and	#0x13,r0		! keep = USE_LOD1 | INSIDE_MASK
+	mov	r0,r13
+	cmp/pl	r1
+	bt	.Lv_ap
+	cmp/gt	r2,r14
+	bf	.Lv_noap
+.Lv_ap:
+	mov	#1,r0
+	shll8	r0
+	or	r0,r13			! HW_FLAT_CHECK_AP
+	mov	r1,r0
+	sub	r3,r0
+	cmp/gt	r3,r1
+	bt	.Lv_ap1
+	mov	#0,r0
+.Lv_ap1:
+	mov.b	r0,@r10			! cur_sub_ytop
+	mov	r2,r0
+	add	r3,r0
+	cmp/gt	r0,r14
+	bt	.Lv_ap2
+	mov	r14,r0
+.Lv_ap2:
+	mov.b	r0,@(1,r10)		! cur_sub_ybot
+.Lv_noap:
+	mov.l	@(28,r15),r0
+	shlr8	r0
+	tst	#1,r0			! any_behind
+	bf	.Lv_nop
+	mov.l	.Lv_ctx,r0
+	mov.l	@(20,r0),r0
+	mov.l	@r0,r0			! hw_psec_fast
+	cmp/eq	r9,r0
+	bf	.Lv_nop0
+.Lv_nop:
+	mov	#2,r0
+	shll8	r0
+	or	r0,r13			! HW_FLAT_NEAR_OR_PSEC
+.Lv_nop0:
+	tst	r12,r12
+	bf	.Lv_ev
+	mov	r13,r0
+	shlr8	r0
+	tst	#3,r0
+	bt	.Lv_ev
+	bsr	.Lv_div
+	mov.l	@r15,r0			! s_min = HW_FastDiv(max_cz)
+	mov	r0,r12
+! ---- HW_EvalSubsectorFlatAperture(sf, r13, s_max, s_min) ----
+.Lv_ev:
+	mov	r13,r0
+	shlr8	r0
+	tst	#3,r0
+	bf	.Lv_full
+	mov.l	@(4,r9),r1		! dz_floor
+	cmp/pz	r1
+	bt	.Lv_f1
+	bsr	.Lv_py
+	mov	r11,r2			! yf_max
+	cmp/gt	r14,r0
+	bf	.Lv_f0
+	mov	r14,r0
+.Lv_f0:
+	mov	r0,r1
+	mov.w	@(10,r9),r0
+	cmp/gt	r0,r1
+	bf	.Lv_f0b
+	mov	r1,r0
+	mov.w	r0,@(10,r9)
+.Lv_f0b:
+	bra	.Lv_f2
+	mov.w	r0,@(6,r10)
+.Lv_f1:
+	mov.w	@(10,r9),r0
+	mov.w	r0,@(6,r10)
+.Lv_f2:
+	mov.b	@(12,r9),r0
+	tst	r0,r0
+	bf	.Lv_fsky
+	mov.l	@r9,r1			! dz_ceil
+	cmp/pl	r1
+	bf	.Lv_fnc
+	bsr	.Lv_py
+	mov	r11,r2			! yc_min
+	cmp/pz	r0
+	bt	.Lv_f3
+	mov	#0,r0
+.Lv_f3:
+	mov	r0,r1
+	mov.w	@(8,r9),r0
+	cmp/gt	r1,r0
+	bf	.Lv_f3b
+	mov	r1,r0
+	mov.w	r0,@(8,r9)
+.Lv_f3b:
+	bra	.Lv_fret
+	mov.w	r0,@(4,r10)
+.Lv_fnc:
+	mov.w	@(8,r9),r0
+	bra	.Lv_fret
+	mov.w	r0,@(4,r10)
+.Lv_fsky:
+	mov	#0,r0
+	mov.w	r0,@(4,r10)
+.Lv_fret:
+	mov	r13,r0
+	and	#0x13,r0
+	bra	.Lv_evd
+	or	#12,r0
+.Lv_full:
+	mov	#3,r8
+	mov	r14,r6			! yf_max = vh
+	mov	#0,r7			! yc_min = 0
+	mov	#20,r0
+	mov.w	@(r0,r10),r5		! ytop_min
+	mov	#22,r0
+	mov.w	@(r0,r10),r4		! ybot_max
+	mov.l	@(40,r15),r3		! pad
+	mov.l	@(4,r9),r1		! dz_floor
+	cmp/pz	r1
+	bt	.Lv_flnn
+	mov	r13,r0
+	shlr8	r0
+	tst	#2,r0
+	bf	.Lv_flnop
+	bsr	.Lv_py
+	mov	r11,r2
+	mov	r0,r6			! yf_max
+	cmp/gt	r14,r0
+	bf	.Lv_fa1
+	mov	r14,r0
+.Lv_fa1:
+	mov	r0,r2
+	mov.w	@(10,r9),r0
+	cmp/gt	r0,r2
+	bf	.Lv_fa2
+	mov	r2,r0
+	mov.w	r0,@(10,r9)
+.Lv_fa2:
+	mov.w	r0,@(6,r10)
+	mov	r13,r0
+	shlr8	r0
+	tst	#1,r0
+	bt	.Lv_fldone
+	mov.l	@(4,r9),r1
+	bsr	.Lv_py
+	mov	r12,r2			! yf_min
+	cmp/ge	r4,r0
+	bt	.Lv_flkill
+	mov	r6,r0
+	add	r3,r0
+	cmp/gt	r5,r0
+	bt	.Lv_fldone
+	bra	.Lv_flkill
+	nop
+.Lv_flnop:
+	mov	r14,r0
+	mov.w	r0,@(10,r9)		! sf->yb_attach = vh
+	bsr	.Lv_py
+	mov	r12,r2			! yf_min
+	cmp/ge	r4,r0
+	bf	.Lv_fb1
+	mov	#-2,r0
+	and	r0,r8
+.Lv_fb1:
+	mov	r13,r0
+	shlr8	r0
+	tst	#1,r0
+	bt	.Lv_fldone
+	mov.l	@(4,r9),r1
+	bsr	.Lv_py
+	mov	r11,r2
+	mov	r0,r6			! yf_max
+	add	r3,r0
+	cmp/gt	r5,r0
+	bt	.Lv_fldone
+.Lv_flkill:
+	mov	#-2,r0
+	bra	.Lv_fldone
+	and	r0,r8
+.Lv_flnn:
+	mov	r13,r0
+	shlr8	r0
+	tst	#2,r0
+	bf	.Lv_fldone
+	mov.w	@(10,r9),r0
+	mov.w	r0,@(6,r10)
+.Lv_fldone:
+	mov.b	@(12,r9),r0
+	tst	r0,r0
+	bf	.Lv_csky
+	mov.l	@r9,r1			! dz_ceil
+	cmp/pl	r1
+	bf	.Lv_cnp
+	mov	r13,r0
+	shlr8	r0
+	tst	#2,r0
+	bf	.Lv_cnop
+	bsr	.Lv_py
+	mov	r11,r2
+	mov	r0,r7			! yc_min
+	cmp/pz	r0
+	bt	.Lv_ca1
+	mov	#0,r0
+.Lv_ca1:
+	mov	r0,r2
+	mov.w	@(8,r9),r0
+	cmp/gt	r2,r0
+	bf	.Lv_ca2
+	mov	r2,r0
+	mov.w	r0,@(8,r9)
+.Lv_ca2:
+	mov.w	r0,@(4,r10)
+	mov	r13,r0
+	shlr8	r0
+	tst	#1,r0
+	bt	.Lv_cdone
+	mov.l	@r9,r1
+	bsr	.Lv_py
+	mov	r12,r2			! yc_max
+	cmp/gt	r5,r0
+	bf	.Lv_ckill
+	mov	r7,r0
+	sub	r3,r0
+	cmp/ge	r4,r0
+	bt	.Lv_ckill
+	bra	.Lv_cdone
+	nop
+.Lv_cnop:
+	mov	#0,r0
+	mov.w	r0,@(8,r9)		! sf->yt_attach = 0
+	bsr	.Lv_py
+	mov	r12,r2			! yc_max
+	cmp/gt	r5,r0
+	bt	.Lv_cb1
+	mov	#-3,r0
+	and	r0,r8
+.Lv_cb1:
+	mov	r13,r0
+	shlr8	r0
+	tst	#1,r0
+	bt	.Lv_cdone
+	mov.l	@r9,r1
+	bsr	.Lv_py
+	mov	r11,r2
+	mov	r0,r7			! yc_min
+	sub	r3,r0
+	cmp/ge	r4,r0
+	bf	.Lv_cdone
+.Lv_ckill:
+	mov	#-3,r0
+	bra	.Lv_cdone
+	and	r0,r8
+.Lv_cnp:
+	mov	r13,r0
+	shlr8	r0
+	tst	#2,r0
+	bf	.Lv_cdone
+	mov.w	@(8,r9),r0
+	bra	.Lv_cdone
+	mov.w	r0,@(4,r10)
+.Lv_csky:
+	mov	r13,r0
+	shlr8	r0
+	tst	#2,r0
+	bf	.Lv_cdone
+	mov	#0,r0
+	mov.w	r0,@(4,r10)
+.Lv_cdone:
+	mov	r13,r0
+	shlr8	r0
+	tst	#1,r0
+	bt	.Lv_evret
+	mov.l	@(4,r9),r1		! dz_floor
+	cmp/pz	r1
+	bt	.Lv_s1
+	bra	.Lv_s2
+	mov	r6,r0			! sub_y_max = yf_max
+.Lv_s1:
+	cmp/pl	r1
+	bt/s	.Lv_s1b
+	mov	r12,r2
+	mov	r11,r2
+.Lv_s1b:
+	bsr	.Lv_py
+	nop
+.Lv_s2:
+	add	r3,r0
+	cmp/gt	r5,r0
+	bf	.Lv_evcull
+	mov.b	@(12,r9),r0
+	tst	r0,r0
+	bf	.Lv_evret
+	mov.l	@r9,r1			! dz_ceil
+	cmp/pl	r1
+	bf	.Lv_s3
+	bra	.Lv_s4
+	mov	r7,r0			! sub_y_min = yc_min
+.Lv_s3:
+	cmp/pz	r1
+	bf/s	.Lv_s3b
+	mov	r12,r2
+	mov	r11,r2
+.Lv_s3b:
+	bsr	.Lv_py
+	nop
+.Lv_s4:
+	sub	r3,r0
+	cmp/ge	r4,r0
+	bt	.Lv_evcull
+.Lv_evret:
+	mov	r13,r0
+	and	#0x13,r0
+	shll2	r8
+	bra	.Lv_evd
+	or	r8,r0
+.Lv_evcull:
+	mov	#-1,r0
+! ---- step cull ----
+.Lv_evd:
+	cmp/pz	r0
+	bf	.Lv_ret
+	mov	r0,r8			! flat_flags
+	mov	r13,r0
+	shlr8	r0
+	and	#3,r0
+	cmp/eq	#1,r0			! check_ap && !near_or_psec
+	bf	.Lv_ret8
+	mov	r8,r0
+	tst	#4,r0			! ALLOW_FLOOR
+	bf	.Lv_ret8
+	mov.b	@(12,r9),r0
+	tst	r0,r0
+	bf	.Lv_sc
+	mov	r8,r0
+	tst	#8,r0			! ALLOW_CEIL
+	bf	.Lv_ret8
+.Lv_sc:
+	mov.l	.Lv_ctx,r0
+	mov.l	@(36,r0),r0
+	mov.l	@(32,r15),r4
+	mov	r9,r5
+	jsr	@r0
+	mov	r12,r6
+	tst	r0,r0
+	bf	.Lv_cull
+.Lv_ret8:
+	mov	r8,r0
+.Lv_ret:
+	add	#60,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+! r1 dz, r2 s -> r0 = vcy - hi32(dz * s); clobbers r2
+.Lv_py:
+	dmuls.l	r1,r2
+	mov.l	@(56,r15),r0
+	sts	mach,r2
+	rts
+	sub	r2,r0
+
+! HW_FastDiv: r0 = cz -> saturn_master_oclut[dist]; clobbers r1
+.Lv_div:
+	shlr16	r0
+	mov	#8,r1
+	shll8	r1			! 2048
+	cmp/hs	r1,r0
+	bt	.Lv_dfar
+.Lv_dlk:
+	shll2	r0
+	mov.l	.Lv_ctx,r1
+	mov.l	@(24,r1),r1
+	rts
+	mov.l	@(r0,r1),r0
+.Lv_dfar:
+	shlr2	r0
+	shlr	r0
+	mov	#1,r1
+	shll8	r1
+	shll2	r1
+	add	#-1,r1			! 1023
+	and	r1,r0
+	mov	#8,r1
+	shll8	r1
+	bra	.Lv_dlk
+	add	r1,r0
+
+	.align	2
+.Lv_ctx:	.long	_hw_asm_subsec_ctx
+.Lv_subap:	.long	_hw_asm_subap

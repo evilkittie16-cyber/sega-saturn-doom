@@ -3998,7 +3998,7 @@ static HW_NOINLINE HW_COLD_OS int HW_CheckNearSubsectorFrustum(const saturn_flat
 
 static const hw_sec_fast_t *hw_psec_fast = NULL;
 
-static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
+static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) int HW_EvalSubsectorFlatAperture(
     hw_sec_fast_t *sf, uint32_t flags, int s_max, int s_min)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
@@ -4198,7 +4198,13 @@ static HW_NOINLINE HW_COLD_OS int HW_CheckPortalSubsectorStepCull(
     return 1;
 }
 
-#if HW_ASM_SUBAP
+/* Compact rewrite stage D1: the whole HW_CheckSubsectorAperture (front
+ * half hw_asm_subap + tail + HW_EvalSubsectorFlatAperture) in
+ * saturn_hw_asm.s (hw_asm_subsec). */
+#ifndef HW_ASM_SUBSEC
+#define HW_ASM_SUBSEC (HW_ASM && HW_DBG_FLAT_LOD && !HW_ASM_SUBAP)
+#endif
+#if HW_ASM_SUBAP || HW_ASM_SUBSEC
 /* Front half in saturn_hw_asm.s (hw_asm_subap); layout documented there. */
 typedef struct {
     int32_t max_cz, s_max, s_min, ytop_min, ybot_max, sx, ex, flags;
@@ -4226,6 +4232,7 @@ static const void *const hw_asm_subap_ctx[11] = {
     hw_ap_words, &saturn_view_h
 };
 
+#if HW_ASM_SUBAP
 static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture_A(int subnum, hw_sec_fast_t *sf, int fully_inside)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
@@ -4331,13 +4338,62 @@ static HW_NOINLINE int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, 
 #else
 #define HW_CheckSubsectorAperture HW_CheckSubsectorAperture_A
 #endif
+#endif /* HW_ASM_SUBAP (_A) */
+#endif /* HW_ASM_SUBAP || HW_ASM_SUBSEC */
+
+#if HW_ASM_SUBSEC
+extern int hw_asm_subsec(int subnum, hw_sec_fast_t *sf, int fully_inside);
+_Static_assert(sizeof(saturn_flat_bbox_t) == 8 && offsetof(hw_sec_fast_t, is_sky) == 12 &&
+               offsetof(hw_aperture_state_t, cur_ybot_max) == 22 &&
+               HW_FLAT_CHECK_AP == 0x100 && HW_FLAT_NEAR_OR_PSEC == 0x200 &&
+               (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK) == 0x13 && HW_FLAT_ALLOW_BOTH == 12,
+               "hw_asm_subsec: layout");
+const void *const hw_asm_subsec_ctx[10] = {
+    &saturn_baked_flat_bboxes, &hw_aperture_state, &saturn_view_h, &saturn_view_cy,
+    hw_asm_subap_ctx, &hw_psec_fast, saturn_master_oclut,
+    (const void *)HW_CheckNearSubsectorFrustum, (const void *)HW_EvalSubsectorSpanSlow,
+    (const void *)HW_CheckPortalSubsectorStepCull
+};
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] subnum [3] C result [4] asm result
+ * [5] 1 = aperture header differs, 2 = sector entry differs */
+static int HW_CheckSubsectorAperture_C(int subnum, hw_sec_fast_t *sf, int fully_inside);
+static volatile uint32_t hw_asm_chk_subsec[8];
+static HW_NOINLINE int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int fully_inside)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    uint8_t a0[24], a1[24];
+    hw_sec_fast_t s0 = *sf, s1;
+    memcpy(a0, ap, 24);
+    int a = hw_asm_subsec(subnum, sf, fully_inside);
+    memcpy(a1, ap, 24);
+    s1 = *sf;
+    memcpy(ap, a0, 24);
+    *sf = s0;
+    int c = HW_CheckSubsectorAperture_C(subnum, sf, fully_inside);
+    uint32_t hd = (memcmp(a1, ap, 24) != 0 ? 1u : 0u) | (memcmp(&s1, sf, sizeof(s1)) != 0 ? 2u : 0u);
+    hw_asm_chk_subsec[0]++;
+    if ((a != c || hd) && hw_asm_chk_subsec[1]++ == 0)
+    {
+        hw_asm_chk_subsec[2] = (uint32_t)subnum;
+        hw_asm_chk_subsec[3] = (uint32_t)c;
+        hw_asm_chk_subsec[4] = (uint32_t)a;
+        hw_asm_chk_subsec[5] = hd;
+    }
+    return c;
+}
+#else
+#define HW_CheckSubsectorAperture hw_asm_subsec
+#endif
+#endif /* HW_ASM_SUBSEC */
+
+#if HW_ASM_SUBAP || HW_ASM_SUBSEC
 #define HW_SUBAP_C_NAME HW_CheckSubsectorAperture_C
 #else
 #define HW_SUBAP_C_NAME HW_CheckSubsectorAperture
-#endif /* HW_ASM_SUBAP */
+#endif
 
-#if !HW_ASM_SUBAP || HW_ASM_CHECK
-/* Walk a subsector: returns flat_flags = (fully_inside & 3) | ((allow_floor | (allow_ceil << 1) | use_lod1) << 2), or -1 if culled */
+#if !(HW_ASM_SUBAP || HW_ASM_SUBSEC) || HW_ASM_CHECK/* Walk a subsector: returns flat_flags = (fully_inside & 3) | ((allow_floor | (allow_ceil << 1) | use_lod1) << 2), or -1 if culled */
 static HW_NOINLINE HW_HOT_O2 int HW_SUBAP_C_NAME(int subnum, hw_sec_fast_t *sf, int fully_inside)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
