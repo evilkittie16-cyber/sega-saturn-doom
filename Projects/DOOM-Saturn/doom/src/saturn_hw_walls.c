@@ -1,4 +1,4 @@
-﻿/* saturn_hw_walls.c â€” 2D Map-Space AABB Frustum & 1D Solid-Span Culling,
+/* saturn_hw_walls.c â€” 2D Map-Space AABB Frustum & 1D Solid-Span Culling,
  * Subsector Pillar Pair Projection, Near-Plane Seg Clipper, 1D Vertical Strip
  * & Monolithic VDP1 Wall Quad Emitters, and Subsector Flat Aperture Evaluator.
  */
@@ -645,6 +645,30 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
                 (cur) -= w_;                                            \
     } while (0)
 
+/* Compact rewrite stage B2: HW_EmitWallStrips_Linear_General in assembly
+ * (saturn_hw_asm.s hw_asm_lingen, same arithmetic; the rare per-strip cases
+ * call the C helpers through this table). */
+#ifndef HW_ASM_LINGEN
+#define HW_ASM_LINGEN (HW_ASM && !HW_VIS_STATS)
+#endif
+#if HW_ASM_LINGEN
+extern void hw_asm_lingen(hw_wall_emit_ctx_t *ctx, int s_min, int s_max);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 &&
+               offsetof(hw_wall_emit_ctx_t, ybot_max) == 14 && offsetof(hw_wall_emit_ctx_t, yb0) == 20 &&
+               offsetof(hw_wall_emit_ctx_t, yb1) == 22 && offsetof(hw_wall_emit_ctx_t, p1) == 44 &&
+               offsetof(hw_wall_emit_ctx_t, rows) == 90 && offsetof(hw_wall_emit_ctx_t, inv_u_span) == 100 &&
+               offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
+               offsetof(hw_wall_emit_ctx_t, tw) == 68 && offsetof(hw_wall_emit_ctx_t, u_start) == 92 &&
+               CMDBUF_M_CAP == 1280 && sizeof(vdp1_cmd_t) == 32, "hw_asm_lingen: layout");
+const void *const hw_asm_lingen_ctx[12] = {
+    &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
+    &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
+    (const void *)HW_TryCoalesceLinearStrip, (const void *)HW_IsStripOccluded_Slow,
+    (const void *)HW_EmitStripQuad_Slow, (const void *)HW_ModNonPow2
+};
+#endif
+
+#if !HW_ASM_LINGEN || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
 {
@@ -867,6 +891,61 @@ next_strip_lin:
     saturn_hw_wall_quads  += l_quads;
     saturn_hw_wall_strips += l_strips;
 }
+#endif /* !HW_ASM_LINGEN || HW_ASM_CHECK */
+
+#if HW_ASM_LINGEN && HW_ASM_CHECK
+/* Self-check: run the asm, hash its output (commands + counters + clip
+ * state), roll back, run C, compare. [0] calls [1] mismatches
+ * [2] s_min [3] s_max [4] asm quads [5] C quads [6] asm hash [7] C hash */
+static volatile uint32_t hw_asm_chk_lingen[8];
+static uint32_t HW_LinGenHash(uint16_t m0, hw_wall_emit_ctx_t *ctx)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *p = (const uint32_t *)&saturn_cmd_m[m0];
+    const uint32_t *e = (const uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+    for (; p < e; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ (uint32_t)saturn_cmd_m_count) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_cells) * 16777619u;
+    h = (h ^ saturn_hw_wall_quads) * 16777619u;
+    h = (h ^ saturn_hw_wall_strips) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_drop) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_captured) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x0) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x1) * 16777619u;
+    return h;
+}
+static HW_NOINLINE void HW_LinGenCheck(hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+{
+    uint16_t m0 = saturn_cmd_m_count;
+    int16_t lc0 = ctx->last_clip_x0, lc1 = ctx->last_clip_x1;
+    int cells0 = saturn_v1w_cells, drop0 = saturn_v1w_drop, cap0 = saturn_v1w_captured;
+    unsigned int q0 = saturn_hw_wall_quads, st0 = saturn_hw_wall_strips;
+    hw_asm_lingen(ctx, s_min, s_max);
+    uint32_t ha = HW_LinGenHash(m0, ctx);
+    unsigned int qa = saturn_hw_wall_quads - q0;
+    saturn_cmd_m_count = m0;
+    ctx->last_clip_x0 = lc0; ctx->last_clip_x1 = lc1;
+    saturn_v1w_cells = cells0; saturn_v1w_drop = drop0; saturn_v1w_captured = cap0;
+    saturn_hw_wall_quads = q0; saturn_hw_wall_strips = st0;
+    HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+    uint32_t hc = HW_LinGenHash(m0, ctx);
+    hw_asm_chk_lingen[0]++;
+    if (ha != hc && hw_asm_chk_lingen[1]++ == 0)
+    {
+        hw_asm_chk_lingen[2] = (uint32_t)s_min;
+        hw_asm_chk_lingen[3] = (uint32_t)s_max;
+        hw_asm_chk_lingen[4] = qa;
+        hw_asm_chk_lingen[5] = saturn_hw_wall_quads - q0;
+        hw_asm_chk_lingen[6] = ha;
+        hw_asm_chk_lingen[7] = hc;
+    }
+}
+#define HW_LINGEN_CALL HW_LinGenCheck
+#elif HW_ASM_LINGEN
+#define HW_LINGEN_CALL hw_asm_lingen
+#else
+#define HW_LINGEN_CALL HW_EmitWallStrips_Linear_General
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
@@ -901,7 +980,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
             (tw >= 64 && (ctx->srca_64 != srca || ctx->srca_mono != srca) && (((u_start + 63) & ~63) + 64 <= u_end)) ||
             (int)m_start + (s_max - s_min + 1) >= CMDBUF_M_CAP - 1, 0))
     {
-        HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+        HW_LINGEN_CALL(ctx, s_min, s_max);
         return;
     }
 
@@ -1447,7 +1526,7 @@ HW_ALWAYS_INLINE void HW_EmitWallStrips(hw_wall_emit_ctx_t *ctx)
         HW_EmitWallStrips_Persp(ctx, s_min, s_max);
 #else
     if (__builtin_expect(!ctx->persp_strips, 1))
-        HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+        HW_LINGEN_CALL(ctx, s_min, s_max);
     else
         HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
 #endif
