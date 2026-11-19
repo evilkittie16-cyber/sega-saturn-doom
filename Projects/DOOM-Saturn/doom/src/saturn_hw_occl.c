@@ -95,8 +95,29 @@ HW_ALWAYS_INLINE int HW_IsClippedSpanOccluded(int x0, int x1)
     return HW_IsSpanOccluded(x0, x1);
 }
 
-/* 3-state span occlusion query:
- *   0 = 100% open (zero solid bits in [x0, x1]; sub-strips need no occlusion test)
+/* Compact rewrite stage C2: HW_CheckSpanOcclusion / HW_MarkSubSolidSpan in
+ * saturn_hw_asm.s (hw_asm_spanocc / hw_asm_marksub); every caller is
+ * routed to them below. */
+#ifndef HW_ASM_OCC
+#define HW_ASM_OCC (HW_ASM && !HW_ORACLE)
+#endif
+#if HW_ASM_OCC
+extern int  hw_asm_spanocc(int x0, int x1);
+extern void hw_asm_marksub(int x0, int x1);
+_Static_assert(HW_VIEW_W == 320, "hw_asm_spanocc: 320 columns");
+const void *const hw_asm_occ_ctx[11] = {
+    &hw_solid_count, hw_solid_mask, hw_mask_left, hw_mask_right,
+    hw_span_mask_lut, &hw_solid_any, &hw_solid_summary,
+    sub_solid_mask, &sub_solid_active, &sub_solid_min_w, &sub_solid_max_w
+};
+#if HW_ASM_CHECK
+#define HW_CheckSpanOcclusion HW_CheckSpanOcclusion_C
+#define HW_MarkSubSolidSpan   HW_MarkSubSolidSpan_C
+#endif
+#endif
+
+#if !HW_ASM_OCC || HW_ASM_CHECK
+/* 3-state span occlusion query: *   0 = 100% open (zero solid bits in [x0, x1]; sub-strips need no occlusion test)
  *   1 = partially occluded (some solid bits in [x0, x1])
  *   2 = 100% occluded (all bits in [x0, x1] are solid)
  */
@@ -197,7 +218,53 @@ static HW_NOINLINE HW_HOT_O2 void HW_MarkSubSolidSpan(int x0, int x1)
     }
     sub_solid_mask[w1] |= hw_mask_right[b1];
 }
+#endif /* !HW_ASM_OCC || HW_ASM_CHECK */
 
+#if HW_ASM_OCC
+#undef HW_CheckSpanOcclusion
+#undef HW_MarkSubSolidSpan
+#if HW_ASM_CHECK
+/* spanocc: [0] calls [1] mismatches [2] x0 [3] x1 [4] asm [5] C
+ * marksub: [0] calls [1] mismatches [2] x0 [3] x1 */
+static volatile uint32_t hw_asm_chk_spanocc[8];
+static volatile uint32_t hw_asm_chk_marksub[8];
+static HW_NOINLINE int HW_SpanOccCheck(int x0, int x1)
+{
+    int a = hw_asm_spanocc(x0, x1);
+    int c = HW_CheckSpanOcclusion_C(x0, x1);
+    hw_asm_chk_spanocc[0]++;
+    if (a != c && hw_asm_chk_spanocc[1]++ == 0)
+    {
+        hw_asm_chk_spanocc[2] = (uint32_t)x0; hw_asm_chk_spanocc[3] = (uint32_t)x1;
+        hw_asm_chk_spanocc[4] = (uint32_t)a;  hw_asm_chk_spanocc[5] = (uint32_t)c;
+    }
+    return a;
+}
+static HW_NOINLINE void HW_MarkSubCheck(int x0, int x1)
+{
+    uint32_t m0[HW_SOLID_WORDS], m1[HW_SOLID_WORDS];
+    int act0 = sub_solid_active, mn0 = sub_solid_min_w, mx0 = sub_solid_max_w;
+    memcpy(m0, sub_solid_mask, sizeof(m0));
+    hw_asm_marksub(x0, x1);
+    memcpy(m1, sub_solid_mask, sizeof(m1));
+    int act1 = sub_solid_active, mn1 = sub_solid_min_w, mx1 = sub_solid_max_w;
+    memcpy(sub_solid_mask, m0, sizeof(m0));
+    sub_solid_active = act0; sub_solid_min_w = mn0; sub_solid_max_w = mx0;
+    HW_MarkSubSolidSpan_C(x0, x1);
+    hw_asm_chk_marksub[0]++;
+    if ((memcmp(m1, sub_solid_mask, sizeof(m1)) != 0 || act1 != sub_solid_active ||
+         mn1 != sub_solid_min_w || mx1 != sub_solid_max_w) && hw_asm_chk_marksub[1]++ == 0)
+    {
+        hw_asm_chk_marksub[2] = (uint32_t)x0; hw_asm_chk_marksub[3] = (uint32_t)x1;
+    }
+}
+#define HW_CheckSpanOcclusion HW_SpanOccCheck
+#define HW_MarkSubSolidSpan   HW_MarkSubCheck
+#else
+#define HW_CheckSpanOcclusion hw_asm_spanocc
+#define HW_MarkSubSolidSpan   hw_asm_marksub
+#endif
+#endif
 typedef struct {
     int16_t sx;
     int16_t ex;
@@ -348,7 +415,8 @@ extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_ASM_COMMIT (HW_ASM && HW_ASM_RESCAN && HW_DBG_OCCLUSION && HW_DBG_APERTURE && !HW_AP_HALF)
 #endif
 
-static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
+/* unused when hw_asm_portal (saturn_hw_walls.c) records spans itself */
+static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
 {
 #if HW_AP_1D
     (void)sx_ex; (void)ytop; (void)ybot; (void)yt_yb_att;

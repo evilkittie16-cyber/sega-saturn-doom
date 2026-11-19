@@ -2036,8 +2036,29 @@ static unsigned int hw_prof_wquad_acc = 0;
 static unsigned int hw_prof_sportal_acc = 0;
 static unsigned int hw_prof_unb_acc = 0;
 
-/* Takes 2 register arguments (r4=ctx, r5=bsec_idx), 0 stack arguments!
- * Uses 16-byte hw_sec_fast_t (1 SH-2 cache line, indexed by bsec_idx << 4) with pre-subtracted dz_ceil/dz_floor. */
+/* Compact rewrite stage C2: HW_RecordSegPortalAperture + HW_RecordPortalSpan
+ * in saturn_hw_asm.s (hw_asm_portal); every caller is routed to it. */
+#ifndef HW_ASM_PORTAL
+#define HW_ASM_PORTAL (HW_ASM && !HW_AP_1D && !HW_ORACLE && !HW_PROF_SUBTIMERS)
+#endif
+#if HW_ASM_PORTAL
+extern void hw_asm_portal(hw_wall_emit_ctx_t *ctx, int bsec_idx);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, portal_recorded) == 0 && offsetof(hw_wall_emit_ctx_t, is_sky_ceil) == 3 &&
+               offsetof(hw_wall_emit_ctx_t, sec_floor) == 36 && offsetof(hw_sec_fast_t, yt_attach) == 8 &&
+               offsetof(hw_sec_fast_t, yb_attach) == 10 && offsetof(hw_aperture_state_t, cur_sub_yt_attach) == 4 &&
+               offsetof(hw_aperture_state_t, cur_sub_yb_attach) == 6 && HW_MAX_AP_SECTORS == 256,
+               "hw_asm_portal: layout");
+const void *const hw_asm_portal_ctx[6] = {
+    hw_sec_fast, &hw_aperture_state, &saturn_view_cy, &saturn_view_h,
+    (const void *)HW_ClipPortalScales, hw_wall_coord_tmp
+};
+#if HW_ASM_CHECK
+#define HW_RecordSegPortalAperture HW_RecordSegPortalAperture_C
+#endif
+#endif
+
+#if !HW_ASM_PORTAL || HW_ASM_CHECK
+/* Takes 2 register arguments (r4=ctx, r5=bsec_idx), 0 stack arguments! * Uses 16-byte hw_sec_fast_t (1 SH-2 cache line, indexed by bsec_idx << 4) with pre-subtracted dz_ceil/dz_floor. */
 static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     hw_wall_emit_ctx_t *ctx, int bsec_idx)
 {
@@ -2133,7 +2154,62 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     hw_prof_sportal_acc += HW_ProfDelta(tsp0, SAT_FRT());
 #endif
 }
+#endif /* !HW_ASM_PORTAL || HW_ASM_CHECK */
 
+#if HW_ASM_PORTAL
+#undef HW_RecordSegPortalAperture
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] first differing byte [3] bsec */
+static volatile uint32_t hw_asm_chk_portal[8];
+typedef struct {
+    hw_portal_span_t spans[HW_MAX_PORTAL_SPANS];
+    hw_sec_fast_t sec;
+    uint8_t count, recorded, pad[2];
+} hw_portal_snap_t;
+static void HW_PortalSave(hw_portal_snap_t *s, const hw_wall_emit_ctx_t *ctx, int b)
+{
+    memset(s, 0, sizeof(*s));
+    memcpy(s->spans, hw_aperture_state.portal_spans, sizeof(s->spans));
+    if ((unsigned)b < HW_MAX_AP_SECTORS) s->sec = hw_sec_fast[b];
+    s->count = hw_aperture_state.portal_span_count;
+    s->recorded = ctx->portal_recorded;
+}
+static void HW_PortalLoad(const hw_portal_snap_t *s, hw_wall_emit_ctx_t *ctx, int b)
+{
+    memcpy(hw_aperture_state.portal_spans, s->spans, sizeof(s->spans));
+    if ((unsigned)b < HW_MAX_AP_SECTORS) hw_sec_fast[b] = s->sec;
+    hw_aperture_state.portal_span_count = s->count;
+    ctx->portal_recorded = s->recorded;
+}
+static HW_NOINLINE void HW_PortalCheck(hw_wall_emit_ctx_t *ctx, int b)
+{
+    hw_portal_snap_t s0, s1, s2;
+    HW_PortalSave(&s0, ctx, b);
+    hw_asm_portal(ctx, b);
+    HW_PortalSave(&s1, ctx, b);
+    HW_PortalLoad(&s0, ctx, b);
+    HW_RecordSegPortalAperture_C(ctx, b);
+    HW_PortalSave(&s2, ctx, b);
+    hw_asm_chk_portal[0]++;
+    const uint8_t *a = (const uint8_t *)&s1, *c = (const uint8_t *)&s2;
+    for (uint32_t i = 0; i < sizeof(s1); i++)
+        if (a[i] != c[i])
+        {
+            if (hw_asm_chk_portal[1]++ == 0)
+            {
+                hw_asm_chk_portal[2] = i;
+                hw_asm_chk_portal[3] = (uint32_t)b;
+                hw_asm_chk_portal[4] = a[i];
+                hw_asm_chk_portal[5] = c[i];
+            }
+            break;
+        }
+}
+#define HW_RecordSegPortalAperture HW_PortalCheck
+#else
+#define HW_RecordSegPortalAperture hw_asm_portal
+#endif
+#endif
 #if defined(__GNUC__) && !defined(__clang__)
 #define HW_HOT_O2_NOTHREAD __attribute__((optimize("O2,no-thread-jumps")))
 #else
