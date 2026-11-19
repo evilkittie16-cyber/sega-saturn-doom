@@ -553,6 +553,39 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         return;
 
     HW_Divlut_Init();
+#if SATURN_BENCH && !defined(SATURN_WIN32)
+    {
+        static int32_t lod_seq_seen = 0;
+        const volatile int32_t *in =
+            (const volatile int32_t *)((uintptr_t)hw_wall_lod_in | 0x20000000u);   /* cache-through */
+        int32_t seq = in[16];
+        if (seq != lod_seq_seen)
+        {
+            lod_seq_seen = seq;
+            for (int i = 0; i < 16; i++)
+                hw_wall_lod[i] = in[i];
+        }
+    }
+#endif
+#ifdef SATURN_WIN32
+    {
+        /* DOOM-Windows strip-LOD tuning: HW_WALL_LOD=v0,v1,... overrides
+         * hw_wall_lod[] (scored against the DOS reference pane). */
+        static int lod_env_done = 0;
+        if (!lod_env_done)
+        {
+            const char *e = getenv("HW_WALL_LOD");
+            int i = 0;
+            lod_env_done = 1;
+            while (e && *e && i < 16)
+            {
+                hw_wall_lod[i++] = (int32_t)strtol(e, (char **)&e, 10);
+                if (*e == ',')
+                    e++;
+            }
+        }
+    }
+#endif
 
     /* Latch player camera state with 60 Hz inter-tic interpolation.
      * Keyed on gametic, NOT vblank parity: at 30 FPS every frame lands

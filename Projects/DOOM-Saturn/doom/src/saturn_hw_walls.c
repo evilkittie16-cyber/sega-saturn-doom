@@ -9,6 +9,45 @@
  * flickering / strobing sectors and light-change linedefs reach walls. */
 static int hw_wall_light_delta = 0;
 
+/* Strip-LOD tuning table (2026-11-19). Every screen-size / depth threshold
+ * that picks how many texels one wall quad covers, read at run time by the
+ * C emitters AND the asm (hw_asm_walk via hw_asm_em_ctx[19], hw_asm_lingen
+ * via hw_asm_lingen_ctx[8]) so the tuning harness can sweep it live with
+ * 5thPlanet `poke` (one build per view). Defaults = the old constants.
+ * dx = on-screen width in pixels of the quad that would be emitted. */
+enum {
+    HW_LOD_M16_DX,       /*  0  short wall (h,u<=16): one 16-texel quad if dx <= */
+    HW_LOD_M16_FAR_DX,   /*  1  far wall: one 16-texel quad if dx <= ...        */
+    HW_LOD_M16_FAR_CZ,   /*  2  ... and p0 depth > this (16.16)                 */
+    HW_LOD_M32_DX,       /*  3  tw 32, level top: one 32-wide quad if dx <=     */
+    HW_LOD_H64_DX,       /*  4  64-texel block -> half-width 32 copy if dx <=   */
+    HW_LOD_H64_NF_DX,    /*  5  ... same when no full 64 copy exists           */
+    HW_LOD_C4_NF_DX,     /*  6  strip coalesce, no full 64 copy: max dx        */
+    HW_LOD_C4_DG_DX,     /*  7  strip coalesce: full 64 -> half copy if dx <=   */
+    HW_LOD_MERGE_DX,     /*  8  32-wide mono pair -> one 64-wide quad if dx <=  */
+    HW_LOD_C_MAX_DX,     /*  9  strip coalesce, other cases: max dx            */
+    HW_LOD_P4_CZ,        /* 10  perspective strips: 4->1 coalesce if depth >=   */
+    HW_LOD_COUNT
+};
+#ifndef HW_LOD_REF
+#define HW_LOD_REF 0     /* 1: start with every lossy LOD rule off (check builds) */
+#endif
+int32_t hw_wall_lod[16] = {
+#if HW_LOD_REF
+    -1, -1, 512 << 16, -1, -1, -1, -1, -1, 48, 1000, 0x7FFFFFFF,
+#else
+    16, 6, 512 << 16, 28, 20, 56, 52, 20, 48, 1000, 192 << 16,
+#endif
+};
+#define HW_LOD(i) (hw_wall_lod[(i)])
+#if SATURN_BENCH
+/* Tuning-harness input: sdbg pokes [0..15] then bumps [16]; the renderer
+ * copies it into hw_wall_lod once per frame, reading cache-through. Poking
+ * hw_wall_lod directly is NOT safe: the master SH-2 keeps reading its own
+ * cached copy of the lines, so a sweep ran on a mix of old and new values. */
+volatile int32_t hw_wall_lod_in[17];
+#endif
+
 HW_ALWAYS_INLINE int HW_SegLight16(const baked_seg_t *seg)
 {
     int l = (int)(seg->baked_light >> 4) + hw_wall_light_delta;
@@ -636,11 +675,11 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     int adv = coal_strips - 1;
     int c_uhi = (s + coal_strips) << 4;
     int next_px1 = (c_uhi >= u_end) ? ctx->p1->px : ((cur_px_fp + step_px_fp * adv) >> 16);
-    int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? 52 : 1000;
+    int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? HW_LOD(HW_LOD_C4_NF_DX) : HW_LOD(HW_LOD_C_MAX_DX);
     if (next_px1 - s_px0 > max_coal_dx)
         return 0;
 
-    if (coal_strips == 4 && (next_px1 - s_px0 <= 20 || srca_64 == srca) && srca_mono != srca)
+    if (coal_strips == 4 && (next_px1 - s_px0 <= HW_LOD(HW_LOD_C4_DG_DX) || srca_64 == srca) && srca_mono != srca)
     {
         emit_srca = srca_mono + (cur_v << 2) + (cur_strip_idx >> 2) * (th << 2);
         emit_size_hi = 4u << 8;
@@ -681,7 +720,7 @@ _Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall
 const void *const hw_asm_lingen_ctx[12] = {
     &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
     &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
-    NULL /* coalesce: inline in asm since stage F1 */, (const void *)HW_IsStripOccluded_Slow,
+    hw_wall_lod /* [8]: coalesce is inline since stage F1 */, (const void *)HW_IsStripOccluded_Slow,
     (const void *)HW_EmitStripQuad_Slow, (const void *)HW_ModNonPow2
 };
 #endif
@@ -1225,10 +1264,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
         if (__builtin_expect((persp_flags & 256u) != 0, 0) &&
             ((cur_strip_idx & 3) == 0) && !(persp_flags & 16u) &&
             (((s + 4) << 4) <= u_end) &&
-            s_px0 >= 0 && s_cz0 >= (192 << FRACBITS))
+            s_px0 >= 0 && s_cz0 >= HW_LOD(HW_LOD_P4_CZ))
         {
             fixed_t end_cz3 = (s + 3 < s_max) ? (cur_cz1 + step_cz1 * 3) : ctx->p1->cz;
-            if (end_cz3 >= (192 << FRACBITS))
+            if (end_cz3 >= HW_LOD(HW_LOD_P4_CZ))
             {
                 coal_strips = 4;
                 int blk = cur_strip_idx >> 2;
@@ -2416,7 +2455,7 @@ static HW_WFUSE HW_WFUSE_O2 void HW_EmitMonolithicBakedSeg(
             {
                 int merged_dx = s_xb - (int)(int16_t)(prev[3] >> 16);
                 if (((w2 & 0x3F00u) == 0x0400u) && ctx->tw == 32 && ctx->srca_64 != ctx->srca &&
-                    merged_dx <= 48 &&
+                    merged_dx <= HW_LOD(HW_LOD_MERGE_DX) &&
                     (unsigned int)(q_ya0 - q_yb0 + 3) <= 6u)
                 {
                     int srca_64 = ctx->srca_64;
@@ -2536,7 +2575,8 @@ static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t
         int srca_mono = ctx->srca_mono;
         int srca_64   = ctx->srca_64;
         int th        = ctx->th;
-        if (((ctx->wall_h <= 16 && dx <= 16 && u_span <= 16) || (dx <= 6 && p0->cz > (512 << FRACBITS))) &&
+        if (((ctx->wall_h <= 16 && dx <= HW_LOD(HW_LOD_M16_DX) && u_span <= 16) ||
+             (dx <= HW_LOD(HW_LOD_M16_FAR_DX) && p0->cz > HW_LOD(HW_LOD_M16_FAR_CZ))) &&
             (unsigned)u_start < (unsigned)tw)
         {
             mono_base_srca = srca + (int)(((unsigned)u_start >> 4) * (unsigned)(th << 1));
@@ -2544,7 +2584,7 @@ static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t
         }
         else if (tw == 32 && u_start == 0)
         {
-            if ((u_span == 32 || (dx <= 28 && (unsigned int)(ctx->ya0 - ctx->yb0 + 3) <= 6u)) && srca_mono != srca)
+            if ((u_span == 32 || (dx <= HW_LOD(HW_LOD_M32_DX) && (unsigned int)(ctx->ya0 - ctx->yb0 + 3) <= 6u)) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono;
                 mono_tw = 32;
@@ -2558,7 +2598,7 @@ static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t
         }
         else if (tw >= 64 && (((u_span ^ 64) | (u_start & 63)) == 0) && (unsigned)u_start < (unsigned)tw)
         {
-            if ((dx <= 20 || (srca_64 == srca && dx <= 56)) && srca_mono != srca)
+            if ((dx <= HW_LOD(HW_LOD_H64_DX) || (srca_64 == srca && dx <= HW_LOD(HW_LOD_H64_NF_DX))) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono + (int)(((unsigned)u_start >> 6) * (unsigned)(th << 2));
                 mono_tw = 32;
@@ -3402,7 +3442,7 @@ _Static_assert(offsetof(baked_seg_t, baked_light) == 2 && offsetof(baked_seg_t, 
  * reset. [1] [2] [4] [5] [6] [8] [9] are no longer fallbacks. */
 volatile uint32_t hw_asm_emstat[10];
 #endif
-static const void *const hw_asm_em_ctx[19] = {
+static const void *const hw_asm_em_ctx[20] = {
     &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &hw_wall_light_delta, wall_zlight_cmdcolr_LUT,
     (const void *)(uintptr_t)((((PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu)) << 16),
     (const void *)(uintptr_t)(((((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)) << 16),
@@ -3414,7 +3454,8 @@ static const void *const hw_asm_em_ctx[19] = {
     NULL,
 #endif
     &saturn_wall_subdivision, (const void *)HW_ModNonPow2, (const void *)HW_WallXYClamp_Slow,
-    hw_wall_coord_tmp, (const void *)HW_EmitSubdividedBakedSeg, (const void *)HW_EmitMultiBandBakedWall
+    hw_wall_coord_tmp, (const void *)HW_EmitSubdividedBakedSeg, (const void *)HW_EmitMultiBandBakedWall,
+    hw_wall_lod                                     /* [19] strip-LOD tuning table */
 };
 #endif
 

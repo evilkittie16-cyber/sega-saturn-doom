@@ -1470,22 +1470,31 @@ _hw_asm_walk:
 	mov.l	@(40,r14),r5
 	mov.l	@(44,r14),r6
 .Le_np:
-	! ((wall_h<=16 && dx<=16 && u_span<=16) || (dx<=6 && p0.cz > 512<<16))
+	! ((wall_h<=16 && dx<=LOD[0] && u_span<=16) || (dx<=LOD[1] && p0.cz > LOD[2]))
 	mov.w	@(28,r14),r0
-	mov	#16,r4
-	cmp/gt	r4,r0
-	bt	.Le_g2
+	add	#-17,r0
+	cmp/pz	r0
+	bt	.Le_g2			! wall_h > 16
+	mov	r3,r0
+	add	#-17,r0
+	cmp/pz	r0
+	bt	.Le_g2			! u_span > 16
+	mov	#116,r0
+	mov.l	@(r0,r11),r4
+	mov	#76,r0
+	mov.l	@(r0,r4),r4		! hw_wall_lod
+	mov.l	@r4,r4			! [0] M16_DX
 	cmp/gt	r4,r7
-	bt	.Le_g2
-	cmp/gt	r4,r3
 	bf	.Le_g3
 .Le_g2:
-	mov	#6,r4
-	cmp/gt	r4,r7
+	mov	#116,r0
+	mov.l	@(r0,r11),r4
+	mov	#76,r0
+	mov.l	@(r0,r4),r4		! hw_wall_lod
+	mov.l	@(4,r4),r0		! [1] M16_FAR_DX
+	cmp/gt	r0,r7
 	bt	.Le_g4
-	mov	#2,r4
-	shll8	r4
-	shll16	r4			! 512 << 16
+	mov.l	@(8,r4),r4		! [2] M16_FAR_CZ
 	mov.l	@(4,r5),r0
 	cmp/gt	r4,r0
 	bf	.Le_g4
@@ -1513,7 +1522,12 @@ _hw_asm_walk:
 	mov	r3,r0
 	cmp/eq	#32,r0
 	bt	.Le_g5
-	mov	#28,r0
+	mov	r11,r0
+	add	#116,r0
+	mov.l	@r0,r0
+	add	#76,r0
+	mov.l	@r0,r0
+	mov.l	@(12,r0),r0		! LOD[3] M32_DX
 	cmp/gt	r0,r7
 	bt	.Le_g5x
 	tst	r4,r4
@@ -1561,12 +1575,22 @@ _hw_asm_walk:
 	shlr2	r2
 	shlr2	r2
 	shlr2	r2			! u_start >> 6
-	mov	#20,r0
+	mov	r11,r0
+	add	#116,r0
+	mov.l	@r0,r0
+	add	#76,r0
+	mov.l	@r0,r0
+	mov.l	@(16,r0),r0		! LOD[4] H64_DX
 	cmp/gt	r0,r7
 	bf	.Le_g7
 	cmp/eq	r5,r6
 	bf	.Le_g8
-	mov	#56,r0
+	mov	r11,r0
+	add	#116,r0
+	mov.l	@r0,r0
+	add	#76,r0
+	mov.l	@r0,r0
+	mov.l	@(20,r0),r0		! LOD[5] H64_NF_DX
 	cmp/gt	r0,r7
 	bt	.Le_g8
 .Le_g7:
@@ -1789,9 +1813,14 @@ _hw_asm_walk:
 	shlr16	r0
 	exts.w	r0,r0			! xb
 	sub	r5,r0
-	mov	#48,r5
+	mov	r11,r5
+	add	#116,r5
+	mov.l	@r5,r5
+	add	#76,r5
+	mov.l	@r5,r5
+	mov.l	@(32,r5),r5		! LOD[8] MERGE_DX
 	cmp/gt	r5,r0
-	bt	.Le_new0		! merged_dx > 48
+	bt	.Le_new0		! merged_dx > LOD[8]
 	exts.w	r1,r0
 	exts.w	r3,r5
 	sub	r5,r0
@@ -3306,12 +3335,14 @@ _hw_asm_lingen:
 	bf	.Lc2_m1k
 	cmp/eq	r2,r3
 	bf	.Lc2_m1k
+	mov.l	.Ll_ctx2,r4
+	mov.l	@(32,r4),r4		! hw_wall_lod
 	bra	.Lc2_mc
-	mov	#52,r4
+	mov.l	@(24,r4),r4		! LOD[6] C4_NF_DX
 .Lc2_m1k:
-	mov	#125,r4
-	shll2	r4
-	shll	r4			! 1000
+	mov.l	.Ll_ctx2,r4
+	mov.l	@(32,r4),r4
+	mov.l	@(36,r4),r4		! LOD[9] C_MAX_DX
 .Lc2_mc:
 	cmp/gt	r4,r0
 	bt	.Lc2_no
@@ -3322,7 +3353,9 @@ _hw_asm_lingen:
 	bt	.Lc2_out
 	cmp/eq	r2,r3
 	bt	.Lc2_dg
-	mov	#20,r4
+	mov.l	.Ll_ctx2,r4
+	mov.l	@(32,r4),r4
+	mov.l	@(28,r4),r4		! LOD[7] C4_DG_DX
 	cmp/gt	r4,r0
 	bt	.Lc2_out
 .Lc2_dg:

@@ -1289,6 +1289,48 @@ static int v1_evict(unsigned int target)
         }
     }
 
+    /* 2a. ... and everything the master's command list being built THIS
+     *    frame references (walls, sprites; saturn_cmd_m, not yet in VRAM).
+     *    The wall fast path (HW_LoadWallTexCtx tag hit) touches nothing, so
+     *    a texture or optional copy first used this frame still looked old:
+     *    it could be evicted and overwritten by a later upload in the same
+     *    frame while already-built commands pointed at it (they would draw
+     *    another texture's data). Defensive (2026-11-19): found by reading
+     *    the code during strip-LOD tuning, not yet seen to fire - the
+     *    courtyard case first blamed on it was a harness artefact. Flats
+     *    need no scan: their lookups v1_touch every hit. */
+    {
+        extern vdp1_cmd_t *saturn_cmd_m;
+        extern volatile uint16_t saturn_cmd_m_count;
+        const uint32_t *c32 = (const uint32_t *)saturn_cmd_m;
+        unsigned int cnt = saturn_cmd_m ? saturn_cmd_m_count : 0u;
+        unsigned int k;
+        for (k = 0; k < cnt; k++, c32 += 8)
+        {
+            unsigned int a;
+            int lo, hi;
+            if (((c32[0] >> 16) & 0xFu) > 2u)
+                continue;                       /* untextured / clip / local */
+            a = (c32[2] >> 16) << 3;            /* CMDSRCA -> byte offset */
+            lo = 0; hi = n - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                unsigned int eo = (unsigned int)v1_log[mid].off32 << 5;
+                if (a < eo)
+                    hi = mid - 1;
+                else if (a >= eo + ((unsigned int)v1_log[mid].len32 << 5))
+                    lo = mid + 1;
+                else
+                {
+                    v1_log_prot[mid] = 1;
+                    v1_log[mid].age = v1_age;
+                    break;
+                }
+            }
+        }
+    }
+
     /* 2b. a texture's copies live or die together: protect every entry of
      *    a tag that has one protected entry. A distant wall draws only its
      *    half-width copy (srca_mono); evicting the unreferenced main copy
