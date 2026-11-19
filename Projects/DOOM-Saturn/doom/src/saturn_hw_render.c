@@ -158,7 +158,7 @@ const void *const hw_asm_sub_ctx[21] = {
     &hw_solid_count, &numsubsectors, &subsectors, &saturn_visit_count,
     hw_sec_fast, (const void *)HW_CheckSubsectorAperture, &saturn_hw_occl_culls,
     &saturn_hw_sky_visible, (const void *)&saturn_cmd_m_count, &hw_cur_sub_ranges,
-    &saturn_slave_enabled, &sectors, (const void *)HW_SubmitSlaveFlatJob,
+    &saturn_slave_enabled, &sectors, (const void *)HW_SUBMIT_FLAT_JOB,
     (const void *)HW_RenderSubsectorBakedFlats, (const void *)HW_SubsectorHasThings,
     (const void *)HW_RenderSubsectorSprites, &sub_solid_active, &hw_aperture_state,
     (const void *)HW_SUB_COMMIT_FN, hw_asm_subw_ctx, (const void *)(uintptr_t)sizeof(sector_t)
@@ -271,7 +271,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
         if (__builtin_expect(saturn_slave_enabled, 1))
         {
             /* Concurrent execution: Submit to Slave so Slave processes flats while Master computes wall geometry */
-            HW_SubmitSlaveFlatJob(visit_idx, subnum, sec, flat_flags);
+            HW_SUBMIT_FLAT_JOB(visit_idx, subnum, sec, flat_flags);
         }
         else
 #endif

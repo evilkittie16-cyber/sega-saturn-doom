@@ -3431,6 +3431,30 @@ static HW_NOINLINE HW_COLD_OS void HW_DeferMasterFlatJob(
 }
 #endif
 
+/* Stage G: HW_SubmitSlaveFlatJob + HW_RingFlatJob in assembly
+ * (saturn_hw_asm.s hw_asm_flatsub). The asm takes the common path and
+ * hands the rare ones (sector-cache refill, first alt-pyramid pack, a job
+ * deferred to the master, a split candidate) to the C function whole,
+ * deciding before any side effect. */
+#ifndef HW_ASM_FLATSUB
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU) && HW_FLAT_STEAL && HW_FLAT_SPLIT && HW_FLAT_CHUNKS
+#define HW_ASM_FLATSUB 1
+#else
+#define HW_ASM_FLATSUB 0
+#endif
+#endif
+#if HW_ASM_FLATSUB && HW_ASM_CHECK
+/* check builds: the C reference writes its ring job into a scratch ring */
+static volatile hw_slave_ipc_t *hw_ring_ipc_c = NULL;      /* header (job_head/job_tail) */
+static volatile aliased_uint32_t *hw_ring_job_c = NULL;    /* the one job slot */
+#define HW_RING_IPC() (hw_ring_ipc_c ? hw_ring_ipc_c : (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED)
+#define HW_RING_JOB(ipc, idx) (hw_ring_job_c ? hw_ring_job_c : \
+    (volatile aliased_uint32_t *)((uintptr_t)(ipc)->jobs + ((idx) << 6) + ((idx) << 5)))
+#else
+#define HW_RING_IPC() ((volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED)
+#define HW_RING_JOB(ipc, idx) ((volatile aliased_uint32_t *)((uintptr_t)(ipc)->jobs + ((idx) << 6) + ((idx) << 5)))
+#endif
+
 #ifndef SATURN_WIN32
 /* Write one flat job into the slave ring (waits if the ring is full).
  * Factored out of HW_SubmitSlaveFlatJob so a big subsector can be
@@ -3442,7 +3466,7 @@ static HW_NOINLINE void HW_RingFlatJob(uint32_t v_first, uint32_t q_first, uint3
     unsigned int tail = hw_master_job_tail;
     hw_master_job_tail = tail + 1;
     unsigned int ring_idx = tail & (HW_JOB_RING - 1);
-    volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
+    volatile hw_slave_ipc_t *ipc = HW_RING_IPC();
 
     /* Ring-full guard: the slave reads each job IN PLACE while it draws it
      * and only advances job_head when done, so a master more than
@@ -3461,7 +3485,7 @@ static HW_NOINLINE void HW_RingFlatJob(uint32_t v_first, uint32_t q_first, uint3
     }
 
     /* Write directly to uncached IPC ring so Master L1 cache is never polluted by write-only IPC jobs */
-    volatile aliased_uint32_t *jw = (volatile aliased_uint32_t *)((uintptr_t)ipc->jobs + (ring_idx << 6) + (ring_idx << 5));
+    volatile aliased_uint32_t *jw = HW_RING_JOB(ipc, ring_idx);
     jw[0] = (uint32_t)&saturn_baked_flat_verts[v_first];
     jw[1] = (uint32_t)&saturn_baked_flat_quads[q_first];
     jw[2] = vq_pack;
@@ -3647,6 +3671,160 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     (void)sub_idx; (void)subnum; (void)sec; (void)fully_inside;
 #endif
 }
+
+#if HW_ASM_FLATSUB
+extern void hw_asm_flatsub(int sub_idx, int subnum, sector_t *sec, int flags);
+_Static_assert(offsetof(hw_flat_sec_cache_t, srca_pack) == 4 && offsetof(hw_flat_sec_cache_t, light_bits) == 12 &&
+               offsetof(hw_flat_sec_cache_t, emit_floor) == 14 && offsetof(hw_flat_sec_cache_t, emit_ceil) == 15 &&
+               offsetof(hw_flat_sec_cache_t, is_sky) == 16 && offsetof(hw_flat_sec_cache_t, y_floor_w) == 20 &&
+               offsetof(hw_flat_sec_cache_t, y_ceil_w) == 24 && offsetof(hw_flat_sec_cache_t, trans_pack) == 28 &&
+               offsetof(hw_flat_sec_cache_t, tile_pack) == 32 && offsetof(hw_flat_sec_cache_t, alt_have) == 36 &&
+               offsetof(hw_flat_sec_cache_t, avg_pack) == 40, "hw_asm_flatsub: sec cache layout");
+_Static_assert(offsetof(hw_slave_ipc_t, job_tail) == 32 && offsetof(hw_slave_ipc_t, job_head) == 48 &&
+               offsetof(hw_slave_ipc_t, jobs) == 64 && sizeof(hw_flat_job_t) == 96 && HW_JOB_RING == 256 &&
+               HW_SOLID_WORDS == 11 && HW_JOB_ALT_SRCA_WORD == 22 && HW_JOB_AVG_WORD == 23 &&
+               sizeof(hw_steal_snap_t) == 52 && HW_STEAL_SNAPS == 64 && HW_SPLIT_MIN_Q == 96 &&
+               HW_MAX_DEF_FLAT_JOBS == 4 && CMDBUF_S_CAP == 1024, "hw_asm_flatsub: ring layout");
+_Static_assert(offsetof(hw_sub_flat_info_t, q_count) == 4 && offsetof(hw_sub_flat_info_t, lod1_q_first) == 8 &&
+               offsetof(hw_sub_flat_info_t, lod1_v_count) == 14 && sizeof(saturn_flat_vert_t) == 4 &&
+               sizeof(saturn_flat_quad_idx_t) == 8 && sizeof(saturn_flat_bbox_t) == 8 &&
+               offsetof(sector_t, floorpic) == 8 && offsetof(sector_t, ceilingpic) == 10 &&
+               sizeof(numflats) == 2 && sizeof(*flattranslation) == 1, "hw_asm_flatsub: data layout");
+static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, int flags);
+/* [0] baked q_count ptr [1] sub flat info [2] sec cache [3] C fallback
+ * [4] quv ptr [5] subflags ptr [6] bboxes ptr [7] cam_x [8] cam_y
+ * [9] flattranslation ptr [10] numflats [11] sub_chunk ptr [12] frame jobs
+ * [13] sky visible [14] def count [15] master flat q [16] chunks ptr
+ * [17] def alt pack [18] def warp bits [19] lod saved [20] lod1 subs
+ * [21] lod0 subs [22] job tail [23] ring base (asm ORs 0x20000000)
+ * [24] ring maxdepth [25] ring waits [26] verts ptr [27] quads ptr
+ * [28] vfrac ptr [29] slave dirty [30] first job [31] aperture
+ * [32] solid count [33] solid summary [34] solid mask [35] solid any
+ * [36] steal snaps [37] HW_CacheFlatSectorInfo [38] HW_FlatAltPack */
+const void *const hw_asm_flatsub_ctx[39] = {
+    &saturn_baked_flat_q_count, hw_wram_h_sub_flat_info, &hw_flat_sec_cache, (const void *)HW_SubmitFlatJob_Fallback,
+    &saturn_baked_flat_quv, &saturn_baked_flat_subflags, &saturn_baked_flat_bboxes, &hw_cam_x,
+    &hw_cam_y, &flattranslation, &numflats, &saturn_baked_flat_sub_chunk,
+    &hw_frame_flat_jobs, &saturn_hw_sky_visible, &hw_def_flat_count, &saturn_master_flat_q,
+    &saturn_baked_flat_chunks, &hw_def_alt_pack, &hw_def_warp_bits, &saturn_hw_flat_lod_saved_quads,
+    &saturn_hw_flat_lod1_subs, &saturn_hw_flat_lod0_subs, &hw_master_job_tail,
+#if HW_IPC_IN_WRAM_L
+    (const void *)SATURN_WRAM_L_IPC_UNCACHED,
+#else
+    &hw_slave_ipc_hwram,
+#endif
+    &saturn_hw_ring_maxdepth, &saturn_hw_ring_waits, &saturn_baked_flat_verts, &saturn_baked_flat_quads,
+    &saturn_baked_flat_vfrac, &hw_slave_dirty_words, &hw_first_flat_job, &hw_aperture_state,
+    &hw_solid_count, &hw_solid_summary, hw_solid_mask, &hw_solid_any,
+    hw_steal_snap, (const void *)HW_CacheFlatSectorInfo, (const void *)HW_FlatAltPack
+};
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] first differing byte [3] subnum
+ * [4] asm byte [5] C byte [6] fallbacks (C both times, not compared) */
+static volatile uint32_t hw_asm_chk_flatsub[8];
+static int hw_flatsub_fell_back;
+static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    hw_flatsub_fell_back = 1;
+    HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+}
+typedef struct {
+    hw_flat_sec_cache_t fc;
+    hw_steal_snap_t snap;
+    uint32_t job[24];
+    uint32_t lod_saved, lod1, lod0, def_alt, def_warp, tail, dirty, jtail;
+    int frame_jobs, first;
+} hw_flatsub_snap_t;
+static void HW_FlatSubSave(hw_flatsub_snap_t *s, volatile hw_slave_ipc_t *ipc,
+                           volatile aliased_uint32_t *job, unsigned int tail)
+{
+    memset(s, 0, sizeof(*s));
+    s->fc = hw_flat_sec_cache;
+    s->snap = hw_steal_snap[tail & (HW_STEAL_SNAPS - 1)];
+    for (int i = 0; i < 24; i++)
+        s->job[i] = job[i];
+    s->lod_saved = saturn_hw_flat_lod_saved_quads; s->lod1 = saturn_hw_flat_lod1_subs;
+    s->lod0 = saturn_hw_flat_lod0_subs; s->def_alt = hw_def_alt_pack; s->def_warp = hw_def_warp_bits;
+    s->tail = hw_master_job_tail; s->dirty = hw_slave_dirty_words; s->jtail = ipc->job_tail;
+    s->frame_jobs = hw_frame_flat_jobs; s->first = hw_first_flat_job;
+}
+static void HW_FlatSubLoad(const hw_flatsub_snap_t *s)
+{
+    hw_flat_sec_cache = s->fc;
+    saturn_hw_flat_lod_saved_quads = s->lod_saved; saturn_hw_flat_lod1_subs = s->lod1;
+    saturn_hw_flat_lod0_subs = s->lod0; hw_def_alt_pack = s->def_alt; hw_def_warp_bits = s->def_warp;
+    hw_master_job_tail = s->tail; hw_slave_dirty_words = s->dirty;
+    hw_frame_flat_jobs = s->frame_jobs; hw_first_flat_job = s->first;
+}
+static HW_NOINLINE void HW_FlatSubCheck(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    static hw_flatsub_snap_t s0, s1, s2;
+    static uint32_t scratch_hdr[16] __attribute__((aligned(16)));   /* ring header (job_head @48) */
+    static uint32_t scratch_job[24] __attribute__((aligned(16)));
+    volatile hw_slave_ipc_t *real = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
+    volatile hw_slave_ipc_t *scratch = (volatile hw_slave_ipc_t *)scratch_hdr;
+    unsigned int tail0 = hw_master_job_tail;
+    volatile aliased_uint32_t *real_job = HW_RING_JOB(real, tail0 & (HW_JOB_RING - 1));
+    unsigned int md = saturn_hw_ring_maxdepth, rw = saturn_hw_ring_waits;
+    HW_FlatSubSave(&s0, real, real_job, tail0);
+    hw_flatsub_fell_back = 0;
+    hw_asm_flatsub(sub_idx, subnum, sec, flags);
+    hw_asm_chk_flatsub[0]++;
+    if (hw_flatsub_fell_back)
+    {
+        hw_asm_chk_flatsub[6]++;
+        return;
+    }
+    HW_FlatSubSave(&s1, real, real_job, tail0);
+    unsigned int md1 = saturn_hw_ring_maxdepth, rw1 = saturn_hw_ring_waits;
+    /* C reference into the scratch ring: same job_head the asm saw is not
+     * recoverable (the slave moves it), so give it an empty ring and leave
+     * the ring-depth statistics out of the comparison */
+    scratch->job_head = tail0;
+    scratch->job_tail = s0.jtail;
+    HW_FlatSubLoad(&s0);
+    saturn_hw_ring_maxdepth = md; saturn_hw_ring_waits = rw;
+    for (int i = 0; i < 24; i++)
+        scratch_job[i] = s0.job[i];   /* words a job leaves alone keep the slot's old value */
+    hw_ring_ipc_c = scratch;
+    hw_ring_job_c = (volatile aliased_uint32_t *)scratch_job;
+    HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+    hw_ring_ipc_c = NULL;
+    hw_ring_job_c = NULL;
+    HW_FlatSubSave(&s2, scratch, (volatile aliased_uint32_t *)scratch_job, tail0);
+    s1.jtail -= s0.jtail;       /* compare the job_tail step only */
+    s2.jtail -= s0.jtail;
+    saturn_hw_ring_maxdepth = md1; saturn_hw_ring_waits = rw1;
+    if (s1.tail == tail0)
+        return;                 /* no job written (nothing to emit) */
+    const uint8_t *a = (const uint8_t *)&s1, *c = (const uint8_t *)&s2;
+    for (uint32_t i = 0; i < sizeof(s1); i++)
+        if (a[i] != c[i])
+        {
+            if (hw_asm_chk_flatsub[1]++ == 0)
+            {
+                hw_asm_chk_flatsub[2] = i;
+                hw_asm_chk_flatsub[3] = (uint32_t)subnum;
+                hw_asm_chk_flatsub[4] = a[i];
+                hw_asm_chk_flatsub[5] = c[i];
+            }
+            break;
+        }
+}
+#define HW_SUBMIT_FLAT_JOB HW_FlatSubCheck
+#else
+static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+}
+#define HW_SUBMIT_FLAT_JOB hw_asm_flatsub
+#endif
+#else
+#define HW_SUBMIT_FLAT_JOB HW_SubmitSlaveFlatJob
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+const void *const hw_asm_flatsub_ctx[1] = { 0 };   /* saturn_hw_asm.s references it */
+#endif
+#endif
 
 #if HW_FLAT_STEAL && !defined(SATURN_WIN32)
 /* Frame start (before the first job is submitted): no limit yet. */

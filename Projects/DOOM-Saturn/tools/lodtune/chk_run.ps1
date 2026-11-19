@@ -30,7 +30,7 @@ foreach ($v in $Views.Split(';')) {
     $chk | Out-File -Encoding ascii "$out\chk_syms.txt"
     $rel = "tmp/doomprof/$Set/$n"
     $s = "frame 5400`nframe $Frames`n"
-    foreach ($c in $chk) { $s += "m 0x$($c.Split(' ')[0]) 24`n" }
+    foreach ($c in $chk) { $s += "m 0x$($c.Split(' ')[0]) 32`n" }
     $s += "q`n"
     [IO.File]::WriteAllText("$out\cmds.txt", $s, (New-Object Text.ASCIIEncoding))
     $procs += Start-Process -FilePath cmd.exe -WorkingDirectory $fp -NoNewWindow -PassThru -ArgumentList "/c target\release\sdbg.exe `"bios\Sega Saturn BIOS (USA).bin`" $rel\game.cue --cart=ram4m < $rel\cmds.txt > $rel\run.log"

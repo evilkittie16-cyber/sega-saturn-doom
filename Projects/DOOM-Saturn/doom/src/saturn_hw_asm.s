@@ -6515,3 +6515,645 @@ _hw_asm_subsector:
 
 	.align	2
 .Lu_ctx:	.long	_hw_asm_sub_ctx
+
+! ==========================================================================
+! Stage G: hw_asm_flatsub(sub_idx, subnum, sec, flags) =
+! HW_SubmitSlaveFlatJob + HW_RingFlatJob (saturn_hw_flats.c). Rare paths
+! (sector-cache refill, first alt-pyramid pack, deferred master job, split
+! candidate) go to the C function whole, decided before any side effect.
+! Table hw_asm_flatsub_ctx[37] (index list in saturn_hw_flats.c).
+! regs: r8 ctx, r9 fc, r10 fi then tail, r11 flags then ring, r12 sub_idx,
+! r13 subnum, r14 sec. Frame: @0 v_first @4 q_first @8 q @12 v @16 alt
+! @20 warp @24 use_lod1 @28 ef @32 ec @36 allow_sky @40 q_orig @44 w3
+! ==========================================================================
+	.align	2
+	.global	_hw_asm_flatsub
+_hw_asm_flatsub:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-48,r15
+	mov	r4,r12
+	mov	r5,r13
+	mov	r6,r14
+	mov	r7,r11
+	mov.l	.Lfj_ctx,r8
+	mov.l	@r8,r0
+	mov.l	@r0,r0			! saturn_baked_flat_q_count
+	tst	r0,r0
+	bt	.Lfj_ret
+	mov.l	@(4,r8),r10
+	mov	r13,r0
+	shll2	r0
+	shll2	r0
+	add	r0,r10			! fi
+	mov.w	@(4,r10),r0
+	extu.w	r0,r1			! q_count
+	tst	r1,r1
+	bt	.Lfj_ret
+	mov.w	@(6,r10),r0
+	extu.w	r0,r2			! v_count
+	tst	r2,r2
+	bt	.Lfj_ret
+	mov.l	@(8,r8),r9		! fc
+	mov.l	@r9,r0
+	cmp/eq	r14,r0
+	bt	.Lfj_hit
+	mov	#74,r0
+	shll	r0
+	mov.l	@(r0,r8),r0		! [37] HW_CacheFlatSectorInfo
+	jsr	@r0
+	mov	r14,r4
+	mov.w	@(4,r10),r0
+	extu.w	r0,r1			! q_count
+	mov.w	@(6,r10),r0
+	extu.w	r0,r2			! v_count
+.Lfj_hit:
+! emit flags
+	mov	r11,r0
+	shlr2	r0
+	and	#1,r0
+	mov	r0,r3
+	mov.b	@(14,r9),r0		! fc->emit_floor
+	and	r0,r3			! ef
+	mov	r11,r0
+	shlr2	r0
+	shlr	r0
+	and	#1,r0
+	mov.l	r0,@(36,r15)		! allow_sky
+	mov	r0,r4
+	mov.b	@(15,r9),r0		! fc->emit_ceil
+	and	r4,r0			! ec
+	mov.l	r0,@(32,r15)
+	mov.l	r3,@(28,r15)
+	or	r3,r0
+	tst	r0,r0
+	bt	.Lfj_ret
+	mov.l	r1,@(40,r15)		! q_orig
+! LOD0 / LOD1
+	mov	#0,r6
+	mov	r11,r0
+	tst	#16,r0
+	bt	.Lfj_l0
+	mov.w	@(12,r10),r0
+	extu.w	r0,r3			! lod1 q
+	tst	r3,r3
+	bt	.Lfj_l0
+	mov.w	@(14,r10),r0
+	extu.w	r0,r4			! lod1 v
+	tst	r4,r4
+	bt	.Lfj_l0
+	mov	r3,r1
+	mov	r4,r2
+	mov.w	@(8,r10),r0
+	extu.w	r0,r5			! lod1 q_first
+	mov.w	@(10,r10),r0
+	extu.w	r0,r7			! lod1 v_first
+	bra	.Lfj_l1
+	mov	#1,r6
+.Lfj_l0:
+	mov.w	@r10,r5
+	extu.w	r5,r5			! q_first
+	mov.w	@(2,r10),r0
+	extu.w	r0,r7			! v_first
+.Lfj_l1:
+	mov.l	r7,@r15
+	mov.l	r5,@(4,r15)
+	mov.l	r1,@(8,r15)
+	mov.l	r2,@(12,r15)
+	mov.l	r6,@(24,r15)
+! alt pyramid variant (HW_FlatAltVariant)
+	mov	#0,r3
+	mov.l	@(16,r8),r0
+	mov.l	@r0,r0			! saturn_baked_flat_quv
+	tst	r0,r0
+	bt	.Lfj_av
+	tst	r6,r6
+	bf/s	.Lfj_av			! LOD1: tile
+	mov	#2,r3
+	mov	#0,r3
+	mov.l	@(20,r8),r0
+	mov.l	@r0,r0			! subflags
+	tst	r0,r0
+	bt	.Lfj_bb
+	add	r13,r0
+	mov.b	@r0,r0
+	tst	#1,r0
+	bf/s	.Lfj_av			! TRANSPOSED
+	mov	#1,r3
+	mov	#0,r3
+.Lfj_bb:
+	mov.l	@(24,r8),r0
+	mov.l	@r0,r0			! bboxes
+	tst	r0,r0
+	bt	.Lfj_av
+	mov	r13,r4
+	shll2	r4
+	shll	r4
+	add	r0,r4			! bb
+	mov.l	@(28,r8),r1
+	mov.l	@r1,r1			! cam_x
+	mov.w	@r4,r2
+	add	#-128,r2
+	add	#-32,r2
+	cmp/gt	r2,r1			! cam_x > min_x - 160
+	bf	.Lfj_av
+	mov.w	@(2,r4),r0
+	add	#127,r0
+	add	#33,r0
+	cmp/gt	r1,r0			! max_x + 160 > cam_x
+	bf	.Lfj_av
+	mov.l	@(32,r8),r1
+	mov.l	@r1,r1			! cam_y
+	mov.w	@(4,r4),r0
+	add	#-128,r0
+	add	#-32,r0
+	cmp/gt	r0,r1
+	bf	.Lfj_av
+	mov.w	@(6,r4),r0
+	add	#127,r0
+	add	#33,r0
+	cmp/gt	r1,r0
+	bf	.Lfj_av
+	mov	#1,r3
+.Lfj_av:
+	mov	#0,r0
+	mov.l	r0,@(16,r15)		! alt = 0
+	tst	r3,r3
+	bt	.Lfj_na
+	mov	#36,r0
+	mov.b	@(r0,r9),r0		! fc->alt_have
+	tst	r3,r0
+	bf	.Lfj_ah
+	mov	r3,r10			! variant (fi is dead)
+	mov	r14,r4
+	mov	r3,r5
+	mov.b	@(14,r9),r0
+	extu.b	r0,r6			! fc->emit_floor
+	mov.b	@(15,r9),r0
+	extu.b	r0,r7			! fc->emit_ceil
+	mov	#76,r0
+	shll	r0
+	mov.l	@(r0,r8),r0		! [38] HW_FlatAltPack
+	jsr	@r0
+	nop
+	mov	r10,r3
+	mov	r0,r1
+	mov	r3,r0
+	cmp/eq	#1,r0
+	bt/s	.Lfj_as
+	mov	r9,r2
+	add	#4,r2			! tile_pack
+.Lfj_as:
+	mov.l	r1,@(28,r2)		! trans_pack / tile_pack
+	mov	r9,r2
+	add	#36,r2
+	mov.b	@r2,r0
+	or	r3,r0
+	mov.b	r0,@r2			! alt_have |= bit
+.Lfj_ah:
+	mov	r3,r0
+	cmp/eq	#1,r0
+	bf/s	.Lfj_tp
+	mov.l	@(32,r9),r1		! tile_pack
+	mov.l	@(28,r9),r1		! trans_pack
+.Lfj_tp:
+	mov.l	r1,@(16,r15)
+.Lfj_na:
+! deferred master job? (C)
+	mov.l	@(52,r8),r0
+	mov.l	@r0,r0			! saturn_hw_sky_visible
+	tst	r0,r0
+	bf	.Lfj_nd
+	mov.l	@(48,r8),r0
+	mov.l	@r0,r1
+	add	#1,r1			! fjob_idx
+	mov	#36,r0
+	cmp/gt	r0,r1
+	bf	.Lfj_nd
+	mov	r1,r0
+	tst	#1,r0
+	bf	.Lfj_nd
+	mov.l	@(56,r8),r0
+	mov.l	@r0,r0			! hw_def_flat_count
+	mov	#4,r1
+	cmp/ge	r1,r0
+	bt	.Lfj_nd
+	mov.l	@(60,r8),r0
+	mov.l	@r0,r1			! saturn_master_flat_q
+	mov.l	@(8,r15),r0
+	shll	r0
+	add	r0,r1
+	add	#8,r1
+	mov	#4,r0
+	shll8	r0			! CMDBUF_S_CAP
+	cmp/ge	r0,r1
+	bf	.Lfj_c
+.Lfj_nd:
+! split candidate? (C)
+	mov.l	@(24,r15),r0
+	tst	r0,r0
+	bf	.Lfj_ns
+	mov.l	@(8,r15),r1
+	mov	#96,r0
+	cmp/ge	r0,r1
+	bf	.Lfj_ns
+	mov	#64,r0
+	mov.l	@(r0,r8),r0
+	mov.l	@r0,r0			! chunks
+	tst	r0,r0
+	bt	.Lfj_ns
+	mov.l	@(44,r8),r0
+	mov.l	@r0,r0			! sub_chunk
+	tst	r0,r0
+	bt	.Lfj_ns
+	mov	r13,r1
+	add	r1,r1
+	mov.w	@(r0,r1),r0
+	extu.w	r0,r0
+	tst	r0,r0
+	bf	.Lfj_c
+.Lfj_ns:
+! warp bits (HW_WarpJobBits)
+	mov	#-1,r6
+	extu.b	r6,r6			! ff
+	mov	r6,r7			! cf
+	mov.l	@(20,r8),r0
+	mov.l	@r0,r0			! subflags
+	tst	r0,r0
+	bt	.Lfj_wd
+	add	r13,r0
+	mov.b	@r0,r1
+	mov.l	@(24,r15),r0
+	tst	r0,r0
+	mov	#2,r0
+	bt	.Lfj_w2
+	mov	#4,r0
+.Lfj_w2:
+	tst	r0,r1
+	bt	.Lfj_wd
+	mov.l	@(28,r15),r0
+	tst	r0,r0
+	bt	.Lfj_wc
+	mov.w	@(8,r14),r0		! floorpic
+	bsr	.Lfj_tr
+	nop
+	mov	r0,r6
+.Lfj_wc:
+	mov.l	@(32,r15),r0
+	tst	r0,r0
+	bt	.Lfj_wd
+	mov.w	@(10,r14),r0		! ceilingpic
+	bsr	.Lfj_tr
+	nop
+	mov	r0,r7
+.Lfj_wd:
+	shll8	r6
+	shll16	r6
+	shll16	r7
+	or	r7,r6
+	mov.l	r6,@(20,r15)		! warp
+	bra	.Lfj_go
+	nop
+.Lfj_ret:
+	add	#48,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+.Lfj_c:
+	mov	r12,r4
+	mov	r13,r5
+	mov	r14,r6
+	mov	r11,r7
+	mov.l	@(12,r8),r1		! C fallback
+	add	#48,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	jmp	@r1
+	mov.l	@r15+,r8
+	.align	2
+.Lfj_ctx:	.long	_hw_asm_flatsub_ctx
+.Lfj_go:
+! ---- committed: side effects from here ----
+	mov.l	@(24,r15),r0
+	tst	r0,r0
+	bt/s	.Lfj_c0
+	mov	#84,r0			! lod0_subs
+	mov.l	@(40,r15),r1
+	mov.l	@(8,r15),r2
+	cmp/gt	r2,r1
+	bf	.Lfj_c1
+	sub	r2,r1
+	mov	#76,r0
+	mov.l	@(r0,r8),r3		! lod_saved_quads
+	mov.l	@r3,r0
+	add	r1,r0
+	mov.l	r0,@r3
+.Lfj_c1:
+	mov	#80,r0			! lod1_subs
+.Lfj_c0:
+	mov.l	@(r0,r8),r3
+	mov.l	@r3,r0
+	add	#1,r0
+	mov.l	r0,@r3
+	mov.l	@(16,r15),r1
+	mov	#68,r0
+	mov.l	@(r0,r8),r2
+	mov.l	r1,@r2			! hw_def_alt_pack
+	mov.l	@(20,r15),r1
+	mov	#72,r0
+	mov.l	@(r0,r8),r2
+	mov.l	r1,@r2			! hw_def_warp_bits
+! w3 = ef << 24 | ec << 16 | (flags & 19) << 8 | sky [| chunk]
+	mov	#16,r0
+	mov.b	@(r0,r9),r0		! fc->is_sky
+	mov.l	@(36,r15),r1
+	and	r0,r1
+	mov	r11,r0
+	and	#19,r0
+	shll8	r0
+	or	r0,r1
+	mov.l	@(32,r15),r0
+	shll16	r0
+	or	r0,r1
+	mov.l	@(28,r15),r0
+	shll8	r0
+	shll16	r0
+	or	r0,r1
+	mov.l	@(24,r15),r0
+	tst	r0,r0
+	bf	.Lfj_nc
+	mov.l	@(44,r8),r0
+	mov.l	@r0,r0			! sub_chunk
+	tst	r0,r0
+	bt	.Lfj_nc
+	mov	r13,r2
+	add	r2,r2
+	mov.w	@(r0,r2),r0
+	extu.w	r0,r0			! c
+	mov	r0,r2
+	and	#127,r0
+	shll8	r0
+	shll16	r0
+	shll	r0			! (c & 0x7F) << 25
+	or	r0,r1
+	mov	r2,r0
+	shlr2	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#127,r0
+	shll16	r0
+	shll	r0			! ((c >> 7) & 0x7F) << 17
+	or	r0,r1
+.Lfj_nc:
+	mov.l	r1,@(44,r15)		! w3
+	mov.l	@(48,r8),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	mov.l	r0,@r1			! ++hw_frame_flat_jobs
+! ---- ring (HW_RingFlatJob) ----
+	mov	r8,r6
+	add	#127,r6
+	add	#1,r6			! ctx + 128: [32..36]
+	mov	#88,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r10			! tail
+	mov	r10,r0
+	add	#1,r0
+	mov.l	r0,@r1			! hw_master_job_tail = tail + 1
+	mov	#92,r0
+	mov.l	@(r0,r8),r11
+	mov.l	.Lfj_unc,r0
+	or	r0,r11			! ipc (uncached)
+	mov.l	@(48,r11),r0		! job_head
+	mov	r10,r1
+	sub	r0,r1			! depth
+	mov	#96,r0
+	mov.l	@(r0,r8),r2
+	mov.l	@r2,r0
+	cmp/hi	r0,r1
+	bf	.Lfj_md
+	mov.l	r1,@r2			! saturn_hw_ring_maxdepth
+.Lfj_md:
+	mov	#-1,r0
+	extu.b	r0,r0			! HW_JOB_RING - 1
+	cmp/hs	r0,r1
+	bf	.Lfj_nf
+	mov	#100,r0
+	mov.l	@(r0,r8),r2
+	mov.l	@r2,r0
+	add	#1,r0
+	mov.l	r0,@r2			! saturn_hw_ring_waits++
+.Lfj_wt:
+	mov	#32,r0
+.Lfj_y:
+	dt	r0
+	bf	.Lfj_y
+	mov.l	@(48,r11),r0
+	mov	r10,r1
+	sub	r0,r1
+	mov	#-1,r0
+	extu.b	r0,r0
+	cmp/hs	r0,r1
+	bt	.Lfj_wt
+.Lfj_nf:
+	mov	r10,r0
+	extu.b	r0,r0			! ring_idx
+	shll2	r0
+	shll2	r0
+	shll	r0			! idx << 5
+	mov	r0,r1
+	shll	r0
+	add	r1,r0			! idx * 96
+	add	#64,r0
+	mov	r11,r7
+	add	r0,r7			! jw
+	mov	#104,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r1			! verts
+	mov.l	@r15,r2
+	shll2	r2
+	add	r2,r1
+	mov.l	r1,@r7			! jw[0]
+	mov	#108,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r1			! quads
+	mov.l	@(4,r15),r2
+	shll2	r2
+	shll	r2
+	add	r2,r1
+	mov.l	r1,@(4,r7)		! jw[1]
+	mov.l	@(12,r15),r1
+	shll16	r1
+	mov.l	@(8,r15),r2
+	or	r2,r1
+	mov.l	r1,@(8,r7)		! jw[2] vq
+	mov	#116,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r4			! dirty
+	mov	#0,r0
+	mov.l	r0,@r1			! hw_slave_dirty_words = 0
+	mov.l	@(44,r15),r5		! w3
+	mov	#120,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r0
+	tst	r0,r0
+	bt	.Lfj_nfj
+	mov	#0,r0
+	mov.l	r0,@r1			! hw_first_flat_job = 0
+	mov	r5,r0
+	or	#2,r0
+	mov	r0,r5
+	mov.l	@(12,r6),r1
+	mov.l	@r1,r4			! dirty = hw_solid_any
+.Lfj_nfj:
+	mov.l	r5,@(12,r7)		! jw[3]
+	mov.l	@(4,r9),r0
+	mov.l	r0,@(16,r7)		! jw[4] srca_pack
+	mov.l	@(20,r9),r0
+	mov.l	r0,@(20,r7)		! jw[5] y_floor_w
+	mov	#112,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r1			! vfrac
+	tst	r1,r1
+	bt	.Lfj_vf
+	mov.l	@r15,r0
+	add	r0,r1
+.Lfj_vf:
+	mov.l	r1,@(24,r7)		! jw[6]
+	mov.l	@(24,r9),r0
+	mov.l	r0,@(28,r7)		! jw[7] y_ceil_w
+	mov	#124,r0
+	mov.l	@(r0,r8),r1
+	mov.w	@r1,r1			! cur_sub_ytop << 8 | cur_sub_ybot
+	shll16	r1
+	mov.w	@(12,r9),r0
+	extu.w	r0,r0			! light_bits
+	or	r0,r1
+	mov	#-1,r0
+	shlr16	r0
+	shlr2	r0
+	shlr2	r0			! 0x0FFF
+	and	r12,r0
+	or	r0,r1
+	mov.l	r1,@(32,r7)		! jw[8]
+	mov.l	@r6,r1
+	mov.l	@r1,r1			! hw_solid_count
+	shll16	r1
+	extu.w	r4,r0
+	or	r0,r1
+	mov.l	r1,@(40,r7)		! jw[10]
+	mov	r7,r2
+	add	#64,r2
+	mov.l	@(16,r15),r0
+	mov.l	r0,@(24,r2)		! jw[22] alt
+	mov.l	@(40,r9),r1		! avg_pack
+	mov.l	@(20,r15),r0
+	or	r0,r1
+	mov.l	r1,@(28,r2)		! jw[23]
+	tst	r4,r4
+	bt	.Lfj_nd2
+	mov.l	@(4,r6),r1
+	mov.l	@r1,r0
+	mov.l	r0,@(36,r7)		! jw[9] summary
+	mov.l	@(8,r6),r1		! hw_solid_mask
+	mov	r7,r2
+	add	#44,r2			! &jw[11]
+.Lfj_dl:
+	shlr	r4
+	bf	.Lfj_ds
+	mov.l	@r1,r0
+	mov.l	r0,@r2
+.Lfj_ds:
+	add	#4,r1
+	tst	r4,r4
+	bf/s	.Lfj_dl
+	add	#4,r2
+.Lfj_nd2:
+! steal snapshot (full mask state at submit)
+	mov	r10,r0
+	and	#63,r0
+	mov	#52,r1
+	mulu.w	r1,r0
+	sts	macl,r2
+	mov.l	@(16,r6),r1
+	add	r1,r2			! sn
+	mov.l	@(4,r6),r1
+	mov.l	@r1,r0
+	mov.l	r0,@r2			! summary
+	mov.l	@r6,r1
+	mov.l	@r1,r0
+	shll16	r0
+	mov.l	@(12,r6),r1
+	mov.l	@r1,r1
+	extu.w	r1,r1
+	or	r1,r0
+	mov.l	r0,@(4,r2)		! count << 16 | any
+	mov.l	@(8,r6),r1
+	add	#8,r2
+	mov	#11,r3
+.Lfj_sl:
+	mov.l	@r1+,r0
+	dt	r3
+	mov.l	r0,@r2
+	bf/s	.Lfj_sl
+	add	#4,r2
+	mov	r10,r0
+	add	#1,r0
+	mov.l	r0,@(32,r11)		! publish: ipc->job_tail = tail + 1
+	add	#48,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+	.align	2
+.Lfj_unc:	.long	0x20000000
+
+! r0 = flat pic -> translated flat if (unsigned)f < 255 && f < numflats,
+! else 0xFF. Clobbers r1.
+.Lfj_tr:
+	mov.l	@(36,r8),r1
+	mov.l	@r1,r1			! flattranslation
+	tst	r1,r1
+	bt	.Lfj_t1
+	add	r0,r1
+	mov.b	@r1,r0
+	extu.b	r0,r0
+.Lfj_t1:
+	mov	#-1,r1
+	extu.b	r1,r1
+	cmp/hs	r1,r0
+	bt	.Lfj_t2
+	mov.l	@(40,r8),r1
+	mov.w	@r1,r1			! numflats
+	cmp/ge	r1,r0
+	bf	.Lfj_t3
+.Lfj_t2:
+	mov	#-1,r0
+	extu.b	r0,r0
+.Lfj_t3:
+	rts
+	nop
