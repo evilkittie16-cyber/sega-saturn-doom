@@ -5182,3 +5182,625 @@ _hw_asm_subsec:
 	.align	2
 .Lv_ctx:	.long	_hw_asm_subsec_ctx
 .Lv_subap:	.long	_hw_asm_subap
+! ===================================================================
+! Stage E1: hw_asm_cullbox(bbox r4, fully_inside r5) -> -1 culled, else
+! the new fully_inside == HW_CullBSPBBox (saturn_hw_walls.c) with
+! HW_CheckBBoxStatus, HW_CheckBBoxOccluded and HW_IsClippedSpanOccluded /
+! HW_IsSpanOccluded inline. hw_asm_bsp(root r4, inside r5) ==
+! HW_RenderBSPNode minus the root-leaf case (C wrapper). Table
+! hw_asm_bsp_ctx: [0] &hw_frust [4] &hw_cam_x [8] &hw_cam_y
+! [12] &hw_solid_count [16] &saturn_hw_bsp_occl [20] &saturn_hw_occl_culls
+! [24] saturn_master_oclut [28] hw_solid_mask [32] hw_mask_left
+! [36] hw_mask_right [40] hw_span_mask_lut [44] &hw_solid_any
+! [48] &hw_solid_summary [52] &saturn_view_w [56] &nodes [60] bsp stack
+! [64] HW_RenderSubsector_Body [68] &hw_node_bboxes
+! [72] &saturn_baked_flat_bboxes [76] &saturn_hw_bsp_abort
+! hw_frust: idx bytes 0..11, Nx 12 Ny 14 Lx 16 Ly 18 Rx 20 Ry 22,
+! Cn 24 Cl 28 Cr 32, cz_off12 36, cx_off12 40.
+! ===================================================================
+! r1 = bbox@f[ix]*f[px] + bbox@f[iy]*f[py] + f[c]; r4 bbox, r6 f;
+! clobbers r0, r2, r3 (== HW_FRUST_DOT)
+	.macro	BFDOT ix, iy, px, py, c
+	mov.b	@(\ix,r6),r0
+	mov.w	@(r0,r4),r2
+	mov.w	@(\px,r6),r0
+	muls.w	r0,r2
+	mov.b	@(\iy,r6),r0
+	mov.w	@(r0,r4),r2
+	mov.w	@(\py,r6),r0
+	sts	macl,r1
+	muls.w	r0,r2
+	mov.l	@(\c,r6),r3
+	add	r3,r1
+	sts	macl,r3
+	add	r3,r1
+	.endm
+! HW_FastDiv: r0 = cz -> saturn_master_oclut[dist]; r7 ctx, clobbers r5
+	.macro	BFDIV
+	shlr16	r0
+	mov	#8,r5
+	shll8	r5			! 2048
+	cmp/hs	r5,r0
+	bf	1f
+	shlr2	r0
+	shlr	r0
+	mov	#4,r5
+	shll8	r5
+	add	#-1,r5			! 1023
+	and	r5,r0
+	mov	#8,r5
+	shll8	r5
+	add	r5,r0			! 2048 + ((dist >> 3) & 1023)
+1:
+	shll2	r0
+	mov.l	@(24,r7),r5
+	mov.l	@(r0,r5),r0
+	.endm
+
+	.align	2
+	.global	_hw_asm_cullbox
+_hw_asm_cullbox:
+.Lb_cull:
+	mov.l	.Lb_ctx,r7
+	tst	r5,r5
+	bf/s	.Lb_occq		! already fully inside: occlusion only
+	mov.l	@r7,r6			! f
+! ---- HW_CheckBBoxStatus ----
+	mov.w	@(4,r4),r0
+	mov	r0,r1			! bl
+	mov.w	@(6,r4),r0
+	mov	r0,r2			! br
+	cmp/gt	r2,r1
+	bt	.Lb_ret0		! INTERSECT_NEAR
+	mov.w	@(2,r4),r0
+	mov	r0,r3			! bb
+	mov.w	@r4,r0			! bt
+	cmp/gt	r0,r3
+	bt	.Lb_ret0
+	mov.l	@(4,r7),r5
+	mov.l	@r5,r5			! vx
+	cmp/ge	r1,r5
+	bf	.Lb_st1
+	cmp/gt	r2,r5
+	bt	.Lb_st1
+	mov.l	@(8,r7),r1
+	mov.l	@r1,r1			! vy
+	cmp/ge	r3,r1
+	bf	.Lb_st1
+	cmp/gt	r0,r1
+	bf	.Lb_ret0		! viewer inside the box
+.Lb_st1:
+	BFDOT	0, 1, 12, 14, 24
+	mov	#64,r2
+	shll8	r2			! 4 << 12
+	cmp/ge	r2,r1
+	bf	.Lb_retm1
+	BFDOT	2, 3, 16, 18, 28
+	mov	#-1,r2
+	shll16	r2			! -(16 << 12)
+	cmp/ge	r2,r1
+	bf	.Lb_retm1
+	BFDOT	4, 5, 20, 22, 32
+	mov	#-1,r2
+	shll16	r2
+	cmp/ge	r2,r1
+	bf	.Lb_retm1
+	BFDOT	6, 7, 12, 14, 24
+	mov	#4,r2
+	shll8	r2
+	shll16	r2			! 16384 << 12
+	cmp/gt	r2,r1
+	bt	.Lb_retm1
+	mov	#64,r2
+	shll8	r2
+	cmp/ge	r2,r1
+	bf	.Lb_ret0		! INTERSECT_NEAR
+	mov	#0,r5			! INTERSECT: fully_inside stays 0
+	mov	#1,r2
+	shll16	r2			! 16 << 12
+	cmp/ge	r2,r1
+	bf	.Lb_nv
+	BFDOT	8, 9, 16, 18, 28
+	cmp/pz	r1
+	bf	.Lb_nv
+	BFDOT	10, 11, 20, 22, 32
+	cmp/pz	r1
+	bf	.Lb_nv
+	mov	#1,r5			! FULLY_INSIDE
+.Lb_nv:
+	bra	.Lb_q
+	mov	#1,r3			! near_verified
+.Lb_occq:
+	mov	#0,r3
+! ---- occlusion: r3 near_verified, r5 fully_inside ----
+.Lb_q:
+	mov.l	@(12,r7),r0
+	mov.l	@r0,r0			! hw_solid_count
+	cmp/pl	r0
+	bf	.Lb_retfi
+	mov	r0,r2
+	mov.l	@(16,r7),r0
+	mov.l	@r0,r0			! saturn_hw_bsp_occl
+	cmp/eq	#2,r0
+	bt	.Lb_retfi
+	mov.l	@(52,r7),r1
+	mov.l	@r1,r1			! saturn_view_w
+	cmp/ge	r1,r2
+	bt	.Lb_cullit
+	tst	r3,r3
+	bf	.Lb_oc1
+	BFDOT	6, 7, 12, 14, 24
+	mov	#64,r2
+	shll8	r2
+	cmp/ge	r2,r1
+	bf	.Lb_retfi
+.Lb_oc1:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r5,@-r15
+	mov.l	@(4,r7),r8
+	mov.l	@r8,r8			! cam_x
+	mov.l	@(8,r7),r9
+	mov.l	@r9,r9			! cam_y
+	mov	#0,r1			! boxpos
+	mov.w	@(4,r4),r0		! bl
+	cmp/gt	r0,r8
+	bf	.Lb_bp1
+	mov.w	@(6,r4),r0		! br
+	cmp/gt	r8,r0
+	movt	r2
+	mov	#2,r1
+	sub	r2,r1			! cam_x < br ? 1 : 2
+.Lb_bp1:
+	mov.w	@r4,r0			! bt
+	cmp/gt	r9,r0
+	bf	.Lb_bp2
+	mov.w	@(2,r4),r0		! bb
+	cmp/gt	r0,r9
+	movt	r0
+	shll2	r0
+	mov	#8,r2
+	sub	r0,r2			! cam_y > bb ? 4 : 8
+	or	r2,r1
+.Lb_bp2:
+	mov	r1,r0
+	cmp/eq	#5,r0
+	bt	.Lb_ocno
+	shll2	r1
+	mova	.Lb_cc,r0
+	add	r1,r0
+	mov	r0,r10
+	mov.b	@r10+,r0
+	mov.w	@(r0,r4),r1
+	sub	r8,r1			! dx1
+	mov.b	@r10+,r0
+	mov.w	@(r0,r4),r2
+	sub	r9,r2			! dy1
+	mov.b	@r10+,r0
+	mov.w	@(r0,r4),r3
+	sub	r8,r3			! dx2
+	mov.b	@r10+,r0
+	mov.w	@(r0,r4),r11
+	sub	r9,r11			! dy2
+	mov.w	@(12,r6),r0
+	mov	r0,r8			! nx
+	mov.w	@(14,r6),r0
+	mov	r0,r9			! ny
+	muls.w	r1,r8
+	mov.l	@(36,r6),r0		! cz_off12
+	sts	macl,r5
+	muls.w	r2,r9
+	add	r5,r0
+	sts	macl,r5
+	add	r5,r0
+	shll2	r0
+	shll2	r0			! cz1
+	mov	#4,r5
+	shll16	r5			! HW_NEAR_Z
+	cmp/ge	r5,r0
+	bf	.Lb_ocno
+	mov	r0,r10			! cz1
+	muls.w	r3,r8
+	mov.l	@(36,r6),r0
+	sts	macl,r5
+	muls.w	r11,r9
+	add	r5,r0
+	sts	macl,r5
+	add	r5,r0
+	shll2	r0
+	shll2	r0			! cz2
+	mov	#4,r5
+	shll16	r5
+	cmp/ge	r5,r0
+	bf	.Lb_ocno
+	mov	r0,r4			! cz2 (bbox no longer needed)
+	neg	r8,r8			! -nx
+	muls.w	r1,r9
+	mov.l	@(40,r6),r1		! cx_off12
+	sts	macl,r5
+	muls.w	r2,r8
+	add	r5,r1
+	sts	macl,r5
+	add	r5,r1
+	shll2	r1
+	shll2	r1			! cx1
+	muls.w	r3,r9
+	mov.l	@(40,r6),r3
+	sts	macl,r5
+	muls.w	r11,r8
+	add	r5,r3
+	sts	macl,r5
+	add	r5,r3
+	shll2	r3
+	shll2	r3			! cx2
+	mov	r10,r0
+	BFDIV
+	mov	r0,r10			! s1
+	mov	r4,r0
+	BFDIV				! s2
+	dmuls.l	r1,r10
+	mov	#80,r2
+	add	r2,r2			! HW_VIEW_CX
+	sts	mach,r1
+	dmuls.l	r3,r0
+	add	r2,r1			! px1
+	sts	mach,r3
+	add	r2,r3			! px2
+	cmp/gt	r3,r1
+	bf	.Lb_mm
+	mov	r1,r0
+	mov	r3,r1
+	mov	r0,r3
+.Lb_mm:					! r1 min_x, r3 max_x
+	mov	#-1,r0
+	cmp/ge	r0,r3
+	bf	.Lb_ocyes
+	mov	#80,r0
+	shll2	r0
+	add	#1,r0			! 321
+	cmp/gt	r0,r1
+	bt	.Lb_ocyes
+	cmp/pl	r3
+	bf	.Lb_ocno
+	add	#-1,r0			! 320
+	cmp/ge	r0,r1
+	bt	.Lb_ocno
+	add	#-1,r1
+	add	#1,r3
+	cmp/pz	r1
+	bt	.Lb_c0
+	mov	#0,r1
+.Lb_c0:
+	cmp/gt	r0,r3
+	bf	.Lb_c1
+	mov	r0,r3
+.Lb_c1:
+	add	#-1,r3			! x1 - 1
+	mov	r1,r0
+	xor	r3,r0
+	mov	#32,r5
+	cmp/hs	r5,r0
+	bt	.Lb_multi
+	mov	r1,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(32,r7),r5
+	mov.l	@(r0,r5),r5		! ml[b0]
+	mov	r3,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(36,r7),r2
+	mov.l	@(r0,r2),r2		! mr[b1]
+	and	r2,r5			! mask
+	mov	r1,r0
+	shlr2	r0
+	shlr	r0
+	and	#0xFC,r0
+	mov.l	@(28,r7),r2
+	mov.l	@(r0,r2),r2
+	and	r5,r2
+	cmp/eq	r5,r2
+	bt	.Lb_ocyes
+	bra	.Lb_ocno
+	nop
+.Lb_multi:				! == HW_IsSpanOccluded, x0 < x1 in range
+	mov.l	@(12,r7),r0
+	mov.l	@r0,r0
+	mov	#80,r5
+	shll2	r5
+	cmp/ge	r5,r0
+	bt	.Lb_ocyes
+	mov	r1,r0
+	shlr2	r0
+	shlr	r0
+	and	#0xFC,r0
+	mov	r0,r8			! w0 * 4
+	mov	r3,r0
+	shlr2	r0
+	shlr	r0
+	and	#0xFC,r0
+	mov	r0,r9			! w1 * 4
+	mov.l	@(40,r7),r10		! hw_span_mask_lut
+	add	#4,r0
+	mov.l	@(r0,r10),r2
+	mov	r8,r0
+	mov.l	@(r0,r10),r0
+	xor	r0,r2			! all_words
+	mov.l	@(44,r7),r0
+	mov.l	@r0,r0
+	and	r2,r0
+	cmp/eq	r2,r0
+	bf	.Lb_ocno
+	mov	r1,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(32,r7),r5
+	mov.l	@(r0,r5),r5		! mask0
+	mov.l	@(28,r7),r11		! hw_solid_mask
+	mov	r8,r0
+	mov.l	@(r0,r11),r0
+	and	r5,r0
+	cmp/eq	r5,r0
+	bf	.Lb_ocno
+	mov	r8,r0
+	add	#4,r0
+	cmp/gt	r0,r9
+	bf	.Lb_m2
+	mov.l	@(r0,r10),r2		! lut[w0 + 1]
+	mov	r9,r0
+	mov.l	@(r0,r10),r0
+	xor	r0,r2			! req_bits
+	mov.l	@(48,r7),r0
+	mov.l	@r0,r0
+	and	r2,r0
+	cmp/eq	r2,r0
+	bf	.Lb_ocno
+.Lb_m2:
+	mov	r3,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(36,r7),r5
+	mov.l	@(r0,r5),r5		! mask1
+	mov	r9,r0
+	mov.l	@(r0,r11),r0
+	and	r5,r0
+	cmp/eq	r5,r0
+	bt	.Lb_ocyes
+.Lb_ocno:
+	mov.l	@r15+,r5
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	mov.l	@r15+,r8
+.Lb_retfi:
+	rts
+	mov	r5,r0
+.Lb_ocyes:
+	mov.l	@r15+,r5
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	mov.l	@r15+,r8
+.Lb_cullit:
+	mov.l	@(20,r7),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	mov.l	r0,@r1			! saturn_hw_occl_culls++
+.Lb_retm1:
+	rts
+	mov	#-1,r0
+.Lb_ret0:
+	rts
+	mov	#0,r0
+
+	.align	2
+.Lb_ctx:	.long	_hw_asm_bsp_ctx
+! Carmack two-corner silhouette table, byte offsets (TOP 0 BOTTOM 2
+! LEFT 4 RIGHT 6), indexed by boxpos * 4
+.Lb_cc:
+	.byte	6,0,4,2,  6,0,4,0,  6,2,4,0,  0,0,0,0
+	.byte	4,0,4,2,  0,0,0,0,  6,2,6,0,  0,0,0,0
+	.byte	4,0,6,2,  4,2,6,2,  4,2,6,0,  0,0,0,0
+
+! -------------------------------------------------------------------
+! hw_asm_bsp: r8 ctx, r9 stack ptr, r10 stack base, r11 bspnum,
+! r12 fully_inside, r13 nodes, r14 front child across the cull call.
+! Stack entry: u16 bspnum, s16 fully_inside, bbox pointer.
+! -------------------------------------------------------------------
+	.align	2
+	.global	_hw_asm_bsp
+_hw_asm_bsp:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	mov.l	.Lb_ctx2,r8
+	mov.l	@(56,r8),r13
+	mov.l	@r13,r13		! nodes
+	mov.l	@(60,r8),r10		! stack base
+	mov	r10,r9
+	mov	r4,r0
+	mov.w	r0,@r9
+	mov	r5,r0
+	mov.w	r0,@(2,r9)
+	mov	#0,r0
+	mov.l	r0,@(4,r9)
+	add	#8,r9
+.Lb_outer:
+	cmp/hi	r10,r9
+	bf	.Lb_out
+	mov.l	@(12,r8),r0
+	mov.l	@r0,r0
+	mov	#80,r1
+	shll2	r1
+	cmp/ge	r1,r0
+	bt	.Lb_abort
+	add	#-8,r9
+	mov.w	@r9,r0
+	extu.w	r0,r11
+	mov.w	@(2,r9),r0
+	mov	r0,r12
+	mov.l	@(4,r9),r4
+	tst	r4,r4
+	bt	.Lb_inner
+	tst	r12,r12
+	bt	.Lb_pc
+	mov.l	@(12,r8),r0
+	mov.l	@r0,r0
+	cmp/pl	r0
+	bf	.Lb_inner
+	mov.l	@(16,r8),r0
+	mov.l	@r0,r0
+	cmp/eq	#2,r0
+	bt	.Lb_inner
+.Lb_pc:
+	bsr	.Lb_cull
+	mov	r12,r5
+	cmp/pz	r0
+	bf	.Lb_outer
+	mov	r0,r12
+.Lb_inner:
+	exts.w	r11,r0
+	cmp/pz	r0
+	bt	.Lb_node
+	cmp/eq	#-1,r0
+	bt	.Lb_outer
+	mov	r11,r4
+	shll16	r4
+	shll	r4
+	shlr16	r4
+	shlr	r4			! bspnum & 0x7FFF
+	mov	r12,r5
+	mov	#64,r0
+	mov.l	@(r0,r8),r0
+	jsr	@r0			! HW_RenderSubsector_Body(sub, fully, NULL)
+	mov	#0,r6
+	bra	.Lb_outer
+	nop
+.Lb_node:
+	mov	r11,r1
+	shll2	r1
+	shll2	r1
+	add	r13,r1			! &nodes[bspnum]
+	mov.l	@(4,r8),r2
+	mov.l	@r2,r2			! cam_x
+	mov.l	@(8,r8),r3
+	mov.l	@r3,r3			! cam_y
+	mov.w	@r1+,r4
+	mov.w	@r1+,r5
+	sub	r2,r4			! x - cam_x
+	sub	r3,r5			! y - cam_y
+	mov.w	@r1+,r6			! dx
+	muls.w	r5,r6
+	mov.w	@r1+,r7			! dy
+	add	#4,r1
+	sts	macl,r5
+	muls.w	r4,r7
+	mov.w	@r1+,r6			! c0
+	mov.w	@r1+,r7			! c1
+	sts	macl,r4
+	cmp/ge	r5,r4
+	movt	r2			! side
+	tst	r2,r2
+	bt	.Lb_s0
+	mov	r6,r0
+	mov	r7,r6
+	mov	r0,r7
+.Lb_s0:					! r6 front, r7 back
+	mov	#68,r0
+	mov.l	@(r0,r8),r3
+	mov.l	@r3,r3			! hw_node_bboxes
+	mov	r11,r1
+	shll2	r1
+	shll2	r1
+	add	r3,r1			! hw_node_bboxes[bspnum]
+	mov	r7,r0
+	cmp/eq	#-1,r0
+	bt	.Lb_nob
+	mov	#2,r0
+	shll8	r0
+	add	r10,r0			! stack end
+	cmp/hs	r0,r9
+	bt	.Lb_nob
+	tst	r3,r3
+	bt/s	.Lb_pb
+	mov	#0,r4
+	cmp/pz	r7
+	bt	.Lb_cb
+	mov	#72,r0
+	mov.l	@(r0,r8),r0
+	mov.l	@r0,r0			! saturn_baked_flat_bboxes
+	tst	r0,r0
+	bf	.Lb_pb
+.Lb_cb:
+	mov	r2,r0
+	xor	#1,r0
+	shll2	r0
+	shll	r0
+	add	r1,r0
+	mov	r0,r4			! [bspnum][side ^ 1]
+.Lb_pb:
+	mov	r7,r0
+	mov.w	r0,@r9
+	mov	r12,r0
+	mov.w	r0,@(2,r9)
+	mov.l	r4,@(4,r9)
+	add	#8,r9
+.Lb_nob:
+	mov	r6,r0
+	cmp/eq	#-1,r0
+	bt	.Lb_outer
+	cmp/pz	r6
+	bf	.Lb_adv
+	tst	r3,r3
+	bt	.Lb_adv
+	tst	r12,r12
+	bt	.Lb_fc
+	mov.l	@(12,r8),r0
+	mov.l	@r0,r0
+	cmp/pl	r0
+	bf	.Lb_adv
+	mov.l	@(16,r8),r0
+	mov.l	@r0,r0
+	cmp/eq	#2,r0
+	bt	.Lb_adv
+.Lb_fc:
+	shll2	r2
+	shll	r2
+	add	r2,r1
+	mov	r1,r4			! [bspnum][side]
+	mov	r6,r14
+	bsr	.Lb_cull
+	mov	r12,r5
+	cmp/pz	r0
+	bf	.Lb_outer
+	mov	r0,r12
+	mov	r14,r6
+.Lb_adv:
+	bra	.Lb_inner
+	mov	r6,r11
+.Lb_abort:
+	mov	#76,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	mov.l	r0,@r1			! saturn_hw_bsp_abort++
+.Lb_out:
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+	.align	2
+.Lb_ctx2:	.long	_hw_asm_bsp_ctx

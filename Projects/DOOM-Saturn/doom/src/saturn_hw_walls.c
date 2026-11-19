@@ -49,6 +49,20 @@ HW_ALWAYS_INLINE int HW_SegLight16(const baked_seg_t *seg)
     })
 #endif
 
+/* Compact rewrite stage E1: the BSP walk (HW_RenderBSPNode) and its node
+ * cull (HW_CullBSPBBox = CheckBBoxStatus + CheckBBoxOccluded +
+ * IsClippedSpanOccluded) are hw_asm_bsp / hw_asm_cullbox in
+ * saturn_hw_asm.s. The C below is the check-build reference only. */
+#ifdef HW_SUBMAX
+#define HW_BSP_SUBMAX_ HW_SUBMAX
+#else
+#define HW_BSP_SUBMAX_ HW_PROF_SUBTIMERS
+#endif
+#ifndef HW_ASM_BSP
+#define HW_ASM_BSP (HW_ASM && !HW_VIS_STATS && !HW_BSP_SUBMAX_)
+#endif
+
+#if !HW_ASM_BSP || HW_ASM_CHECK
 /* Fast 2D Map-Space AABB Frustum Test with Full-Accept & Near-Intersect Detection.
  * Evaluates exact bounding box boundaries against 2D frustum planes in map space.
  * Returns BBOX_OUTSIDE (0) if guaranteed outside view frustum (culled).
@@ -258,6 +272,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CullBSPBBox(const int16_t *bbox, int fully_i
     }
     return fully_inside;
 }
+#endif /* !HW_ASM_BSP || HW_ASM_CHECK */
 
 /* Precomputed inverses for du_vis in [1..16] (replaces runtime divisions with 1-cycle multiply-shift) */
 static const int32_t saturn_inv_du_vis_lut[17] = {

@@ -281,6 +281,63 @@ typedef struct {
 
 #define HW_BSP_STACK_MAX 64
 
+#if HW_ASM_BSP
+/* Stage E1 (saturn_hw_asm.s): hw_asm_bsp(root, inside) walks the tree,
+ * hw_asm_cullbox(bbox, fully_inside) = HW_CullBSPBBox. Table: */
+extern void hw_asm_bsp(int root_bspnum, int root_inside);
+extern int  hw_asm_cullbox(const int16_t *bbox, int fully_inside);
+static bsp_stack_t hw_bsp_stack[HW_BSP_STACK_MAX];
+_Static_assert(sizeof(bsp_stack_t) == 8, "hw_asm_bsp: 8-byte stack entries");
+_Static_assert(sizeof(node_t) == 16, "hw_asm_bsp: 16-byte nodes");
+_Static_assert(HW_VIEW_W == 320 && HW_VIEW_CX == 160, "hw_asm_cullbox: 320 columns");
+_Static_assert(HW_NEAR_Z_UNITS == 4 && HW_FAR_Z_UNITS == 16384, "hw_asm_cullbox: near/far");
+const void *const hw_asm_bsp_ctx[20] = {
+    &hw_frust, &hw_cam_x, &hw_cam_y, &hw_solid_count,                    /*  0 */
+    &saturn_hw_bsp_occl, &saturn_hw_occl_culls, saturn_master_oclut,     /* 16 */
+    hw_solid_mask, hw_mask_left, hw_mask_right, hw_span_mask_lut,        /* 28 */
+    &hw_solid_any, &hw_solid_summary, &saturn_view_w,                    /* 44 */
+    &nodes, hw_bsp_stack, (const void *)HW_RenderSubsector_Body,         /* 56 */
+    &hw_node_bboxes, &saturn_baked_flat_bboxes, &saturn_hw_bsp_abort     /* 68 */
+};
+#if HW_ASM_CHECK
+/* cullbox: [0] calls [1] mismatches [2] bbox [3] fully [4] asm [5] C */
+static volatile uint32_t hw_asm_chk_cullbox[8];
+static HW_NOINLINE int HW_CullBoxCheck(const int16_t *bbox, int fully_inside)
+{
+    unsigned int culls0 = saturn_hw_occl_culls;
+    int a = hw_asm_cullbox(bbox, fully_inside);
+    unsigned int culls_a = saturn_hw_occl_culls;
+    saturn_hw_occl_culls = culls0;
+    int c = HW_CullBSPBBox(bbox, fully_inside);
+    hw_asm_chk_cullbox[0]++;
+    if ((a != c || culls_a != saturn_hw_occl_culls) && hw_asm_chk_cullbox[1]++ == 0)
+    {
+        hw_asm_chk_cullbox[2] = (uint32_t)bbox; hw_asm_chk_cullbox[3] = (uint32_t)fully_inside;
+        hw_asm_chk_cullbox[4] = (uint32_t)a;    hw_asm_chk_cullbox[5] = (uint32_t)c;
+    }
+    return a;
+}
+#define HW_CullBSPBBox HW_CullBoxCheck
+#else
+/* Normal build: the asm walk. The root-leaf case (one-subsector map)
+ * stays C so the asm needs no numnodes (VINT width). */
+static void HW_RenderBSPNode(int root_bspnum, const byte *pvs_row, int root_inside)
+{
+    (void)pvs_row;
+    if (__builtin_expect((unsigned)root_bspnum >= (unsigned)numnodes, 0))
+    {
+        if ((int16_t)root_bspnum < 0 && (int16_t)root_bspnum != -1)
+            HW_RenderSubsector(root_bspnum & 0x7FFFu, root_inside);
+        return;
+    }
+    hw_asm_bsp(root_bspnum, root_inside);
+}
+#endif
+#elif HW_ASM
+const void *const hw_asm_bsp_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+
+#if !HW_ASM_BSP || HW_ASM_CHECK
 /* Front-to-back iterative BSP tree traversal with zero C-call overhead and deferred occlusion */
 static HW_NOINLINE HW_HOT_O2 void HW_RenderBSPNode(int root_bspnum, const byte *pvs_row, int root_inside)
 {
@@ -394,6 +451,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderBSPNode(int root_bspnum, const byte *
         }
     }
 }
+#endif /* !HW_ASM_BSP || HW_ASM_CHECK */
 
 /* Main Hardware Renderer entry point */
 HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
