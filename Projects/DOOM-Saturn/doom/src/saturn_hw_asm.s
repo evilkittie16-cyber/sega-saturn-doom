@@ -3365,3 +3365,721 @@ _hw_asm_lingen:
 .Ll_k320b:	.long	320
 .Ll_k10100b:	.long	0x00010100
 .Ll_k10000b:	.long	0x00010000
+! ===================================================================
+! hw_asm_commit(): HW_CommitSubsectorOcclusion (saturn_hw_occl.c) with
+! HW_CommitSubSolidMask, HW_CommitPortalSpan, HW_UpdatePortalWordPartial
+! and HW_UpdatePortalWordCols inlined (stage C1). HW_CommitPortalClosedWord
+! stays C (cold); the rescan calls hw_asm_rescan. Table hw_asm_commit_ctx:
+! [0] ap [4] hw_solid_mask [8] hw_ap_words [12] sub_solid_mask
+! [16] &sub_solid_active [20] &sub_solid_min_w [24] &sub_solid_max_w
+! [28] &hw_solid_any [32] &hw_slave_dirty_words [36] &hw_solid_summary
+! [40] &hw_solid_words [44] &hw_solid_count [48] &saturn_view_h
+! [52] hw_bit_lut [56] HW_CommitPortalClosedWord
+! ap: +2 aperture_active +3 portal_span_count +8 dirty_words +24 spans,
+! +408 ytop, +760 ybot. regs: r9 touched, r10 ps, r12 ap, r13 solid mask,
+! r14 ap_words, r8 w. frame: 0 ps_end 4 w1 8 check 12 vh 16 touch 20 x_s
+! 24 x_e 28 x_w0 32 w_mod 36 w 40 flags 44 ps
+! ===================================================================
+	.align	2
+	.global	_hw_asm_commit
+_hw_asm_commit:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-48,r15
+	mov.l	.Lc_ctx0,r1
+	mov.l	@r1,r12
+	mov.l	@(4,r1),r13
+	mov.l	@(8,r1),r14
+	mov.l	@(48,r1),r0
+	mov.l	@r0,r0
+	mov.l	r0,@(12,r15)		! vh (int)
+	mov	#0,r9
+	mov.l	@(16,r1),r2
+	mov.l	@r2,r0
+	tst	r0,r0
+	bt	.Lc_nosub
+! ---- HW_CommitSubSolidMask ----
+	mov.l	@(20,r1),r0
+	mov.l	@r0,r3			! i = min
+	mov.l	@(24,r1),r0
+	mov.l	@r0,r4			! max
+	mov.l	@(12,r1),r5		! sub_solid_mask
+.Lc_s_loop:
+	cmp/gt	r4,r3
+	bt	.Lc_s_done
+	mov	r3,r0
+	shll2	r0
+	mov.l	@(r0,r5),r6		! bits
+	tst	r6,r6
+	bt	.Lc_s_next
+	mov	#0,r7
+	mov.l	r7,@(r0,r5)
+	mov.l	@(r0,r13),r7		! old
+	or	r7,r6			! new
+	cmp/eq	r7,r6
+	bt	.Lc_s_next
+	mov.l	r6,@(r0,r13)
+	mov.l	@(52,r1),r7
+	mov.l	@(r0,r7),r7		! wbit
+	mov.l	@(28,r1),r2
+	mov.l	@r2,r0
+	or	r7,r0
+	mov.l	r0,@r2
+	mov.l	@(32,r1),r2
+	mov.l	@r2,r0
+	or	r7,r0
+	mov.l	r0,@r2
+	mov	r3,r2
+	shll2	r2
+	add	r2,r2
+	add	r14,r2			! aw
+	mov	#-1,r0
+	cmp/eq	r0,r6
+	bf	.Lc_s_part
+	mov.l	@(40,r1),r6
+	mov.l	@r6,r0
+	add	#1,r0
+	mov.l	r0,@r6
+	mov.l	@(36,r1),r6
+	mov.l	@r6,r0
+	or	r7,r0
+	mov.l	r0,@r6
+	mov.l	@(12,r15),r0
+	mov.w	r0,@r2			! yt_min = vh
+	mov.w	r0,@(4,r2)		! yt_max = vh
+	mov	#0,r0
+	mov.w	r0,@(2,r2)
+	mov.w	r0,@(6,r2)
+	mov.l	@(8,r12),r0
+	or	r7,r0
+	bra	.Lc_s_next
+	mov.l	r0,@(8,r12)
+.Lc_s_part:
+	mov.l	@(8,r12),r0
+	tst	r7,r0
+	bt	.Lc_s_next
+	mov.l	@r2,r0
+	mov.l	@(4,r2),r6
+	cmp/eq	r6,r0
+	bt	.Lc_s_next
+	or	r7,r9
+.Lc_s_next:
+	bra	.Lc_s_loop
+	add	#1,r3
+	.align	2
+.Lc_ctx0:	.long	_hw_asm_commit_ctx
+.Lc_s_done:
+	mov.l	@(16,r1),r2
+	mov	#0,r0
+	mov.l	r0,@r2			! sub_solid_active = 0
+	mov.l	@(40,r1),r2
+	mov.l	@r2,r3
+	mov	#10,r2
+	cmp/ge	r2,r3
+	bf/s	.Lc_s_cnt
+	mov	#1,r0
+	mov	#80,r0
+	shll2	r0
+.Lc_s_cnt:
+	mov.l	@(44,r1),r2
+	mov.l	r0,@r2
+! ---- portal spans ----
+.Lc_nosub:
+	mov.b	@(3,r12),r0
+	extu.b	r0,r0
+	tst	r0,r0
+	bt	.Lc_fin
+	mov	r0,r1
+	mov	#0,r0
+	mov.b	r0,@(3,r12)
+	mov	r12,r10
+	add	#24,r10
+	shll2	r1
+	add	r1,r1
+	add	r10,r1
+	mov.l	r1,@(0,r15)
+.Lc_span:
+	mov.w	@r10,r1			! sx
+	mov.w	@(2,r10),r0
+	mov	r0,r2			! ex
+	cmp/pz	r1
+	bt	.Lc_sp0
+	mov	#0,r1
+.Lc_sp0:
+	mov	#80,r3
+	shll2	r3
+	cmp/gt	r3,r2
+	bf	.Lc_sp1
+	mov	r3,r2
+.Lc_sp1:
+	cmp/ge	r2,r1
+	bt	.Lc_span_next
+	mov.b	@(4,r10),r0
+	extu.b	r0,r3			! yt
+	mov.b	@(5,r10),r0
+	extu.b	r0,r4			! yb
+	mov.b	@(6,r10),r0
+	extu.b	r0,r5			! yt_att
+	mov.b	@(7,r10),r0
+	extu.b	r0,r6			! yb_att
+	mov	#0,r7
+	cmp/pl	r3
+	bf	.Lc_sp2
+	mov	r3,r0
+	add	#1,r0
+	cmp/gt	r0,r5
+	bt	.Lc_sp2
+	mov	#1,r7			! check_yt
+.Lc_sp2:
+	mov.l	@(12,r15),r0
+	cmp/gt	r4,r0
+	bf	.Lc_sp3
+	mov	r4,r0
+	add	#-1,r0
+	cmp/ge	r0,r6
+	bf	.Lc_sp3
+	add	#2,r7			! check_yb
+.Lc_sp3:
+	tst	r7,r7
+	bt	.Lc_span_next
+	mov.l	r7,@(8,r15)
+	mov	r1,r8
+	shlr2	r8
+	shlr2	r8
+	shlr	r8			! w0
+	add	#-1,r2
+	shlr2	r2
+	shlr2	r2
+	shlr	r2
+	mov.l	r2,@(4,r15)		! w1
+.Lc_word:
+	mov	r8,r0
+	shll2	r0
+	mov.l	@(r0,r13),r1		! sm
+	mov	#-1,r2
+	cmp/eq	r2,r1
+	bt	.Lc_word_next
+	mov.l	.Lc_ctx,r2
+	mov.l	@(52,r2),r2
+	mov.l	@(r0,r2),r7		! wbit
+	mov	r8,r2
+	shll2	r2
+	add	r2,r2
+	add	r14,r2			! aw
+	mov.b	@(4,r10),r0
+	extu.b	r0,r3
+	mov.b	@(5,r10),r0
+	extu.b	r0,r4
+	mov.b	@(6,r10),r0
+	extu.b	r0,r5
+	mov.b	@(7,r10),r0
+	extu.b	r0,r6
+	mov	#0,r11
+	mov.l	@(8,r15),r0
+	tst	#1,r0
+	bt	.Lc_nyt
+	tst	r7,r9
+	bf	.Lc_yt1
+	mov.w	@r2,r0			! yt_min
+	cmp/gt	r0,r3
+	bf	.Lc_nyt
+	mov.w	@(4,r2),r0		! yt_max
+	add	#2,r0
+	cmp/gt	r0,r5
+	bt	.Lc_nyt
+.Lc_yt1:
+	mov	#1,r11
+.Lc_nyt:
+	mov.l	@(8,r15),r0
+	tst	#2,r0
+	bt	.Lc_nyb
+	tst	r7,r9
+	bf	.Lc_yb1
+	mov.w	@(2,r2),r0		! yb_max
+	cmp/gt	r4,r0
+	bf	.Lc_nyb
+	mov.w	@(6,r2),r0		! yb_min
+	add	#-2,r0
+	cmp/ge	r0,r6
+	bf	.Lc_nyb
+.Lc_yb1:
+	add	#2,r11
+.Lc_nyb:
+	tst	r11,r11
+	bt	.Lc_word_next
+	tst	r7,r9
+	bf	.Lc_tch
+	tst	r1,r1
+	bf	.Lc_fl0
+	bra	.Lc_fl0
+	add	#4,r11
+.Lc_tch:
+	add	#8,r11
+.Lc_fl0:
+	mov	#0,r0
+	mov.l	r0,@(16,r15)		! touch_ret = 0
+	mov	r8,r1
+	shll2	r1
+	shll2	r1
+	shll	r1			! x_w0
+	mov.l	r1,@(28,r15)
+	mov.w	@r10,r0
+	cmp/gt	r1,r0
+	bt	.Lc_xs
+	mov	r1,r0
+.Lc_xs:
+	mov.l	r0,@(20,r15)		! x_s
+	add	#32,r1			! x_w1
+	mov.w	@(2,r10),r0
+	cmp/gt	r1,r0
+	bf	.Lc_xe
+	mov	r1,r0
+.Lc_xe:
+	mov.l	r0,@(24,r15)		! x_e
+! ---- HW_UpdatePortalWordPartial ----
+	mov	r11,r0
+	tst	#4,r0
+	bt	.Lc_cols
+	mov	#0,r1
+	tst	#1,r0
+	bt	.Lc_p0
+	mov.w	@r2,r0
+	add	#2,r0
+	cmp/gt	r0,r5
+	bt	.Lc_p0
+	mov.w	@(4,r2),r0
+	cmp/ge	r0,r3
+	bf	.Lc_p0
+	mov	#1,r1			! full_yt
+.Lc_p0:
+	mov	r11,r0
+	tst	#2,r0
+	bt	.Lc_p1
+	mov.w	@(2,r2),r0
+	add	#-2,r0
+	cmp/ge	r0,r6
+	bf	.Lc_p1
+	mov.w	@(6,r2),r0
+	cmp/ge	r4,r0
+	bf	.Lc_p1
+	add	#2,r1			! full_yb
+.Lc_p1:
+	tst	r1,r1
+	bt	.Lc_cols
+	mov.w	@(4,r2),r0
+	mov	r0,r5			! next_yt_max
+	mov	r1,r0
+	tst	#1,r0
+	bt	.Lc_p2
+	mov	r3,r5
+.Lc_p2:
+	mov.w	@(6,r2),r0
+	mov	r0,r6			! next_yb_min
+	mov	r1,r0
+	tst	#2,r0
+	bt	.Lc_p3
+	mov	r4,r6
+.Lc_p3:
+	cmp/ge	r6,r5
+	bt	.Lc_cols_rl
+	mov	r1,r0
+	tst	#1,r0
+	bt	.Lc_p_yb
+	mov.l	@(20,r15),r5
+	mov.l	@(24,r15),r0
+	sub	r5,r0			! count
+	mov	#102,r6
+	shll2	r6
+	add	r12,r6
+	add	r5,r6			! &ytop[x_s]
+	bsr	.Lc_fill
+	mov	r3,r5
+	bf	.Lc_p_ytfull
+	mov.w	@(4,r2),r0
+	mov	r0,r5
+	mov.w	@r2,r0
+	cmp/eq	r5,r0
+	bf	.Lc_p_yttch
+	mov	r3,r0
+	bra	.Lc_p_ytdone
+	mov.w	r0,@(4,r2)
+.Lc_p_yttch:
+	mov	#1,r0
+	bra	.Lc_p_ytdone
+	mov.l	r0,@(16,r15)
+.Lc_p_ytfull:
+	mov	r3,r0
+	mov.w	r0,@r2
+	mov.w	r0,@(4,r2)
+.Lc_p_ytdone:
+	mov.l	@(8,r12),r0
+	or	r7,r0
+	mov.l	r0,@(8,r12)
+	mov	#1,r0
+	mov.b	r0,@(2,r12)
+	mov	#-2,r0
+	and	r0,r11
+.Lc_p_yb:
+	mov	r1,r0
+	tst	#2,r0
+	bt	.Lc_p_end
+	mov.l	@(20,r15),r5
+	mov.l	@(24,r15),r0
+	sub	r5,r0
+	mov	#95,r6
+	shll2	r6
+	shll	r6			! 760
+	add	r12,r6
+	add	r5,r6			! &ybot[x_s]
+	bsr	.Lc_fill
+	mov	r4,r5
+	bf	.Lc_p_ybfull
+	mov.w	@(2,r2),r0
+	mov	r0,r5
+	mov.w	@(6,r2),r0
+	cmp/eq	r5,r0
+	bf	.Lc_p_ybtch
+	mov	r4,r0
+	bra	.Lc_p_ybdone
+	mov.w	r0,@(6,r2)
+.Lc_p_ybtch:
+	mov	#1,r0
+	bra	.Lc_p_ybdone
+	mov.l	r0,@(16,r15)
+.Lc_p_ybfull:
+	mov	r4,r0
+	mov.w	r0,@(2,r2)
+	mov.w	r0,@(6,r2)
+.Lc_p_ybdone:
+	mov.l	@(8,r12),r0
+	or	r7,r0
+	mov.l	r0,@(8,r12)
+	mov	#1,r0
+	mov.b	r0,@(2,r12)
+	mov	#-3,r0
+	and	r0,r11
+.Lc_p_end:
+	mov	r11,r0
+	tst	#3,r0
+	bf	.Lc_cols_rl
+	mov.l	@(16,r15),r0
+	tst	r0,r0
+	bt	.Lc_res0
+	bra	.Lc_res1
+	nop
+! ---- HW_UpdatePortalWordCols ----
+.Lc_cols_rl:
+	mov.b	@(6,r10),r0
+	extu.b	r0,r5
+	mov.b	@(7,r10),r0
+	extu.b	r0,r6
+.Lc_cols:
+	add	#-2,r5
+	cmp/pz	r5
+	bt	.Lc_c0
+	mov	#0,r5			! yt_req = max(yt_att - 2, 0)
+.Lc_c0:
+	add	#2,r6			! yb_req
+	mov.l	r8,@(36,r15)
+	mov.l	r11,@(40,r15)
+	mov.l	r10,@(44,r15)
+	mov.l	@(16,r15),r0
+	mov.l	r0,@(32,r15)		! w_mod = touch_ret
+	mov.l	@(20,r15),r0
+	mov.l	@(24,r15),r10
+	sub	r0,r10			! count
+	mov	#102,r1
+	shll2	r1
+	add	r12,r1
+	add	r0,r1			! &ytop[x_s]
+	mov	#88,r2
+	shll2	r2
+	add	r1,r2			! &ybot[x_s]
+	and	#31,r0
+	shll2	r0
+	mov.l	.Lc_ctx,r8
+	mov.l	@(52,r8),r8
+	mov.l	@(r0,r8),r8		! bit
+	mov	#0,r7			! newly_closed
+	mov	r11,r0
+	tst	#2,r0
+	bt	.Lc_lt
+	tst	#1,r0
+	bt	.Lc_lb
+.Lc_lbt:
+	mov.b	@r1,r0
+	extu.b	r0,r0			! yt
+	mov.b	@r2,r11
+	extu.b	r11,r11			! yb
+	cmp/hs	r5,r0
+	bf	.Lc_bt3
+	cmp/hs	r3,r0
+	bt	.Lc_bt3
+	mov	r3,r0
+	mov.b	r3,@r1
+	mov.l	r8,@(32,r15)
+	cmp/hi	r4,r11
+	bf	.Lc_bt4
+	cmp/hi	r6,r11
+	bt	.Lc_bt4
+	mov	r4,r11
+	mov.b	r4,@r2
+.Lc_bt4:
+	cmp/ge	r11,r0
+	bf	.Lc_bt5
+	bra	.Lc_bt5
+	or	r8,r7
+.Lc_bt3:
+	cmp/hi	r4,r11
+	bf	.Lc_bt5
+	cmp/hi	r6,r11
+	bt	.Lc_bt5
+	mov	r4,r11
+	mov.b	r4,@r2
+	mov.l	r8,@(32,r15)
+	cmp/ge	r11,r0
+	bf	.Lc_bt5
+	or	r8,r7
+.Lc_bt5:
+	add	#1,r1
+	add	#1,r2
+	shll	r8
+	dt	r10
+	bf	.Lc_lbt
+	bra	.Lc_post
+	nop
+.Lc_lt:
+	mov.b	@r1,r0
+	extu.b	r0,r0
+	cmp/hs	r5,r0
+	bf	.Lc_lt1
+	cmp/hs	r3,r0
+	bt	.Lc_lt1
+	mov.b	r3,@r1
+	mov.l	r8,@(32,r15)
+	mov.b	@r2,r11
+	extu.b	r11,r11
+	cmp/ge	r11,r3
+	bf	.Lc_lt1
+	or	r8,r7
+.Lc_lt1:
+	add	#1,r1
+	add	#1,r2
+	shll	r8
+	dt	r10
+	bf	.Lc_lt
+	bra	.Lc_post
+	nop
+.Lc_lb:
+	mov.b	@r2,r11
+	extu.b	r11,r11
+	cmp/hi	r4,r11
+	bf	.Lc_lb1
+	cmp/hi	r6,r11
+	bt	.Lc_lb1
+	mov.b	r4,@r2
+	mov.l	r8,@(32,r15)
+	mov.b	@r1,r0
+	extu.b	r0,r0
+	cmp/ge	r4,r0
+	bf	.Lc_lb1
+	or	r8,r7
+.Lc_lb1:
+	add	#1,r1
+	add	#1,r2
+	shll	r8
+	dt	r10
+	bf	.Lc_lb
+.Lc_post:
+	mov.l	@(36,r15),r8
+	mov.l	@(40,r15),r11
+	mov.l	@(44,r15),r10
+	mov	r8,r2
+	shll2	r2
+	add	r2,r2
+	add	r14,r2			! aw
+	tst	r7,r7
+	bf	.Lc_closed
+	mov.l	@(32,r15),r0
+	tst	r0,r0
+	bt	.Lc_res0
+	mov.l	@(16,r15),r0
+	tst	r0,r0
+	bf	.Lc_res1
+	mov	r11,r0
+	tst	#8,r0
+	bf	.Lc_res1
+	mov	#0,r1			! partial_clean
+	tst	#4,r0
+	bt	.Lc_pc0
+	mov.l	@(28,r15),r7
+	mov.l	@(20,r15),r0
+	cmp/gt	r7,r0
+	bt	.Lc_pc1
+	add	#32,r7
+	mov.l	@(24,r15),r0
+	cmp/gt	r0,r7
+	bf	.Lc_pc0
+.Lc_pc1:
+	mov	#1,r1
+.Lc_pc0:
+	mov	r11,r0
+	tst	#1,r0
+	bt	.Lc_okyt
+	mov.w	@r2,r0
+	cmp/gt	r0,r5
+	bt	.Lc_okyt
+	tst	r1,r1
+	bt	.Lc_res1
+	mov	r0,r7
+	mov.w	@(4,r2),r0
+	cmp/eq	r7,r0
+	bf	.Lc_res1
+.Lc_okyt:
+	mov	r11,r0
+	tst	#2,r0
+	bt	.Lc_okyb
+	mov.w	@(2,r2),r0
+	cmp/gt	r6,r0
+	bt	.Lc_okyb
+	tst	r1,r1
+	bt	.Lc_res1
+	mov	r0,r7
+	mov.w	@(6,r2),r0
+	cmp/eq	r7,r0
+	bf	.Lc_res1
+.Lc_okyb:
+	mov	r11,r0
+	tst	#1,r0
+	bt	.Lc_u1
+	mov.w	@(4,r2),r0
+	cmp/gt	r0,r3
+	bf	.Lc_u1
+	mov	r3,r0
+	mov.w	r0,@(4,r2)
+.Lc_u1:
+	mov	r11,r0
+	tst	#2,r0
+	bt	.Lc_u2
+	mov.w	@(6,r2),r0
+	cmp/gt	r4,r0
+	bf	.Lc_u2
+	mov	r4,r0
+	mov.w	r0,@(6,r2)
+.Lc_u2:
+	bsr	.Lc_wbit
+	nop
+	mov.l	@(8,r12),r0
+	or	r1,r0
+	mov.l	r0,@(8,r12)
+	mov	#1,r0
+	bra	.Lc_res0
+	mov.b	r0,@(2,r12)
+.Lc_closed:
+	mov.l	.Lc_ctx,r0
+	mov.l	@(56,r0),r0
+	mov	r8,r4
+	jsr	@r0
+	mov	r7,r5
+	tst	r0,r0
+	bt	.Lc_res1
+	bsr	.Lc_wbit
+	nop
+	not	r1,r1
+	bra	.Lc_word_next
+	and	r1,r9
+.Lc_res1:
+	bsr	.Lc_wbit
+	nop
+	or	r1,r9
+	mov	#1,r0
+	mov.b	r0,@(2,r12)
+.Lc_res0:
+.Lc_word_next:
+	mov.l	@(4,r15),r0
+	add	#1,r8
+	cmp/gt	r0,r8
+	bt	.Lc_span_next
+	bra	.Lc_word
+	nop
+.Lc_span_next:
+	mov.l	@(0,r15),r0
+	add	#8,r10
+	cmp/hs	r0,r10
+	bt	.Lc_fin
+	bra	.Lc_span
+	nop
+.Lc_fin:
+	tst	r9,r9
+	bt	.Lc_ret
+	mov.l	@(8,r12),r0
+	or	r9,r0
+	mov.l	r0,@(8,r12)
+	mov	r9,r4
+	mov	r13,r5
+	mov	r14,r6
+	mov	#102,r7
+	shll2	r7
+	mov.l	.Lc_rescan,r0
+	jsr	@r0
+	add	r12,r7
+.Lc_ret:
+	add	#48,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+! r1 = hw_bit_lut[w=r8]; clobbers r0
+.Lc_wbit:
+	mov.l	.Lc_ctx,r1
+	mov.l	@(52,r1),r1
+	mov	r8,r0
+	shll2	r0
+	rts
+	mov.l	@(r0,r1),r1
+
+! fill r0 = count (1..32) bytes at r6 with r5; count 32 = a whole aligned
+! word: 8 long stores, returns T=0. Byte path returns T=1. Clobbers r0,r5,r6.
+.Lc_fill:
+	tst	#32,r0
+	bt	.Lc_fb
+	extu.b	r5,r5
+	mov	r5,r0
+	shll8	r0
+	or	r0,r5
+	mov	r5,r0
+	shll16	r0
+	or	r0,r5
+	mov.l	r5,@r6
+	mov.l	r5,@(4,r6)
+	mov.l	r5,@(8,r6)
+	mov.l	r5,@(12,r6)
+	mov.l	r5,@(16,r6)
+	mov.l	r5,@(20,r6)
+	mov.l	r5,@(24,r6)
+	rts
+	mov.l	r5,@(28,r6)
+.Lc_fb:
+	mov.b	r5,@r6
+	dt	r0
+	bf/s	.Lc_fb
+	add	#1,r6
+	rts
+	nop
+
+	.align	2
+.Lc_ctx:	.long	_hw_asm_commit_ctx
+.Lc_k320:	.long	320
+.Lc_rescan:	.long	_hw_asm_rescan

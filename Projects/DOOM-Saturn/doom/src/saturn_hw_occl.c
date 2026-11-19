@@ -342,6 +342,11 @@ extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #if HW_AP_HALF
 #define HW_AP_PAIR_SOLID(sm, h) ((((sm) >> (((h) & 15) << 1)) & 3u) == 3u)
 #endif
+/* Compact rewrite stage C1: the whole commit below in saturn_hw_asm.s
+ * (hw_asm_commit; table layout documented there). */
+#ifndef HW_ASM_COMMIT
+#define HW_ASM_COMMIT (HW_ASM && HW_ASM_RESCAN && HW_DBG_OCCLUSION && HW_DBG_APERTURE && !HW_AP_HALF)
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
 {
@@ -590,6 +595,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_SPANAP_C_NAME(int sx, int ex)
 }
 #endif /* !HW_ASM_SPANAP || HW_ASM_CHECK */
 
+#if !HW_ASM_COMMIT || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitSubSolidMask(void)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
@@ -636,6 +642,7 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitSubSolidMask(void)
     hw_solid_count = (hw_solid_words >= req_words) ? vw : 1;
     return touched_words;
 }
+#endif
 
 #if HW_ASM_RESCAN
 /* saturn_hw_asm.s; bit-identical to the C below (HW_AP_HALF=0 only). */
@@ -809,6 +816,7 @@ static HW_NOINLINE HW_COLD_OS int HW_CommitPortalClosedWord(int w, uint32_t newl
     return 0;
 }
 
+#if !HW_ASM_COMMIT || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
     int w_and_flags, const hw_portal_span_t *ps, int touch_ret)
 {
@@ -1095,8 +1103,102 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(
     }
     return touched_words;
 }
+#endif
 
-static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
+#if HW_ASM_COMMIT
+extern void hw_asm_commit(void);
+_Static_assert(offsetof(hw_aperture_state_t, aperture_active) == 2 &&
+               offsetof(hw_aperture_state_t, portal_span_count) == 3 &&
+               offsetof(hw_aperture_state_t, dirty_words) == 8 &&
+               offsetof(hw_aperture_state_t, portal_spans) == 24 &&
+               offsetof(hw_aperture_state_t, ytop) == 408 &&
+               offsetof(hw_aperture_state_t, ybot) == 760 &&
+               sizeof(hw_portal_span_t) == 8 && sizeof(hw_ap_word_t) == 8 &&
+               offsetof(hw_ap_word_t, yb_max) == 2 && offsetof(hw_ap_word_t, yt_max) == 4 &&
+               offsetof(hw_ap_word_t, yb_min) == 6 && HW_VIEW_W == 320 && HW_MAX_PORTAL_SPANS == 32,
+               "hw_asm_commit: layout");
+const void *const hw_asm_commit_ctx[15] = {
+    &hw_aperture_state, hw_solid_mask, hw_ap_words, sub_solid_mask,
+    &sub_solid_active, &sub_solid_min_w, &sub_solid_max_w, &hw_solid_any,
+    &hw_slave_dirty_words, &hw_solid_summary, &hw_solid_words, &hw_solid_count,
+    &saturn_view_h, hw_bit_lut, (const void *)HW_CommitPortalClosedWord
+};
+#if HW_ASM_CHECK
+static void HW_CommitSubsectorOcclusion_C(void);
+/* [0] calls [1] mismatches [2] first differing byte offset in the snapshot */
+static volatile uint32_t hw_asm_chk_commit[8];
+typedef struct {
+    hw_aperture_state_t ap;
+    hw_ap_word_t aw[HW_SOLID_WORDS];
+    uint32_t sm[HW_SOLID_WORDS], sub[HW_SOLID_WORDS];
+    int act, mn, mx, words, count;
+    uint32_t any, sdirty, summ;
+} hw_occl_snap_t;
+/* heap, not BSS: 3 x ~1.3 KB would push static data past 0x060C0000 */
+extern byte *I_AllocHigh(int length);
+static hw_occl_snap_t *hw_occl_snap;
+static void HW_OcclSave(hw_occl_snap_t *s)
+{
+    memcpy(&s->ap, &hw_aperture_state, sizeof(s->ap));
+    memcpy(s->aw, hw_ap_words, sizeof(s->aw));
+    memcpy(s->sm, hw_solid_mask, sizeof(s->sm));
+    memcpy(s->sub, sub_solid_mask, sizeof(s->sub));
+    s->act = sub_solid_active; s->mn = sub_solid_min_w; s->mx = sub_solid_max_w;
+    s->words = hw_solid_words; s->count = hw_solid_count;
+    s->any = hw_solid_any; s->sdirty = hw_slave_dirty_words; s->summ = hw_solid_summary;
+}
+static void HW_OcclLoad(const hw_occl_snap_t *s)
+{
+    memcpy(&hw_aperture_state, &s->ap, sizeof(s->ap));
+    memcpy(hw_ap_words, s->aw, sizeof(s->aw));
+    memcpy(hw_solid_mask, s->sm, sizeof(s->sm));
+    memcpy(sub_solid_mask, s->sub, sizeof(s->sub));
+    sub_solid_active = s->act; sub_solid_min_w = s->mn; sub_solid_max_w = s->mx;
+    hw_solid_words = s->words; hw_solid_count = s->count;
+    hw_solid_any = s->any; hw_slave_dirty_words = s->sdirty; hw_solid_summary = s->summ;
+}
+#endif
+static HW_NOINLINE void HW_CommitSubsectorOcclusion(void)
+{
+#if HW_ASM_CHECK
+    if (!hw_occl_snap)
+    {
+        hw_occl_snap = (hw_occl_snap_t *)I_AllocHigh((int)(3 * sizeof(hw_occl_snap_t)));
+        memset(hw_occl_snap, 0, 3 * sizeof(hw_occl_snap_t));
+    }
+    HW_OcclSave(&hw_occl_snap[0]);
+    hw_asm_commit();
+    HW_OcclSave(&hw_occl_snap[1]);
+    HW_OcclLoad(&hw_occl_snap[0]);
+    HW_CommitSubsectorOcclusion_C();
+    HW_OcclSave(&hw_occl_snap[2]);
+    hw_asm_chk_commit[0]++;
+    {
+        const uint8_t *a = (const uint8_t *)&hw_occl_snap[1];
+        const uint8_t *c = (const uint8_t *)&hw_occl_snap[2];
+        for (uint32_t i = 0; i < sizeof(hw_occl_snap_t); i++)
+            if (a[i] != c[i])
+            {
+                if (hw_asm_chk_commit[1]++ == 0)
+                {
+                    hw_asm_chk_commit[2] = i;
+                    hw_asm_chk_commit[3] = a[i];
+                    hw_asm_chk_commit[4] = c[i];
+                }
+                break;
+            }
+    }
+#else
+    hw_asm_commit();
+#endif
+}
+#define HW_COMMIT_C_SIG static void HW_CommitSubsectorOcclusion_C(void)
+#else
+#define HW_COMMIT_C_SIG static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
+#endif
+
+#if !HW_ASM_COMMIT || HW_ASM_CHECK
+HW_COMMIT_C_SIG
 {
 #if !HW_DBG_OCCLUSION
     sub_solid_active = 0;
@@ -1123,6 +1225,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
     if (touched_words != 0)
         HW_RescanApertureWords(touched_words);
 }
+#endif /* !HW_ASM_COMMIT || HW_ASM_CHECK */
 
 static HW_NOINLINE HW_COLD_OS void HW_UpdateNodePvsVis(const byte *pvs_row, const void *ssec_key)
 {
