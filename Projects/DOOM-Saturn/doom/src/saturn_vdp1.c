@@ -1622,6 +1622,40 @@ static void v1_touch(unsigned int srca)
     }
 }
 
+/* Quarter-width blocks: block q covers texels [128q, 128q + 128) mod w,
+ * every 4th column (the half copy takes every 2nd), 32 px wide. */
+#define V1_WALL_QUARTER_BLOCKS(w) (((w) + 127) >> 7)
+static void v1_copy_q_blocks(unsigned int off, const byte *src, int w, int h)
+{
+    int num_blocks = V1_WALL_QUARTER_BLOCKS(w);
+    int b, y, x;
+    for (b = 0; b < num_blocks; b++)
+    {
+        unsigned int block_off = off + (unsigned int)(b * (32 * h));
+        int col[32];
+        for (x = 0; x < 32; x++)
+            col[x] = (b * 128 + x * 4) % w;
+#ifdef SATURN_WIN32
+        uint8_t *dst = (uint8_t *)(V1_BASE + block_off);
+        for (y = 0; y < h; y++)
+        {
+            const byte *sr = src + y * w;
+            uint8_t *dr = dst + y * 32;
+            for (x = 0; x < 32; x++)
+                dr[x] = sr[col[x]];
+        }
+#else
+        volatile unsigned short *dst = (volatile unsigned short *)(V1_BASE + block_off);
+        for (y = 0; y < h; y++)
+        {
+            const byte *sr = src + y * w;
+            for (x = 0; x < 32; x += 2)
+                *dst++ = (unsigned short)(((unsigned)sr[col[x]] << 8) | (unsigned)sr[col[x + 1]]);
+        }
+#endif
+    }
+}
+
 /* A strip-major wall's optional copies (half-width 32-blocks for distant
  * walls, or a row-major copy plus a 64-wide doubled copy for 32-wide
  * textures), made only while `reserve` bytes stay free. Walls point
@@ -1635,13 +1669,19 @@ static void v1_wall_opt_copies(v1_tag_t *tag, const byte *src, int tw, int th, u
 #define v1_arena_alloc(b, t) v1_alloc_fit((unsigned int)(b), (t), 0u)
     if (tw >= 64 && (tw & 63) == 0)
     {
+        /* half copy (tw/64 blocks of 64 texels -> 32 px) followed in the
+         * same allocation by the quarter copy (V1_WALL_QUARTER_BLOCKS
+         * blocks of 128 texels -> 32 px, wrapping mod tw), so the emitter
+         * finds quarter block q at srca_mono + (tw/64 + q) * th * 4 */
         int bytes_32 = (tw >> 1) * th;
-        if (v1_free_total() >= (unsigned int)bytes_32 + reserve)
+        int bytes_q  = V1_WALL_QUARTER_BLOCKS(tw) * 32 * th;
+        if (v1_free_total() >= (unsigned int)(bytes_32 + bytes_q) + reserve)
         {
-            unsigned int off_32 = v1_arena_alloc(bytes_32, tag);
+            unsigned int off_32 = v1_arena_alloc(bytes_32 + bytes_q, tag);
             if (off_32 != 0)
             {
                 v1_copy_32_blocks(off_32, src, tw, th);
+                v1_copy_q_blocks(off_32 + (unsigned int)bytes_32, src, tw, th);
                 tag->srca_mono = (unsigned short)(off_32 / 8u);
             }
         }

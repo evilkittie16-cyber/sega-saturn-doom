@@ -3253,6 +3253,61 @@ _hw_asm_lingen:
 	mov	#64,r0
 	cmp/ge	r0,r1
 	bf	.Lc2_c2
+! 8 -> 1 from the quarter copy (srca_mono + (tw/64 + idx/8) * th*4)
+	cmp/eq	r2,r5
+	bt	.Lc2_4p
+	mov	r4,r0
+	tst	#7,r0
+	bf	.Lc2_4p
+	mov	r9,r0
+	add	#8,r0
+	shll2	r0
+	shll2	r0			! c_uhi
+	cmp/gt	r6,r0
+	bt	.Lc2_4p
+	cmp/ge	r6,r0
+	bf	.Lc2_8np
+	mov.l	@(44,r8),r0
+	bra	.Lc2_8px
+	mov.l	@(12,r0),r0		! p1->px
+.Lc2_8np:
+	mov.l	@(20,r15),r0		! step_px_fp
+	mov	#7,r7
+	mul.l	r7,r0
+	mov.l	@(8,r15),r7		! cur_px_fp
+	sts	macl,r0
+	add	r7,r0
+	shlr16	r0
+	exts.w	r0,r0
+.Lc2_8px:
+	sub	r11,r0			! px8 - s_px0
+	mov.l	.Ll_ctx2,r7
+	mov.l	@(32,r7),r7		! hw_wall_lod
+	mov.l	@(44,r7),r7		! LOD[11] C8_DX
+	cmp/gt	r7,r0
+	bt	.Lc2_4p
+	shlr2	r4
+	shlr	r4			! idx >> 3
+	mov	r1,r0
+	shlr2	r0
+	shlr2	r0
+	shlr2	r0			! tw >> 6
+	add	r0,r4
+	mov.w	@(26,r8),r0		! th
+	shll2	r0
+	mul.l	r4,r0
+	sts	macl,r1
+	add	r5,r1
+	mov.w	@(30,r8),r0		! cur_v
+	shll2	r0
+	add	r0,r1			! emit_srca
+	mov	#4,r0
+	shll8	r0
+	mov.l	r0,@r15			! size_hi = 4 << 8
+	mov	#8,r7			! coal = 8
+	bra	.Lc2_out
+	mov	#7,r6			! adv
+.Lc2_4p:
 	cmp/eq	r2,r3
 	bf	.Lc2_4a
 	cmp/eq	r2,r5

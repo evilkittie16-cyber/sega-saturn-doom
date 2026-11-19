@@ -27,16 +27,20 @@ enum {
     HW_LOD_MERGE_DX,     /*  8  32-wide mono pair -> one 64-wide quad if dx <=  */
     HW_LOD_C_MAX_DX,     /*  9  strip coalesce, other cases: max dx            */
     HW_LOD_P4_CZ,        /* 10  perspective strips: 4->1 coalesce if depth >=   */
+    HW_LOD_C8_DX,        /* 11  strip coalesce 8 -> 1 (128 texels, quarter copy) if dx <= */
     HW_LOD_COUNT
 };
 #ifndef HW_LOD_REF
 #define HW_LOD_REF 0     /* 1: start with every lossy LOD rule off (check builds) */
 #endif
+#ifndef HW_LOD_C8_DEF
+#define HW_LOD_C8_DEF 32   /* quarter block = 32 texel columns: <= 32 px never undersamples it */
+#endif
 int32_t hw_wall_lod[16] = {
 #if HW_LOD_REF
-    -1, -1, 512 << 16, -1, -1, -1, -1, -1, 48, 1000, 0x7FFFFFFF,
+    -1, -1, 512 << 16, -1, -1, -1, -1, -1, 48, 1000, 0x7FFFFFFF, -1,
 #else
-    16, 6, 512 << 16, 28, 20, 56, 52, 20, 48, 1000, 192 << 16,
+    16, 6, 512 << 16, 28, 20, 56, 52, 20, 48, 1000, 192 << 16, HW_LOD_C8_DEF,
 #endif
 };
 #define HW_LOD(i) (hw_wall_lod[(i)])
@@ -654,6 +658,22 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
 
     if ((s << 4) < u_start)
         return 0;
+
+    /* 8 strips -> one 32-px quad from the quarter copy, which shares the
+     * half copy's allocation (saturn_vdp1.c v1_wall_opt_copies; can_coal
+     * already required tw % 64 == 0) */
+    if (tw >= 64 && srca_mono != srca && (cur_strip_idx & 7) == 0 && ((s + 8) << 4) <= u_end)
+    {
+        int px8 = (((s + 8) << 4) >= u_end) ? ctx->p1->px : ((cur_px_fp + step_px_fp * 7) >> 16);
+        if (px8 - s_px0 <= HW_LOD(HW_LOD_C8_DX))
+        {
+            emit_srca = srca_mono + (cur_v << 2) +
+                (int)(((unsigned)tw >> 6) + ((unsigned)cur_strip_idx >> 3)) * (th << 2);
+            hw_wall_coord_tmp[0] = (int)(((uint32_t)emit_srca << 16) | (4u << 8) | (cmd_w2_base & 0xFFu));
+            hw_wall_coord_tmp[1] = (int)(cmd_w2_cur + ((uint32_t)strip_srca_step << 16) * 7u);
+            return 8;
+        }
+    }
 
     if (tw >= 64 && (srca_64 != srca || srca_mono != srca) && (cur_strip_idx & 3) == 0 && ((s + 4) << 4) <= u_end)
     {

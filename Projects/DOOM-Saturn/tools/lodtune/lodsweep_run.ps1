@@ -4,7 +4,7 @@ param(
     [string] $Views = "w:2:-1880:1117:4:204;p2:1:3095:-3319:3:140;m1a:1:3352:-3568:3",
     [string] $Settings = "",      # file: one "name v0,v1,..." per line (decimal, may be negative)
     [int] $Settle = 30,
-    [int] $ProfFrames = 40,
+    [int] $ProfFrames = 240,      # 40 frames = ~13 rendered frames in the window: +-7% noise
     [switch] $NoBuild,
     [string] $Defs = "",
     [switch] $NoFreeze
