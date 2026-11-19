@@ -3199,7 +3199,53 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx_Call(hw_wall_emit_
     HW_EmitWallFromCtx(ctx, seg);
 }
 
-static const void *const hw_asm_walk_ctx[29] = {
+/* Stage B1: one-band unclipped mono walls emitted inside hw_asm_walk
+ * (layout in saturn_hw_asm.s at .Le_*); everything else -> C emitter. */
+#ifndef HW_ASM_EMIT
+#define HW_ASM_EMIT 1
+#endif
+_Static_assert(offsetof(hw_wall_emit_ctx_t, srca) == 24 && offsetof(hw_wall_emit_ctx_t, th) == 26 &&
+               offsetof(hw_wall_emit_ctx_t, cur_tex_id) == 60 && offsetof(hw_wall_emit_ctx_t, tw) == 68 &&
+               offsetof(hw_wall_emit_ctx_t, srca_mono) == 70 && offsetof(hw_wall_emit_ctx_t, srca_64) == 72 &&
+               offsetof(hw_wall_emit_ctx_t, sub_m_start) == 74 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
+               offsetof(hw_wall_emit_ctx_t, u_start) == 92 && offsetof(hw_wall_emit_ctx_t, u_span) == 96,
+               "hw_asm_walk emitter: hw_wctx layout");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, should_subdivide) == 64 && offsetof(hw_wall_emit_ctx_t, needs_clip) == 65 &&
+               offsetof(hw_wall_emit_ctx_t, persp_strips) == 66 && offsetof(hw_wall_emit_ctx_t, mono_tw) == 80 &&
+               offsetof(hw_wall_emit_ctx_t, mono_base_srca) == 82 && offsetof(hw_wall_emit_ctx_t, rem_h) == 84 &&
+               offsetof(hw_wall_emit_ctx_t, q_xa) == 86 && offsetof(hw_wall_emit_ctx_t, q_xb) == 88 &&
+               offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104, "hw_asm_walk emitter: multi-band fields");
+_Static_assert(offsetof(baked_seg_t, baked_light) == 2 && offsetof(baked_seg_t, u_start) == 8 &&
+               offsetof(baked_seg_t, u_span) == 10 && sizeof(vdp1_cmd_t) == 32 && CMDBUF_M_CAP == 1280 &&
+               SEG_FLAG_STATIC == 0x40 && SEG_FLAG_MID == 0x08,
+               "hw_asm_walk emitter: layout/constants");
+#if HW_ASM_EMIT
+#ifndef HW_ASM_EMSTAT
+#define HW_ASM_EMSTAT 0
+#endif
+#if HW_ASM_EMSTAT
+/* Full-C fallbacks by reason (the other exits call the C helpers directly
+ * and are not counted): [3] tw<=16 partial (clipped mono), [7] user clip
+ * reset. [1] [2] [4] [5] [6] [8] [9] are no longer fallbacks. */
+volatile uint32_t hw_asm_emstat[10];
+#endif
+static const void *const hw_asm_em_ctx[19] = {
+    &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &hw_wall_light_delta, wall_zlight_cmdcolr_LUT,
+    (const void *)(uintptr_t)((((PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu)) << 16),
+    (const void *)(uintptr_t)(((((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)) << 16),
+    &saturn_v1w_cells, &saturn_hw_wall_quads, &saturn_v1w_drop, &saturn_v1w_captured,
+    &saturn_hw_tex_miss, (const void *)HW_LoadWallTexCtx,
+#if HW_ASM_EMSTAT
+    (const void *)hw_asm_emstat,
+#else
+    NULL,
+#endif
+    &saturn_wall_subdivision, (const void *)HW_ModNonPow2, (const void *)HW_WallXYClamp_Slow,
+    hw_wall_coord_tmp, (const void *)HW_EmitSubdividedBakedSeg, (const void *)HW_EmitMultiBandBakedWall
+};
+#endif
+
+static const void *const hw_asm_walk_ctx[30] = {
     &hw_wctx, &hw_cam_x, &hw_cam_y, local_trans_pillars,
     hw_pil_gen, &hw_cur_pil_gen, &hw_cur_pfrac, &hw_frust,
     saturn_master_oclut, hw_solid_mask, hw_mask_left, hw_mask_right,
@@ -3208,7 +3254,12 @@ static const void *const hw_asm_walk_ctx[29] = {
     (const void *)HW_TransformPillar_Shifted, (const void *)HW_CheckSpanOcclusion,
     (const void *)HW_OccludeZeroHeightSeg, (const void *)HW_ClipSegNearPlane,
     (const void *)HW_MarkSubSolidSpan, (const void *)HW_RecordSegPortalAperture,
-    (const void *)HW_EmitWallFromCtx_Call, &hw_p0_clipped, &hw_p1_clipped
+    (const void *)HW_EmitWallFromCtx_Call, &hw_p0_clipped, &hw_p1_clipped,
+#if HW_ASM_EMIT
+    hw_asm_em_ctx
+#else
+    NULL
+#endif
 };
 #endif /* HW_ASM_WALK */
 

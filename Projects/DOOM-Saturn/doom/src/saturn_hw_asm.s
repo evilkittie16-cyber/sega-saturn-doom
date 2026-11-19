@@ -488,6 +488,59 @@ _hw_asm_spanap:
 	rts
 	mov.l	@r15+,r8
 
+
+! Partial edge word of a multi-word span. In: r3 word index, r2 first test
+! bit, r4 &ytop[first column], r6 column count; r8 solid_mask, r9 ap_words,
+! r10 yt_min / r11 yb_max (real values, updated). Clobbers r0-r4, r6, r7, r12.
+.Lg_edge:
+	mov	r3,r0
+	shll2	r0
+	mov.l	@(r0,r8),r1		! sm
+	shll	r0
+	mov	r9,r3
+	add	r0,r3			! aw
+	mov	r1,r0
+	cmp/eq	#-1,r0
+	bt	.Lg_e_ret		! fully solid word
+	mov.w	@r3,r7			! aw yt_min
+	cmp/gt	r7,r10
+	bt	.Lg_e_need
+	mov.w	@(2,r3),r0
+	cmp/gt	r11,r0
+	bf	.Lg_e_ret		! can't widen the result
+.Lg_e_need:
+	mov.w	@(4,r3),r0
+	sub	r7,r0
+	add	#-5,r0
+	cmp/pz	r0			! yt_max - yt_min > 4 ?
+	bt	.Lg_e_scan
+	mov.w	@(6,r3),r0
+	mov	r0,r12
+	mov.w	@(2,r3),r0
+	sub	r0,r12
+	add	#4,r12
+	cmp/pz	r12			! yb_max - yb_min > 4 ?
+	bf	.Lg_e_scan
+	cmp/gt	r7,r10			! flat word: use its summary
+	bf	.Lg_e_1
+	mov	r7,r10
+.Lg_e_1:
+	cmp/gt	r11,r0
+	bf	.Lg_e_ret
+	mov	r0,r11
+.Lg_e_ret:
+	rts
+	nop
+.Lg_e_scan:
+	sts.l	pr,@-r15
+	mov	r6,r3
+	exts.b	r10,r10
+	bsr	.Lg_cols
+	exts.b	r11,r11
+	extu.b	r10,r10
+	lds.l	@r15+,pr
+	rts
+	extu.b	r11,r11
 ! --------------------------------------------------------------------------
 ! void hw_asm_walk(const baked_seg_t *seg, const baked_seg_t *seg_end,
 !                  const saturn_wl_pillar_t *pillars, const void *const *ctx)
@@ -1188,11 +1241,779 @@ _hw_asm_walk:
 	mov.b	r0,@(5,r14)		! top_overlap
 	mov	r7,r0
 	mov.b	r0,@(6,r14)		! bot_overlap
+
+! ---- stage B1: HW_EmitWallFromCtx -> EmitBakedWallQuads -> one-band,
+! unclipped HW_EmitMonolithicBakedSeg (+ the merge into the previous
+! quad). Any other shape calls the C emitter (.Le_c) before anything is
+! written, so C redoes the whole wall. em ctx (walk ctx 116, NULL = off):
+! 0 &saturn_cmd_m, 4 &saturn_cmd_m_count, 8 &hw_wall_light_delta,
+! 12 wall_zlight_cmdcolr_LUT, 16 header (solid), 20 header (mid),
+! 24 &saturn_v1w_cells, 28 &saturn_hw_wall_quads, 32 &saturn_v1w_drop,
+! 36 &saturn_v1w_captured, 40 &saturn_hw_tex_miss, 44 fn LoadWallTexCtx.
+! hw_wctx: 24 srca, 26 th, 60 cur_tex_id, 68 tw, 70 srca_mono, 72 srca_64,
+! 74 sub_m_start, 76 last_clip_x0, 92 u_start, 96 u_span.
+! Scratch: @(8,r15) header, @(12,r15) w2 (is_solid/bsec are dead here).
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	tst	r0,r0
+	bt	.Le_c
+	mov.w	@(4,r8),r0
+	extu.w	r0,r1			! tex
+	mov.l	@(60,r14),r0		! cur_tex_id
+	cmp/eq	r0,r1
+	bf	.Le_load
+	mov.w	@(24,r14),r0		! srca
+	tst	r0,r0
+	bt	.Le_miss
+.Le_have:
+	mov.b	@(3,r8),r0
+	tst	#0x40,r0
+	bf	.Le_st
+	! not STATIC: DOOM pegging of cur_v (EmitWallFromCtx). Idempotent for
+	! power-of-two th, so a later C fallback may redo it; other th -> C.
+	and	#0x30,r0
+	mov	r0,r2			! PEG_LOWER_UNPEGGED | PEG_BOTTOM
+	mov.w	@(26,r14),r0
+	mov	r0,r1			! th
+	mov.w	@(30,r14),r0
+	mov	r0,r3			! v_top = cur_v
+	mov	r2,r0
+	cmp/eq	#0x10,r0
+	bf	.Le_p2
+	add	r1,r3			! bottom-pegged: v_top += th
+.Le_p2:
+	cmp/pl	r1
+	bf/s	.Le_p1
+	mov	#0,r0			! th <= 0: v_top = 0
+	mov	r1,r0
+	add	#-1,r0
+	tst	r1,r0
+	bf	.Le_mod			! th not a power of two
+	and	r0,r3			! v_top &= th - 1
+.Le_pc:
+	mov	#64,r0
+	cmp/ge	r0,r1
+	bf/s	.Le_p1
+	mov	r3,r0
+	mov.w	@(28,r14),r0
+	mov	r0,r4			! wall_h
+	add	r3,r0
+	cmp/gt	r1,r0
+	bf/s	.Le_p1
+	mov	r3,r0
+	mov.w	@(16,r14),r0
+	mov	r0,r5
+	mov.w	@(18,r14),r0
+	sub	r5,r0
+	mov	#32,r5
+	cmp/gt	r5,r0
+	bt/s	.Le_p1
+	mov	r3,r0
+	mov.w	@(20,r14),r0
+	mov	r0,r6
+	mov.w	@(22,r14),r0
+	sub	r6,r0
+	cmp/gt	r5,r0
+	bt/s	.Le_p1
+	mov	r3,r0
+	cmp/gt	r1,r4
+	bf	.Le_p3
+	mov	r1,r4
+	mov	r4,r0
+	mov.w	r0,@(28,r14)		! wall_h = th
+.Le_p3:
+	mov	r1,r0
+	sub	r4,r0			! v_top = th - wall_h
+.Le_p1:
+	mov.w	r0,@(30,r14)		! ctx->cur_v
+.Le_st:
+	mov.b	@(1,r14),r0
+	tst	r0,r0
+	bf	.Le_c2			! near-clipped: subdivided path
+	mov.l	@(40,r14),r5		! p0
+	mov.l	@(44,r14),r6		! p1
+	mov.l	@(12,r6),r7
+	mov.l	@(12,r5),r0
+	sub	r0,r7			! dx
+	mov	#68,r0
+	mov.w	@(r0,r14),r1		! tw
+	mov.w	@(8,r8),r0
+	extu.w	r0,r2			! u_start
+	mov.w	@(10,r8),r0
+	extu.w	r0,r3			! u_span
+	mov	#92,r0
+	mov.l	r2,@(r0,r14)		! ctx->u_start
+	mov	#96,r0
+	mov.l	r3,@(r0,r14)		! ctx->u_span
+	mov	#16,r0
+	cmp/gt	r0,r1
+	bt	.Le_t17
+	! tw <= 16: whole texture only (partial = clipped mono -> C)
+	tst	r2,r2
+	bf	.Le_c3
+	cmp/eq	r1,r3
+	bf	.Le_c3
+	tst	r3,r3
+	bt	.Le_c3
+	mov	#70,r0
+	mov.w	@(r0,r14),r2		! base = srca_mono
+	bra	.Le_mono
+	nop
+.Le_t17:
+	mov	r3,r0
+	cmp/eq	#16,r0
+	bf	.Le_gen
+	mov	r2,r0
+	tst	#15,r0
+	bf	.Le_gen
+	cmp/hs	r1,r2
+	bt	.Le_gen
+.Le_m16:				! base = srca + (u_start >> 4) * (th << 1)
+	mov.w	@(26,r14),r0
+	add	r0,r0
+	shlr2	r2
+	shlr2	r2
+	mulu.w	r0,r2
+	mov.w	@(24,r14),r0
+	sts	macl,r2
+	add	r0,r2
+	bra	.Le_mono
+	mov	#16,r1
+.Le_gen:
+	! perspective candidate (C runs HW_NeedPerspectiveStrips)
+	mov	r2,r0
+	add	r3,r0
+	add	#-1,r0
+	xor	r2,r0
+	mov	#15,r4
+	cmp/hi	r4,r0
+	bf	.Le_np
+	mov.w	@(28,r14),r0
+	mov	#24,r4
+	cmp/gt	r4,r0
+	bt	.Le_ps
+	mov	#64,r4
+	shll16	r4
+	add	r4,r4			! 128 << 16
+	mov.l	@(4,r5),r0
+	cmp/ge	r4,r0
+	bt	.Le_np
+	mov.l	@(4,r6),r0
+	cmp/ge	r4,r0
+	bt	.Le_np
+.Le_ps:					! HW_NeedPerspectiveStrips (tw > 16 here)
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	mov.l	@(52,r0),r0
+	mov.l	@r0,r0			! saturn_wall_subdivision
+	tst	r0,r0
+	bt	.Le_np
+	mov	#16,r0
+	cmp/ge	r0,r7
+	bf	.Le_np			! dx < 16
+	mov.l	@(4,r5),r0
+	mov.l	@(4,r6),r4
+	cmp/gt	r4,r0
+	bf	.Le_ps1
+	mov	r0,r6
+	mov	r4,r0
+	mov	r6,r4			! r0 min_z, r4 max_z
+.Le_ps1:
+	mov	#7,r6
+	shll2	r6
+	shll2	r6
+	shll2	r6
+	shll16	r6			! 448 << 16
+	cmp/gt	r6,r0
+	bt	.Le_npr
+	mov	#20,r6
+	cmp/ge	r6,r7
+	bt	.Le_ps2
+	mov	#64,r6
+	shll16	r6
+	add	r6,r6			! 128 << 16
+	cmp/gt	r6,r0
+	bt	.Le_npr
+.Le_ps2:
+	sub	r0,r4			! dz
+	mov	r0,r6
+	shar	r6
+	shar	r6
+	shar	r6
+	cmp/ge	r6,r4
+	bf	.Le_npr			! dz < min_z >> 3
+	mov	#9,r6
+	shll2	r6
+	shll2	r6
+	shll	r6
+	shll16	r6			! 288 << 16
+	cmp/gt	r6,r0
+	bf	.Le_ps3
+	mov	#32,r6
+	cmp/ge	r6,r7
+	bf	.Le_npr
+	mov	r0,r6
+	shar	r6
+	shar	r6
+	cmp/ge	r6,r4
+	bf	.Le_npr
+.Le_ps3:
+	mov	r3,r6
+	shll2	r6
+	add	r3,r6			! u_span * 5
+	mov	r7,r0
+	shll2	r0
+	shll2	r0			! dx << 4
+	cmp/ge	r6,r0
+	bt	.Le_c4			! perspective strips: C
+.Le_npr:
+	mov.l	@(40,r14),r5
+	mov.l	@(44,r14),r6
+.Le_np:
+	! ((wall_h<=16 && dx<=16 && u_span<=16) || (dx<=6 && p0.cz > 512<<16))
+	mov.w	@(28,r14),r0
+	mov	#16,r4
+	cmp/gt	r4,r0
+	bt	.Le_g2
+	cmp/gt	r4,r7
+	bt	.Le_g2
+	cmp/gt	r4,r3
+	bf	.Le_g3
+.Le_g2:
+	mov	#6,r4
+	cmp/gt	r4,r7
+	bt	.Le_g4
+	mov	#2,r4
+	shll8	r4
+	shll16	r4			! 512 << 16
+	mov.l	@(4,r5),r0
+	cmp/gt	r4,r0
+	bf	.Le_g4
+.Le_g3:
+	cmp/hs	r1,r2
+	bf	.Le_m16
+.Le_g4:
+	mov	r1,r0
+	cmp/eq	#32,r0
+	bf	.Le_g6
+	tst	r2,r2
+	bf	.Le_g6
+	mov.w	@(20,r14),r0		! yb0
+	mov	r0,r4
+	mov.w	@(16,r14),r0		! ya0
+	sub	r4,r0
+	add	#3,r0
+	mov	#6,r4
+	cmp/hi	r4,r0
+	movt	r4			! r4 = 1: not a level top edge
+	mov.w	@(24,r14),r0
+	mov	r0,r5			! srca
+	mov	#70,r0
+	mov.w	@(r0,r14),r6		! srca_mono
+	mov	r3,r0
+	cmp/eq	#32,r0
+	bt	.Le_g5
+	mov	#28,r0
+	cmp/gt	r0,r7
+	bt	.Le_g5x
+	tst	r4,r4
+	bf	.Le_g5x
+.Le_g5:
+	cmp/eq	r5,r6
+	bf	.Le_mr6
+.Le_g5x:
+	mov	r3,r0
+	cmp/eq	#64,r0
+	bf	.Le_c5
+	tst	r4,r4
+	bf	.Le_c5
+	mov	#72,r0
+	mov.w	@(r0,r14),r6		! srca_64
+	cmp/eq	r5,r6
+	bt	.Le_c5
+	mov	r6,r2
+	bra	.Le_mono
+	mov	#64,r1
+.Le_mr6:
+	mov	r6,r2
+	bra	.Le_mono
+	mov	#32,r1
+.Le_g6:
+	mov	#64,r0
+	cmp/ge	r0,r1
+	bf	.Le_c6
+	mov	r3,r0
+	cmp/eq	#64,r0
+	bf	.Le_c6
+	mov	r2,r0
+	tst	#63,r0
+	bf	.Le_c6
+	cmp/hs	r1,r2
+	bt	.Le_c6
+	mov.w	@(24,r14),r0
+	mov	r0,r5			! srca
+	mov	#72,r0
+	mov.w	@(r0,r14),r6		! srca_64
+	mov	#70,r0
+	mov.w	@(r0,r14),r4		! srca_mono
+	mov.w	@(26,r14),r0
+	mov	r0,r3			! th
+	shlr2	r2
+	shlr2	r2
+	shlr2	r2			! u_start >> 6
+	mov	#20,r0
+	cmp/gt	r0,r7
+	bf	.Le_g7
+	cmp/eq	r5,r6
+	bf	.Le_g8
+	mov	#56,r0
+	cmp/gt	r0,r7
+	bt	.Le_g8
+.Le_g7:
+	cmp/eq	r5,r4
+	bt	.Le_g8
+	shll2	r3
+	mulu.w	r3,r2
+	sts	macl,r2
+	add	r4,r2			! srca_mono + (u_start>>6)*(th<<2)
+	bra	.Le_mono
+	mov	#32,r1
+.Le_g8:
+	cmp/eq	r5,r6
+	bt	.Le_c6
+	shll2	r3
+	add	r3,r3
+	mulu.w	r3,r2
+	sts	macl,r2
+	add	r6,r2			! srca_64 + (u_start>>6)*(th<<3)
+	mov	#64,r1
+
+! r1 mono_tw, r2 base srca (low 16 bits valid)
+.Le_mono:
+	mov	#116,r0
+	mov.l	@(r0,r11),r7		! em
+	mov.l	@(4,r7),r0
+	mov.w	@r0,r0
+	extu.w	r0,r0			! m_cnt
+	add	#16,r0
+	mov	#5,r4
+	shll8	r4			! CMDBUF_M_CAP 1280
+	cmp/ge	r4,r0
+	bt	.Le_ret
+	mov	#76,r0
+	mov.w	@(r0,r14),r0		! last_clip_x0
+	cmp/eq	#-1,r0
+	bf	.Le_c7			! user clip reset: C
+	mov.l	@(40,r14),r0
+	mov.l	@(12,r0),r4		! q_xa
+	mov.l	@(44,r14),r0
+	mov.l	@(12,r0),r5		! q_xb
+	cmp/gt	r4,r5
+	bf	.Le_ret
+	! light_s = clamp((baked_light >> 4) + delta, 0, 15)
+	mov.l	@(8,r7),r0
+	mov.l	@r0,r3
+	mov.b	@(2,r8),r0
+	extu.b	r0,r0
+	shlr2	r0
+	shlr2	r0
+	add	r3,r0
+	cmp/pz	r0
+	bt	.Le_l1
+	mov	#0,r0
+.Le_l1:
+	mov	#15,r3
+	cmp/gt	r3,r0
+	bf	.Le_l2
+	mov	r3,r0
+.Le_l2:
+	cmp/eq	r3,r0
+	bt/s	.Le_l3
+	mov	#0,r3			! zb = 0 at full light
+	mov.l	@(40,r14),r3
+	mov.l	@(4,r3),r3
+	mov.l	@(44,r14),r6
+	mov.l	@(4,r6),r6
+	add	r6,r3
+	shlr16	r3
+	shlr2	r3
+	shlr2	r3
+	shlr	r3			! (cz0 + cz1) >> 21
+	mov	#127,r6
+	cmp/hi	r6,r3
+	bf	.Le_l3
+	mov	r6,r3
+.Le_l3:
+	shll8	r0
+	add	r3,r3
+	add	r3,r0
+	mov.l	@(12,r7),r3
+	mov.w	@(r0,r3),r3
+	extu.w	r3,r3
+	shlr8	r3
+	shll8	r3			! k_shade
+	mov.b	@(3,r8),r0
+	mov.l	@(16,r7),r6
+	tst	#8,r0
+	bt	.Le_l4
+	mov.l	@(20,r7),r6		! MID: no SPD
+.Le_l4:
+	or	r6,r3
+	mov.l	r3,@(8,r15)		! cmd_header1
+	! one band? rem_h <= (th > 0 ? th - cur_v : rem_h) && rem_h <= 255
+	mov.w	@(26,r14),r0
+	mov	r0,r3			! th
+	mov.w	@(28,r14),r0
+	mov	r0,r6			! rem_h
+	mov	#-1,r0
+	extu.b	r0,r0
+	cmp/gt	r0,r6
+	bt	.Le_c8			! multi-band: C
+	cmp/pl	r3
+	bf	.Le_r1
+	mov.w	@(30,r14),r0
+	neg	r0,r0
+	add	r3,r0			! th - cur_v
+	cmp/gt	r0,r6
+	bt	.Le_c8
+	cmp/gt	r3,r6
+	bf	.Le_r1
+	mov	r3,r6			! rows = th
+.Le_r1:
+	mov	r1,r0
+	shlr2	r0
+	shlr	r0
+	mov	r0,r3			! tw_stride
+	mov.w	@(30,r14),r0
+	muls.w	r0,r3
+	sts	macl,r0
+	add	r2,r0			! strip_srca
+	shll16	r0
+	shll8	r3
+	or	r3,r0
+	extu.b	r6,r6
+	or	r6,r0
+	mov.l	r0,@(12,r15)		! w2
+	! HW_WALL_XYCLAMP fast test (slow clamp: C)
+	mov	#125,r7
+	shll2	r7			! 500
+	mov	r7,r6
+	sub	r5,r6			! 500 - xb
+	add	r4,r7			! xa + 500
+	or	r7,r6
+	mov.w	@(16,r14),r0
+	mov	r0,r1			! ya0
+	mov.w	@(18,r14),r0
+	mov	r0,r2			! ya1
+	mov.w	@(20,r14),r0
+	mov	r0,r3			! yb0
+	mov.w	@(22,r14),r0
+	mov	r0,r7			! yb1
+	sub	r3,r0
+	or	r0,r6
+	mov	r2,r0
+	sub	r1,r0
+	or	r0,r6
+	mov	#4,r0
+	shll8	r0
+	add	#-1,r0			! 1023
+	cmp/hi	r0,r6
+	bt	.Le_c9
+	! now ya0 <= ya1 <= ya0+1023 (same for b): outside [-1024,1023]
+	! iff ya0 < -1024 || ya1 > 1023 (or b)
+	cmp/gt	r0,r2
+	bt	.Le_c9
+	cmp/gt	r0,r7
+	bt	.Le_c9
+	add	#1,r0
+	mov	r1,r6
+	add	r0,r6
+	cmp/pz	r6
+	bf	.Le_c9
+	mov	r3,r6
+	add	r0,r6
+	cmp/pz	r6
+	bf	.Le_c9
+.Le_w:
+	shll16	r4
+	shll16	r5
+	extu.w	r1,r1
+	or	r4,r1			! w3
+	extu.w	r2,r2
+	or	r4,r2			! w6
+	extu.w	r3,r3
+	or	r5,r3			! w4
+	extu.w	r7,r7
+	or	r5,r7			! w5
+	mov	#116,r0
+	mov.l	@(r0,r11),r6		! em
+	mov.l	@(4,r6),r0
+	mov.w	@r0,r0
+	extu.w	r0,r4			! m_cnt
+	mov.l	@r6,r0
+	mov.l	@r0,r6			! saturn_cmd_m
+	mov	r4,r0
+	shll2	r0
+	shll2	r0
+	shll	r0
+	add	r0,r6			! &cmd[m_cnt]
+	mov	#74,r0
+	mov.w	@(r0,r14),r0
+	extu.w	r0,r0			! sub_m_start
+	cmp/hi	r0,r4
+	bf	.Le_new
+	add	#-32,r6			! prev
+	mov.l	@(16,r6),r0
+	cmp/eq	r1,r0
+	bf	.Le_new0
+	mov.l	@(20,r6),r0
+	cmp/eq	r2,r0
+	bf	.Le_new0
+	mov.l	@(4,r6),r0
+	mov.l	@(8,r15),r5
+	cmp/eq	r5,r0
+	bf	.Le_new0
+	mov.l	@(8,r6),r0
+	mov.l	@(12,r15),r5
+	cmp/eq	r5,r0
+	bf	.Le_new0
+	mov	r5,r0
+	shlr8	r0
+	and	#0x3F,r0
+	cmp/eq	#4,r0			! 32-wide texture strip
+	bf	.Le_new0
+	mov.l	@(12,r6),r5
+	shlr16	r5
+	exts.w	r5,r5			! prev xa
+	mov	r3,r0
+	shlr16	r0
+	exts.w	r0,r0			! xb
+	sub	r5,r0
+	mov	#48,r5
+	cmp/gt	r5,r0
+	bt	.Le_new0		! merged_dx > 48
+	exts.w	r1,r0
+	exts.w	r3,r5
+	sub	r5,r0
+	add	#3,r0
+	mov	#6,r5
+	cmp/hi	r5,r0
+	bt	.Le_new0
+	mov	#72,r0
+	mov.w	@(r0,r14),r5		! srca_64
+	mov.w	@(24,r14),r0
+	cmp/eq	r0,r5
+	bt	.Le_new0
+	mov	#68,r0
+	mov.w	@(r0,r14),r0
+	cmp/eq	#32,r0
+	bf	.Le_new0
+	mov.w	@(30,r14),r0
+	shll2	r0
+	shll	r0
+	add	r0,r5
+	shll16	r5
+	mov.l	@(12,r15),r0
+	extu.b	r0,r0
+	or	r0,r5
+	mov	#8,r0
+	shll8	r0
+	or	r0,r5
+	mov.l	r5,@(8,r6)		! prev[2]: 64-wide copy
+	mov.l	r3,@(16,r6)		! prev[4] = w4
+	bra	.Le_ret
+	mov.l	r7,@(20,r6)		! prev[5] = w5
+.Le_new0:
+	add	#32,r6
+.Le_new:
+	mov	#5,r0
+	shll8	r0
+	add	#-1,r0
+	cmp/ge	r0,r4
+	bt	.Le_drop
+	add	#1,r4
+	mov	#116,r0
+	mov.l	@(r0,r11),r5		! em
+	mov.l	@(4,r5),r0
+	mov.w	r4,@r0			! saturn_cmd_m_count = m_cnt + 1
+	mov	#2,r0
+	shll16	r0
+	mov.l	r0,@r6
+	mov.l	@(8,r15),r0
+	mov.l	r0,@(4,r6)
+	mov.l	@(12,r15),r0
+	mov.l	r0,@(8,r6)
+	mov.l	r1,@(12,r6)
+	mov.l	r3,@(16,r6)
+	mov.l	r7,@(20,r6)
+	mov.l	r2,@(24,r6)
+	mov	#0,r0
+	mov.l	r0,@(28,r6)
+	mov.l	@(24,r5),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	mov.l	r0,@r1			! saturn_v1w_cells++
+	mov.l	@(28,r5),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	bra	.Le_ret
+	mov.l	r0,@r1			! saturn_hw_wall_quads++
+.Le_drop:
+	mov	#116,r0
+	mov.l	@(r0,r11),r5
+	mov.l	@(32,r5),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	mov.l	r0,@r1			! saturn_v1w_drop++
+	mov.l	@(36,r5),r1
+	mov	#1,r0
+	bra	.Le_ret
+	mov.l	r0,@r1			! saturn_v1w_captured = 1
+.Le_load:
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	mov.l	@(44,r0),r0		! HW_LoadWallTexCtx(tex, ctx)
+	mov	r1,r4
+	jsr	@r0
+	mov	r14,r5
+	tst	r0,r0
+	bf	.Le_have
+.Le_miss:
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	mov.l	@(40,r0),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	bra	.Le_ret
+	mov.l	r0,@r1			! saturn_hw_tex_miss++
+.Le_c1:
+	bra	.Le_cs
+	mov	#1,r1
+.Le_c2:					! near-clipped: Subdivided(ctx, dx >= 24 && subdivision)
+	mov.l	@(40,r14),r0
+	mov.l	@(12,r0),r1
+	mov.l	@(44,r14),r0
+	mov.l	@(12,r0),r5
+	sub	r1,r5
+	mov	#24,r0
+	cmp/ge	r0,r5
+	bf/s	.Le_sd
+	mov	#0,r5
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	mov.l	@(52,r0),r0
+	mov.l	@r0,r0
+	tst	r0,r0
+	bt	.Le_sd
+	bra	.Le_sd
+	mov	#1,r5
+.Le_c4:					! perspective strips
+	bra	.Le_sd
+	mov	#1,r5
+.Le_c5:					! no mono copy: linear strips
+.Le_c6:
+	mov	#0,r5
+.Le_sd:					! HW_EmitSubdividedBakedSeg(ctx, r5)
+	mov	#116,r0
+	mov.l	@(r0,r11),r1
+	mov	#68,r0
+	mov.l	@(r0,r1),r0
+	jsr	@r0
+	mov	r14,r4
+	bra	.Le_ret
+	nop
+.Le_c8:					! multi-band mono: HW_EmitMultiBandBakedWall(ctx)
+	mov.l	@(8,r15),r7
+	mov	#104,r0
+	mov.l	r7,@(r0,r14)		! cmd_header1
+	mov	#0,r7
+	mov	#64,r0
+	mov.b	r7,@(r0,r14)		! should_subdivide
+	mov	#65,r0
+	mov.b	r7,@(r0,r14)		! needs_clip
+	mov	#66,r0
+	mov.b	r7,@(r0,r14)		! persp_strips
+	mov	#80,r0
+	mov.w	r1,@(r0,r14)		! mono_tw
+	mov	#82,r0
+	mov.w	r2,@(r0,r14)		! mono_base_srca
+	mov	#84,r0
+	mov.w	r6,@(r0,r14)		! rem_h
+	mov	#86,r0
+	mov.w	r4,@(r0,r14)		! q_xa
+	mov	#88,r0
+	mov.w	r5,@(r0,r14)		! q_xb
+	mov	#116,r0
+	mov.l	@(r0,r11),r1
+	mov	#72,r0
+	mov.l	@(r0,r1),r0
+	jsr	@r0
+	mov	r14,r4
+	bra	.Le_ret
+	nop
+.Le_c2s:
+	bra	.Le_cs
+	mov	#2,r1
+.Le_c3:
+	bra	.Le_cs
+	mov	#3,r1
+.Le_c7:
+	bra	.Le_cs
+	mov	#7,r1
+.Le_c9:					! HW_WallXYClamp_Slow(hw_wall_coord_tmp)
+	mov	#116,r0
+	mov.l	@(r0,r11),r6
+	mov	#64,r0
+	mov.l	@(r0,r6),r0		! hw_wall_coord_tmp
+	mov.l	r4,@r0
+	mov.l	r5,@(4,r0)
+	mov.l	r1,@(8,r0)
+	mov.l	r3,@(12,r0)
+	mov.l	r2,@(16,r0)
+	mov.l	r7,@(20,r0)
+	mov.l	@(60,r6),r1
+	jsr	@r1
+	mov	r0,r4
+	mov	#116,r0
+	mov.l	@(r0,r11),r6
+	mov	#64,r0
+	mov.l	@(r0,r6),r0
+	mov.l	@r0,r4			! xa
+	mov.l	@(4,r0),r5		! xb
+	mov.l	@(8,r0),r1		! ya0
+	mov.l	@(12,r0),r3		! yb0
+	mov.l	@(16,r0),r2		! ya1
+	bra	.Le_w
+	mov.l	@(20,r0),r7		! yb1
+.Le_mod:				! v_top = HW_ModNonPow2(v_top, th)
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	mov.l	@(56,r0),r0
+	mov	r3,r4
+	jsr	@r0
+	mov	r1,r5
+	mov	r0,r3
+	mov.w	@(26,r14),r0
+	bra	.Le_pc
+	mov	r0,r1			! th
+.Le_cs:			! fallback statistics: em[48] = counts[10] or NULL
+	mov	#116,r0
+	mov.l	@(r0,r11),r0
+	mov.l	@(48,r0),r0
+	tst	r0,r0
+	bt	.Le_c
+	shll2	r1
+	add	r1,r0
+	mov.l	@r0,r1
+	add	#1,r1
+	mov.l	r1,@r0
+.Le_c:
 	mov	#104,r0
 	mov.l	@(r0,r11),r0		! HW_EmitWallFromCtx(ctx, seg)
 	mov	r14,r4
 	jsr	@r0
 	mov	r8,r5
+.Le_ret:
 	bra	.Lw_next
 	nop
 
@@ -1834,55 +2655,3 @@ _hw_asm_subap:
 	.align	2
 .Ls_nzs:	.long	2621440		! HW_NEAR_Z_SCALE = 10485760 / 4
 
-! Partial edge word of a multi-word span. In: r3 word index, r2 first test
-! bit, r4 &ytop[first column], r6 column count; r8 solid_mask, r9 ap_words,
-! r10 yt_min / r11 yb_max (real values, updated). Clobbers r0-r4, r6, r7, r12.
-.Lg_edge:
-	mov	r3,r0
-	shll2	r0
-	mov.l	@(r0,r8),r1		! sm
-	shll	r0
-	mov	r9,r3
-	add	r0,r3			! aw
-	mov	r1,r0
-	cmp/eq	#-1,r0
-	bt	.Lg_e_ret		! fully solid word
-	mov.w	@r3,r7			! aw yt_min
-	cmp/gt	r7,r10
-	bt	.Lg_e_need
-	mov.w	@(2,r3),r0
-	cmp/gt	r11,r0
-	bf	.Lg_e_ret		! can't widen the result
-.Lg_e_need:
-	mov.w	@(4,r3),r0
-	sub	r7,r0
-	add	#-5,r0
-	cmp/pz	r0			! yt_max - yt_min > 4 ?
-	bt	.Lg_e_scan
-	mov.w	@(6,r3),r0
-	mov	r0,r12
-	mov.w	@(2,r3),r0
-	sub	r0,r12
-	add	#4,r12
-	cmp/pz	r12			! yb_max - yb_min > 4 ?
-	bf	.Lg_e_scan
-	cmp/gt	r7,r10			! flat word: use its summary
-	bf	.Lg_e_1
-	mov	r7,r10
-.Lg_e_1:
-	cmp/gt	r11,r0
-	bf	.Lg_e_ret
-	mov	r0,r11
-.Lg_e_ret:
-	rts
-	nop
-.Lg_e_scan:
-	sts.l	pr,@-r15
-	mov	r6,r3
-	exts.b	r10,r10
-	bsr	.Lg_cols
-	exts.b	r11,r11
-	extu.b	r10,r10
-	lds.l	@r15+,pr
-	rts
-	extu.b	r11,r11
