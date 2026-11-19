@@ -63,11 +63,46 @@ static int          hw_submax_num = -1;
 #define HW_SUBPROF_MARK(slot) do { } while (0)
 #endif
 
+#if HW_ASM_SUBBODY
+/* Stage E2 (saturn_hw_asm.s): Body + HW_RenderSubsectorBakedWalls. */
+extern void hw_asm_subsector(int subnum, int fully_inside);
+_Static_assert(sizeof(subsector_t) == 4, "sub1");
+_Static_assert(offsetof(subsector_t, sector) == 2, "sub2");
+_Static_assert(sizeof(hw_sec_fast_t) == 16, "sub3");
+_Static_assert(offsetof(hw_sec_fast_t, has_things) == 13, "sub4");
+_Static_assert(offsetof(hw_sec_fast_t, light_delta) == 14, "sub5");
+_Static_assert(offsetof(sub_range_t, s_start) == 4, "sub6");
+_Static_assert(offsetof(sub_range_t, subnum) == 8, "sub7");
+_Static_assert(HW_MAX_AP_SECTORS == 256, "sub8");
+_Static_assert(CMDBUF_MAX_VISIT == 384, "sub9");
+_Static_assert(HW_FLAT_ALLOW_CEIL == 8, "sub10");
+_Static_assert(sizeof(saturn_wl_subsector_t) == 16, "sub11");
+_Static_assert(offsetof(saturn_wl_subsector_t, portal_first) == 8, "sub12");
+_Static_assert(sizeof(saturn_wl_pillar_t) == 4, "sub13");
+_Static_assert(sizeof(baked_seg_t) == 16, "sub14");
+_Static_assert(HW_MAX_SUBSECTOR_PILLARS == 96, "sub15");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, is_sky_ceil) == 3, "sub16");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, n_vis) == 4, "sub17");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, ytop_min) == 12, "sub18");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, ybot_max) == 14, "sub19");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, sec_ceiling) == 32, "sub20");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, sec_floor) == 36, "sub21");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, cur_tex_id) == 60, "sub22");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, sub_m_start) == 74, "sub23");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76, "sub24");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, last_clip_x1) == 78, "sub25");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, seg_end) == 108, "sub26");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, portal_first) == 120, "sub27");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, portal_count) == 122, "sub28");
+#define HW_RenderSubsector(subnum, fully_inside) hw_asm_subsector((subnum), (fully_inside))
+#else
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
                                                          unsigned int *sp_parts);
+#endif
 
 /* Walk a subsector (takes 2 register arguments: r4=subnum, r5=fully_inside) */
-#if HW_SUBMAX
+#if HW_ASM_SUBBODY
+#elif HW_SUBMAX
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_inside)
 {
     unsigned int parts[5] = { 0, 0, 0, 0, 0 };
@@ -85,6 +120,53 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector(int subnum, int fully_insid
 #define HW_RenderSubsector(subnum, fully_inside) HW_RenderSubsector_Body((subnum), (fully_inside), NULL)
 #endif
 
+#if HW_ASM_SUBBODY
+#if HW_ASM_CHECK
+#define HW_SUB_COMMIT_FN HW_CommitSubsectorOcclusion   /* keeps the commit check */
+#else
+#define HW_SUB_COMMIT_FN hw_asm_commit
+#endif
+/* Wall half: [0] &saturn_baked_walls_active [4] &saturn_baked_wall_num_subsectors
+ * [8] &saturn_baked_wall_subsectors [12] &hw_wctx [16] &hw_wall_light_delta
+ * [20] &hw_solid_count [24] RecordSubsectorUnbakedPortals [28] &hw_prof_segs_acc
+ * [32] HW_ProfDelta_Wrap [36] &hw_cur_pil_gen [40] hw_pil_gen
+ * [44] &saturn_baked_wall_pillars [48] &hw_cur_pillars [52] &hw_cur_pfrac
+ * [56] &saturn_baked_wall_pillar_frac [60] hw_zero_pfrac [64] &saturn_baked_wall_segs
+ * [68] &hw_wctx_tex_frame [72] &hw_render_frame [76] &saturn_cmd_m_count
+ * [80] &saturn_view_h [84] hw_asm_walk [88] hw_asm_walk_ctx [92] &saturn_hw_seg_iter
+ * [96] &saturn_hw_seg_vis [100] HW_EmitUserClip */
+const void *const hw_asm_subw_ctx[26] = {
+    &saturn_baked_walls_active, &saturn_baked_wall_num_subsectors, &saturn_baked_wall_subsectors,
+    &hw_wctx, &hw_wall_light_delta, &hw_solid_count,
+    (const void *)HW_RecordSubsectorUnbakedPortals, &hw_prof_segs_acc,
+    (const void *)HW_ProfDelta_Wrap, &hw_cur_pil_gen, hw_pil_gen,
+    &saturn_baked_wall_pillars, &hw_cur_pillars, &hw_cur_pfrac,
+    &saturn_baked_wall_pillar_frac, hw_zero_pfrac, &saturn_baked_wall_segs,
+    &hw_wctx_tex_frame, &hw_render_frame, (const void *)&saturn_cmd_m_count,
+    &saturn_view_h, (const void *)hw_asm_walk, hw_asm_walk_ctx, &saturn_hw_seg_iter,
+    &saturn_hw_seg_vis, (const void *)HW_EmitUserClip
+};
+/* Body half: [0] &hw_solid_count [4] &numsubsectors [8] &subsectors
+ * [12] &saturn_visit_count [16] hw_sec_fast [20] HW_CheckSubsectorAperture
+ * [24] &saturn_hw_occl_culls [28] &saturn_hw_sky_visible [32] &saturn_cmd_m_count
+ * [36] &hw_cur_sub_ranges [40] &saturn_slave_enabled [44] &sectors
+ * [48] HW_SubmitSlaveFlatJob [52] HW_RenderSubsectorBakedFlats
+ * [56] HW_SubsectorHasThings [60] HW_RenderSubsectorSprites
+ * [64] &sub_solid_active [68] &hw_aperture_state [72] commit
+ * [76] hw_asm_subw_ctx [80] sizeof(sector_t) */
+const void *const hw_asm_sub_ctx[21] = {
+    &hw_solid_count, &numsubsectors, &subsectors, &saturn_visit_count,
+    hw_sec_fast, (const void *)HW_CheckSubsectorAperture, &saturn_hw_occl_culls,
+    &saturn_hw_sky_visible, (const void *)&saturn_cmd_m_count, &hw_cur_sub_ranges,
+    &saturn_slave_enabled, &sectors, (const void *)HW_SubmitSlaveFlatJob,
+    (const void *)HW_RenderSubsectorBakedFlats, (const void *)HW_SubsectorHasThings,
+    (const void *)HW_RenderSubsectorSprites, &sub_solid_active, &hw_aperture_state,
+    (const void *)HW_SUB_COMMIT_FN, hw_asm_subw_ctx, (const void *)(uintptr_t)sizeof(sector_t)
+};
+#else
+#if HW_ASM
+const void *const hw_asm_sub_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
                                                          unsigned int *sp_parts)
 {
@@ -272,6 +354,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     }
     HW_SUBPROF_MARK(4);
 }
+#endif /* HW_ASM_SUBBODY */
 
 typedef struct {
     uint16_t bspnum;       /* must be unsigned: node_t children are uint16_t (NF_SUBSECTOR = 0x8000) */
@@ -296,7 +379,11 @@ const void *const hw_asm_bsp_ctx[20] = {
     &saturn_hw_bsp_occl, &saturn_hw_occl_culls, saturn_master_oclut,     /* 16 */
     hw_solid_mask, hw_mask_left, hw_mask_right, hw_span_mask_lut,        /* 28 */
     &hw_solid_any, &hw_solid_summary, &saturn_view_w,                    /* 44 */
+#if HW_ASM_SUBBODY
+    &nodes, hw_bsp_stack, (const void *)hw_asm_subsector,                /* 56 */
+#else
     &nodes, hw_bsp_stack, (const void *)HW_RenderSubsector_Body,         /* 56 */
+#endif
     &hw_node_bboxes, &saturn_baked_flat_bboxes, &saturn_hw_bsp_abort     /* 68 */
 };
 #if HW_ASM_CHECK

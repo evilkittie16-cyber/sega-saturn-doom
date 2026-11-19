@@ -3433,6 +3433,26 @@ static const void *const hw_asm_walk_ctx[30] = {
 };
 #endif /* HW_ASM_WALK */
 
+/* Compact rewrite stage E2: HW_RenderSubsector_Body (saturn_hw_render.c)
+ * and HW_RenderSubsectorBakedWalls below are one asm routine,
+ * hw_asm_subsector (saturn_hw_asm.s). Both have side effects (they draw),
+ * so there is no C-beside-asm check: verified by VDP1 VRAM equality
+ * against -DHW_ASM_SUBBODY=0. */
+/* RESULT (5thPlanet, 2026-11-19, sets asmE1 -> asmE2): VDP1 VRAM identical,
+ * but master busy w +0.08, p2 +0.21, m1a +0.88 ms - the routine misses
+ * on nearly every line like the C pair it replaces, plus a data miss per
+ * table pointer. OFF by default; -DHW_ASM_SUBBODY=1 enables it (needs
+ * HW_ASM_BSP && HW_ASM_WALK && !HW_ORACLE && !HW_WALLS_ONLY &&
+ * !HW_PROF_SUBTIMERS && !HW_DEFER_WALLS). */
+#ifndef HW_ASM_SUBBODY
+#define HW_ASM_SUBBODY 0
+#endif
+#if HW_ASM_SUBBODY && !(HW_ASM_BSP && HW_ASM_WALK && !HW_ORACLE && !HW_WALLS_ONLY && \
+                        !HW_PROF_SUBTIMERS && !HW_DEFER_WALLS)
+#error "HW_ASM_SUBBODY needs HW_ASM_BSP, HW_ASM_WALK and no ORACLE/WALLS_ONLY/SUBTIMERS/DEFER_WALLS"
+#endif
+
+#if !HW_ASM_SUBBODY
 /* Master Blueprint: Zero-Runtime-Math 1D LOD Subsector Wall Renderer (Phase 3)
  * Fast Culling & Pillar Projection Loop (< 400 bytes, zero register spills):
  * rejects ~72% of segs in registers and dispatches surviving visible segs to HW_EmitVisibleBakedSeg. */
@@ -3527,6 +3547,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
     hw_prof_segs_acc += HW_ProfDelta(tw0, SAT_FRT());
     return 1;
 }
+#endif /* !HW_ASM_SUBBODY */
 
 #if HW_DEFER_WALLS
 /* One recorded wall -> hw_wctx -> quads (both CPUs' pass 2). */

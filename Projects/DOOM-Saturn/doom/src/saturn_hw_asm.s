@@ -1,4 +1,4 @@
-! saturn_hw_asm.s — hand-written SH-2 kernels for the hardware renderer
+! saturn_hw_asm.s ? hand-written SH-2 kernels for the hardware renderer
 ! (saturn_hw_*.c). Each routine is bit-identical to the C it replaces; the
 ! C stays as the reference and as the DOOM-Windows (MSVC) path. Switch:
 ! HW_ASM (saturn_hw_internal.h), default 1 on Saturn.
@@ -5804,3 +5804,450 @@ _hw_asm_bsp:
 
 	.align	2
 .Lb_ctx2:	.long	_hw_asm_bsp_ctx
+
+! ===================================================================
+! Stage E2: hw_asm_subsector(subnum r4, fully_inside r5) ==
+! HW_RenderSubsector_Body (saturn_hw_render.c, no ORACLE / SUBMAX /
+! VIS_STATS / DEFER_WALLS / WALLS_ONLY) with HW_RenderSubsectorBakedWalls
+! (saturn_hw_walls.c) inline. Tables hw_asm_sub_ctx / hw_asm_subw_ctx:
+! see saturn_hw_render.c. regs: r8 sub ctx, r9 flat flags then the wall
+! table, r10 sf, r11 subnum, r12 secnum, r13 &ranges[visit_idx],
+! r14 m_start. frame: 0 tw0, 4 num_segs, 8 visit_idx
+! ===================================================================
+	.align	2
+	.global	_hw_asm_subsector
+_hw_asm_subsector:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-16,r15
+	mov.l	.Lu_ctx,r8
+	mov.l	@r8,r0
+	mov.l	@r0,r0			! hw_solid_count
+	mov	#80,r1
+	shll2	r1
+	cmp/ge	r1,r0
+	bt	.Lu_ret
+	mov.l	@(4,r8),r0
+	mov.w	@r0,r0			! numsubsectors (VINT short)
+	cmp/hs	r0,r4
+	bt	.Lu_ret
+	mov	r4,r11
+	mov.l	@(8,r8),r0
+	mov.l	@r0,r0			! subsectors
+	mov	r4,r1
+	shll2	r1
+	add	r1,r0
+	mov.w	@(2,r0),r0
+	mov	r0,r12			! secnum
+	mov	#1,r1
+	shll8	r1
+	cmp/hs	r1,r12
+	bt	.Lu_ret
+	mov.l	@(12,r8),r0
+	mov.l	@r0,r0			! saturn_visit_count
+	mov	#96,r1
+	shll2	r1			! CMDBUF_MAX_VISIT
+	cmp/ge	r1,r0
+	bt	.Lu_ret
+	mov.l	@(16,r8),r10
+	mov	r12,r1
+	shll2	r1
+	shll2	r1
+	add	r1,r10			! sf
+	mov	r5,r0
+	and	#3,r0
+	mov	r0,r6
+	mov	r11,r4
+	mov	r10,r5
+	mov.l	@(20,r8),r0
+	jsr	@r0			! HW_CheckSubsectorAperture
+	nop
+	cmp/pz	r0
+	bt	.Lu_vis
+	mov.l	@(24,r8),r1
+	mov.l	@r1,r0
+	add	#1,r0
+	bra	.Lu_ret
+	mov.l	r0,@r1			! saturn_hw_occl_culls++
+.Lu_vis:
+	mov	r0,r9			! flat_flags
+	mov.b	@(12,r10),r0		! is_sky
+	tst	r0,r0
+	bt	.Lu_nsky
+	mov	r9,r0
+	tst	#8,r0
+	bt	.Lu_sk1
+	mov.l	@(28,r8),r1
+	mov	#1,r2
+	mov.l	r2,@r1			! saturn_hw_sky_visible = 1
+.Lu_sk1:
+	mov	#-9,r1
+	and	r1,r9			! &= ~ALLOW_CEIL
+.Lu_nsky:
+	mov.l	@(12,r8),r1
+	mov.l	@r1,r0			! visit_idx
+	mov	r0,r2
+	add	#1,r2
+	mov.l	r2,@r1
+	mov.l	r0,@(8,r15)
+	mov.l	@(32,r8),r1
+	mov.w	@r1,r14
+	extu.w	r14,r14			! m_start
+	mov.l	@(36,r8),r13
+	mov.l	@r13,r13		! hw_cur_sub_ranges
+	shll2	r0
+	shll2	r0
+	add	r0,r13
+	mov	#0,r0
+	mov.l	r0,@(4,r13)		! s_start/s_count = 0
+	mov	r11,r0
+	mov.w	r0,@(8,r13)		! subnum
+	mov	r9,r0
+	tst	#12,r0			! ALLOW_BOTH
+	bt	.Lu_walls
+	mov.l	@(44,r8),r6
+	mov.l	@r6,r6			! sectors
+	mov	#80,r0
+	mov.l	@(r0,r8),r1		! sizeof(sector_t)
+	mulu.w	r1,r12
+	sts	macl,r1
+	add	r1,r6			! sec
+	mov.l	@(40,r8),r0
+	mov.b	@r0,r0			! saturn_slave_enabled
+	tst	r0,r0
+	mov.l	@(48,r8),r0		! HW_SubmitSlaveFlatJob
+	bf	.Lu_fj
+	mov.l	@(52,r8),r0		! HW_RenderSubsectorBakedFlats
+.Lu_fj:
+	mov.l	@(8,r15),r4
+	mov	r11,r5
+	jsr	@r0
+	mov	r9,r7
+! ---- HW_RenderSubsectorBakedWalls ----
+.Lu_walls:
+	mov	#76,r0
+	mov.l	@(r0,r8),r9		! wall table
+	mov.l	@r9,r0
+	mov.l	@r0,r0			! saturn_baked_walls_active
+	tst	r0,r0
+	bt	.Lu_spr
+	mov.l	@(4,r9),r0
+	mov.l	@r0,r0
+	cmp/hs	r0,r11
+	bt	.Lu_spr
+	bsr	.Lu_frt
+	nop
+	mov.l	r0,@r15			! tw0
+	mov.l	@(8,r9),r1
+	mov.l	@r1,r1
+	mov	r11,r0
+	shll2	r0
+	shll2	r0
+	add	r0,r1			! ss
+	mov.l	@(12,r9),r2		! hw_wctx
+	mov.w	@(4,r1),r0
+	extu.w	r0,r3			! num_segs
+	mov.l	r3,@(4,r15)
+	mov.w	@(8,r1),r0
+	mov	r0,r4
+	mov.w	@(10,r1),r0
+	mov	r0,r5
+	mov	#120,r0
+	mov.w	r4,@(r0,r2)		! portal_first
+	add	#2,r0
+	mov.w	r5,@(r0,r2)		! portal_count
+	mov.l	@r10,r0
+	mov.l	r0,@(32,r2)		! sec_ceiling
+	mov.l	@(4,r10),r0
+	mov.l	r0,@(36,r2)		! sec_floor
+	mov.b	@(12,r10),r0
+	mov.b	r0,@(3,r2)		! is_sky_ceil
+	mov.w	@(14,r10),r0
+	mov.l	@(16,r9),r4
+	mov.l	r0,@r4			! hw_wall_light_delta
+	tst	r3,r3
+	bf	.Lu_w1
+	bsr	.Lu_unb
+	nop
+	bra	.Lu_wacc
+	nop
+.Lu_w1:
+	mov.w	@r1,r0
+	extu.w	r0,r4			! num_pil
+	tst	r4,r4
+	bt	.Lu_spr
+	mov	#96,r0
+	cmp/hi	r0,r4
+	bt	.Lu_spr
+	mov.l	@(36,r9),r5		! &hw_cur_pil_gen
+	mov.b	@r5,r0
+	add	#1,r0
+	extu.b	r0,r0
+	tst	r0,r0
+	bf	.Lu_pg
+	mov.l	@(40,r9),r6		! hw_pil_gen
+	mov	#24,r7
+.Lu_pgc:
+	mov.l	r0,@r6
+	dt	r7
+	bf/s	.Lu_pgc
+	add	#4,r6
+	mov	#1,r0
+.Lu_pg:
+	mov.b	r0,@r5
+	mov.w	@(2,r1),r0
+	extu.w	r0,r6			! pillar_start
+	mov.l	@(44,r9),r4
+	mov.l	@r4,r4
+	mov	r6,r0
+	shll2	r0
+	add	r0,r4			! pillars
+	mov.l	@(48,r9),r0
+	mov.l	r4,@r0			! hw_cur_pillars
+	mov.l	@(56,r9),r0
+	mov.l	@r0,r0			! saturn_baked_wall_pillar_frac
+	tst	r0,r0
+	bt/s	.Lu_pz
+	add	r6,r0
+	bra	.Lu_pf
+	nop
+.Lu_pz:
+	mov.l	@(60,r9),r0		! hw_zero_pfrac
+.Lu_pf:
+	mov.l	@(52,r9),r5
+	mov.l	r0,@r5			! hw_cur_pfrac
+	mov.w	@(6,r1),r0
+	extu.w	r0,r6
+	shll2	r6
+	shll2	r6			! seg_start * 16
+	mov	#64,r0
+	mov.l	@(r0,r9),r5
+	mov.l	@r5,r5
+	add	r6,r5			! seg
+	mov	r3,r6
+	shll2	r6
+	shll2	r6
+	add	r5,r6			! seg_end
+	mov	#108,r0
+	mov.l	r6,@(r0,r2)		! hw_wctx.seg_end
+	mov	#68,r0
+	mov.l	@(r0,r9),r1		! &hw_wctx_tex_frame
+	mov	#72,r0
+	mov.l	@(r0,r9),r7
+	mov.w	@r7,r7			! hw_render_frame
+	mov.w	@r1,r0
+	cmp/eq	r7,r0
+	bt	.Lu_tf
+	mov	r7,r0
+	mov.w	r0,@r1
+	mov	#-1,r0
+	mov.l	r0,@(60,r2)		! cur_tex_id = -1
+.Lu_tf:
+	mov	#-1,r7
+	mov	#76,r0
+	mov.w	r7,@(r0,r2)		! last_clip_x0
+	add	#2,r0
+	mov.w	r7,@(r0,r2)		! last_clip_x1
+	mov	#0,r0
+	mov.b	r0,@(4,r2)		! n_vis
+	mov.w	r0,@(12,r2)		! ytop_min
+	mov	#76,r0
+	mov.l	@(r0,r9),r7
+	mov.w	@r7,r7			! saturn_cmd_m_count
+	mov	#74,r0
+	mov.w	r7,@(r0,r2)		! sub_m_start
+	mov	#80,r0
+	mov.l	@(r0,r9),r7
+	mov.l	@r7,r0
+	mov.w	r0,@(14,r2)		! ybot_max = view_h
+	mov	r4,r7
+	mov	r5,r4
+	mov	r6,r5
+	mov	r7,r6
+	mov	#88,r0
+	mov.l	@(r0,r9),r7		! hw_asm_walk_ctx
+	mov	#84,r0
+	mov.l	@(r0,r9),r0
+	jsr	@r0			! hw_asm_walk(seg, seg_end, pillars, ctx)
+	nop
+	bsr	.Lu_unb
+	nop
+	mov	#92,r0
+	mov.l	@(r0,r9),r1
+	mov.l	@r1,r2
+	mov.l	@(4,r15),r3
+	add	r3,r2
+	mov.l	r2,@r1			! saturn_hw_seg_iter
+	mov.l	@(12,r9),r2
+	mov.b	@(4,r2),r0
+	extu.b	r0,r3
+	mov	#96,r0
+	mov.l	@(r0,r9),r1
+	mov.l	@r1,r0
+	add	r3,r0
+	mov.l	r0,@r1			! saturn_hw_seg_vis
+	mov	#76,r0
+	mov.w	@(r0,r2),r0
+	cmp/eq	#-1,r0
+	bt	.Lu_wacc
+	mov	#0,r4
+	mov	#0,r5
+	mov	#80,r6
+	shll2	r6
+	add	#-1,r6			! 319
+	mov	#80,r0
+	mov.l	@(r0,r9),r7
+	mov.l	@r7,r7
+	add	#-1,r7			! view_h - 1
+	mov	#100,r0
+	mov.l	@(r0,r9),r0
+	jsr	@r0			! HW_EmitUserClip
+	nop
+	mov.l	@(12,r9),r2
+	mov	#-1,r1
+	mov	#76,r0
+	mov.w	r1,@(r0,r2)
+	add	#2,r0
+	mov.w	r1,@(r0,r2)
+.Lu_wacc:
+	bsr	.Lu_acc
+	mov.l	@r15,r4
+! ---- sprites ----
+.Lu_spr:
+	mov.b	@(13,r10),r0		! has_things
+	tst	r0,r0
+	bt	.Lu_rng
+	mov.l	@(44,r8),r4
+	mov.l	@r4,r4
+	mov	#80,r0
+	mov.l	@(r0,r8),r1
+	mulu.w	r1,r12
+	sts	macl,r1
+	add	r1,r4			! sec
+	mov	r4,r9
+	mov	r12,r5
+	mov	r11,r6
+	mov.l	@(56,r8),r0
+	jsr	@r0			! HW_SubsectorHasThings
+	nop
+	tst	r0,r0
+	bt	.Lu_rng
+	mov	r9,r4
+	mov	r11,r5
+	mov.l	@(60,r8),r0
+	jsr	@r0			! HW_RenderSubsectorSprites
+	nop
+.Lu_rng:
+	mov.l	@(32,r8),r1
+	mov.w	@r1,r0
+	sub	r14,r0
+	extu.w	r0,r0
+	mov	r14,r1
+	shll16	r1
+	or	r1,r0
+	mov.l	r0,@r13			! m_start << 16 | m_count
+	mov	#64,r0
+	mov.l	@(r0,r8),r1
+	mov.l	@r1,r1			! sub_solid_active
+	tst	r1,r1
+	bf	.Lu_cm
+	mov	#68,r0
+	mov.l	@(r0,r8),r1
+	mov.b	@(3,r1),r0		! portal_span_count
+	tst	r0,r0
+	bt	.Lu_ret
+.Lu_cm:
+	mov	#72,r0
+	mov.l	@(r0,r8),r0
+	jsr	@r0			! commit
+	nop
+.Lu_ret:
+	add	#16,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+! RecordSubsectorUnbakedPortals(&hw_wctx) if portal_count && solid < 320
+.Lu_unb:
+	mov.l	@(12,r9),r4
+	mov	#122,r0
+	mov.w	@(r0,r4),r0
+	extu.w	r0,r0
+	tst	r0,r0
+	bt	.Lu_ur
+	mov.l	@(20,r9),r0
+	mov.l	@r0,r0
+	mov	#80,r1
+	shll2	r1
+	cmp/ge	r1,r0
+	bt	.Lu_ur
+	sts.l	pr,@-r15
+	mov.l	@(24,r9),r0
+	jsr	@r0
+	nop
+	lds.l	@r15+,pr
+.Lu_ur:
+	rts
+	nop
+
+! hw_prof_segs_acc += HW_ProfDelta(r4 = tw0, SAT_FRT())
+.Lu_acc:
+	sts.l	pr,@-r15
+	bsr	.Lu_frt
+	nop
+	mov	r0,r5
+	cmp/hs	r4,r5
+	bf/s	.Lu_aw
+	mov	r5,r0
+	sub	r4,r0
+.Lu_aa:
+	mov.l	@(28,r9),r1
+	mov.l	@r1,r2
+	add	r0,r2
+	mov.l	r2,@r1
+	lds.l	@r15+,pr
+	rts
+	nop
+.Lu_aw:
+	mov.l	@(32,r9),r0
+	jsr	@r0			! HW_ProfDelta_Wrap(t0, t1)
+	nop
+	bra	.Lu_aa
+	nop
+
+! SAT_FRT (Saturn_HW_ReadFRT): r0 = FRC; clobbers r1-r3
+.Lu_frt:
+	mov	#-2,r1
+	shll8	r1
+	add	#18,r1			! 0xFFFFFE12
+	mov.b	@r1,r0
+	extu.b	r0,r2			! hi0
+	mov.b	@(1,r1),r0
+	extu.b	r0,r3			! lo
+	mov.b	@r1,r0
+	extu.b	r0,r0			! hi1
+	cmp/eq	r0,r2
+	bt	.Lu_f1
+	mov	r0,r2
+	mov.b	@(1,r1),r0
+	extu.b	r0,r3
+.Lu_f1:
+	shll8	r2
+	or	r3,r2
+	rts
+	mov	r2,r0
+
+	.align	2
+.Lu_ctx:	.long	_hw_asm_sub_ctx
