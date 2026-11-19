@@ -580,6 +580,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_IsStripOccluded_Slow(int s_px0, int s_px1, i
     return 0;
 }
 
+#ifndef HW_ASM_LINGEN
+#define HW_ASM_LINGEN (HW_ASM && !HW_VIS_STATS)
+#endif
+/* Stage F1: hw_asm_lingen does this inline; C kept for the C emitter. */
+#if !HW_ASM_LINGEN || HW_ASM_CHECK
 static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     int s, int s_px0, uint32_t cmd_w2_cur)
 {
@@ -644,6 +649,7 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     hw_wall_coord_tmp[1] = (int)(cmd_w2_cur + ((uint32_t)strip_srca_step << 16) * (uint32_t)adv);
     return coal_strips;
 }
+#endif
 
 /* Wrap a strip's packed (SRCA << 16 | size) word back into the texture
  * (2026-11-16 hang fix). The old test `cur >= base + wrap` overflows 32 bits
@@ -663,9 +669,6 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
 /* Compact rewrite stage B2: HW_EmitWallStrips_Linear_General in assembly
  * (saturn_hw_asm.s hw_asm_lingen, same arithmetic; the rare per-strip cases
  * call the C helpers through this table). */
-#ifndef HW_ASM_LINGEN
-#define HW_ASM_LINGEN (HW_ASM && !HW_VIS_STATS)
-#endif
 #if HW_ASM_LINGEN
 extern void hw_asm_lingen(hw_wall_emit_ctx_t *ctx, int s_min, int s_max);
 _Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 &&
@@ -678,7 +681,7 @@ _Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall
 const void *const hw_asm_lingen_ctx[12] = {
     &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
     &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
-    (const void *)HW_TryCoalesceLinearStrip, (const void *)HW_IsStripOccluded_Slow,
+    NULL /* coalesce: inline in asm since stage F1 */, (const void *)HW_IsStripOccluded_Slow,
     (const void *)HW_EmitStripQuad_Slow, (const void *)HW_ModNonPow2
 };
 #endif

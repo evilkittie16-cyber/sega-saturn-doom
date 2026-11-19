@@ -3158,32 +3158,205 @@ _hw_asm_lingen:
 	bra	.Ll_next
 	mov.l	r0,@r5
 
-! ---- coalesce (C helper decides, like the C loop) ----
+! ---- coalesce: HW_TryCoalesceLinearStrip inline (stage F1) ----
+! 8-byte temp below the frame (frame offsets +8 here): @0 size_hi,
+! @4 cur_strip_idx >> 2. regs: r1 emit_srca, r2 srca, r3 srca_64,
+! r5 srca_mono, r6 u_end then adv, r7 coal
 .Ll_coal:
-	mov.l	.Ll_ctx2,r1
-	mov.l	@(28,r1),r2
-	mov.l	@(0,r15),r0
-	mov.l	r0,@r2
-	mov.l	@(12,r15),r0
-	mov.l	r0,@(4,r2)
-	mov.l	@(28,r15),r0
-	mov.l	r0,@(8,r2)
-	mov.l	@(32,r1),r0
+	add	#-8,r15
+	mov	#92,r0
+	mov.l	@(r0,r8),r7		! u_start
+	mov	r7,r0
+	tst	#15,r0
+	bt	.Lc2_a
+	mov	r7,r1
+	shar	r1
+	shar	r1
+	shar	r1
+	shar	r1
+	cmp/eq	r9,r1			! partial first strip: no coalesce
+	bt	.Lc2_no
+.Lc2_a:
+	mov	r9,r0
+	shll2	r0
+	shll2	r0
+	cmp/ge	r7,r0			! (s << 4) >= u_start
+	bf	.Lc2_no
+	mov	#68,r0
+	mov.w	@(r0,r8),r1		! tw
+	mov	#1,r5			! num_strips
+	cmp/pl	r1
+	bf	.Lc2_ns
+	mov	r1,r5
+	add	#15,r5
+	shar	r5
+	shar	r5
+	shar	r5
+	shar	r5
+.Lc2_ns:
+	mov	r5,r6
+	add	#-1,r6			! strip_mask
+	tst	r6,r5
+	bf/s	.Lc2_mod
 	mov	r9,r4
-	mov	r11,r5
-	jsr	@r0
-	mov	r10,r6
-	cmp/pl	r0
-	bf	.Ll_c_no
-	mov.l	r0,@(40,r15)		! coal
-	mov	r0,r3
-	add	#-1,r3			! adv
+	bra	.Lc2_i
+	and	r6,r4			! cur_strip_idx = s & mask
+.Lc2_mod:
+	mov.l	.Ll_ctx2,r0
+	mov.l	@(44,r0),r0
+	jsr	@r0			! HW_ModNonPow2(s, num_strips)
+	nop
+	mov	r0,r4
+.Lc2_i:
+	mov	#92,r0
+	mov.l	@(r0,r8),r7
+	add	#4,r0
+	mov.l	@(r0,r8),r6
+	add	r7,r6			! u_end
+	mov	#68,r0
+	mov.w	@(r0,r8),r1		! tw
+	mov.w	@(24,r8),r0
+	mov	r0,r2			! srca
+	mov	#72,r0
+	mov.w	@(r0,r8),r3		! srca_64
+	mov	#70,r0
+	mov.w	@(r0,r8),r5		! srca_mono
+	mov	#64,r0
+	cmp/ge	r0,r1
+	bf	.Lc2_c2
+	cmp/eq	r2,r3
+	bf	.Lc2_4a
+	cmp/eq	r2,r5
+	bt	.Lc2_c2
+.Lc2_4a:
+	mov	r4,r0
+	tst	#3,r0
+	bf	.Lc2_c2
+	mov	r9,r0
+	add	#4,r0
+	shll2	r0
+	shll2	r0
+	cmp/gt	r6,r0
+	bt	.Lc2_c2
+	mov	#4,r7			! coal = 4
+	shar	r4
+	shar	r4
+	mov.l	r4,@(4,r15)		! idx >> 2
+	mov.w	@(30,r8),r0		! cur_v
+	shll2	r0
+	shll	r0
+	mov	r3,r1
+	add	r0,r1
+	mov.w	@(26,r8),r0		! th
+	shll2	r0
+	shll	r0
+	mul.l	r4,r0
+	sts	macl,r0
+	add	r0,r1			! srca_64 + (cur_v<<3) + (idx>>2)*(th<<3)
+	mov	#8,r0
+	shll8	r0
+	bra	.Lc2_have
+	mov.l	r0,@r15			! size_hi = 8 << 8
+.Lc2_c2:
+	mov	#32,r0
+	cmp/eq	r0,r1
+	bf	.Lc2_no
+	cmp/eq	r2,r5
+	bt	.Lc2_no
+	tst	r4,r4
+	bf	.Lc2_no
+	mov	r9,r0
+	add	#2,r0
+	shll2	r0
+	shll2	r0
+	cmp/gt	r6,r0
+	bt	.Lc2_no
+	mov	#2,r7			! coal = 2
+	mov.w	@(30,r8),r0
+	shll2	r0
+	mov	r5,r1
+	add	r0,r1			! srca_mono + (cur_v << 2)
+	mov	#4,r0
+	shll8	r0
+	mov.l	r0,@r15			! size_hi = 4 << 8
+.Lc2_have:
+	mov	r9,r0
+	add	r7,r0
+	shll2	r0
+	shll2	r0			! c_uhi
+	cmp/ge	r6,r0
+	mov	r7,r6
+	bf/s	.Lc2_np
+	add	#-1,r6			! adv
+	mov.l	@(44,r8),r0
+	bra	.Lc2_px
+	mov.l	@(12,r0),r0		! p1->px
+.Lc2_np:
+	mov.l	@(20,r15),r0		! step_px_fp
+	mul.l	r6,r0
+	mov.l	@(8,r15),r4		! cur_px_fp
+	sts	macl,r0
+	add	r4,r0
+	shlr16	r0
+	exts.w	r0,r0			! >> 16
+.Lc2_px:
+	sub	r11,r0			! next_px1 - s_px0
+	mov	#4,r4
+	cmp/eq	r4,r7
+	bf	.Lc2_m1k
+	cmp/eq	r2,r3
+	bf	.Lc2_m1k
+	bra	.Lc2_mc
+	mov	#52,r4
+.Lc2_m1k:
+	mov	#125,r4
+	shll2	r4
+	shll	r4			! 1000
+.Lc2_mc:
+	cmp/gt	r4,r0
+	bt	.Lc2_no
+	mov	#4,r4
+	cmp/eq	r4,r7
+	bf	.Lc2_out
+	cmp/eq	r2,r5
+	bt	.Lc2_out
+	cmp/eq	r2,r3
+	bt	.Lc2_dg
+	mov	#20,r4
+	cmp/gt	r4,r0
+	bt	.Lc2_out
+.Lc2_dg:
+	mov.w	@(30,r8),r0
+	shll2	r0
+	mov	r5,r1
+	add	r0,r1
+	mov.w	@(26,r8),r0
+	shll2	r0
+	mov.l	@(4,r15),r4
+	mul.l	r4,r0
+	sts	macl,r0
+	add	r0,r1			! srca_mono + (cur_v<<2) + (idx>>2)*(th<<2)
+	mov	#4,r0
+	shll8	r0
+	mov.l	r0,@r15
+.Lc2_out:
+	shll16	r1
+	mov.l	@r15,r0
+	or	r0,r1
+	mov.l	@(36,r15),r0		! cmd_w2_base
+	extu.b	r0,r0
+	or	r0,r1			! emit_cmd2
+	mov.w	@(26,r8),r0
+	shll	r0
+	shll16	r0
+	mul.l	r6,r0
+	sts	macl,r0
+	add	r0,r10			! cmd_w2_cur += (th << 17) * adv
+	add	#8,r15
+	mov.l	r7,@(40,r15)		! coal
+	mov.l	r1,@(44,r15)		! emit_cmd2
+	mov	r6,r3			! adv
 	add	r3,r9
-	mov.l	.Ll_ctx2,r1
-	mov.l	@(28,r1),r2
-	mov.l	@r2,r0
-	mov.l	r0,@(44,r15)		! emit_cmd2
-	mov.l	@(4,r2),r10		! cmd_w2_cur
 	mov.l	@(12,r15),r0
 	mul.l	r3,r0
 	mov.l	@(0,r15),r1
@@ -3205,6 +3378,9 @@ _hw_asm_lingen:
 .Ll_c_no:
 	bra	.Ll_nocoal
 	nop
+.Lc2_no:
+	bra	.Ll_nocoal
+	add	#8,r15
 
 ! ---- slow strip: visibility / occlusion / clipped or clamped quad ----
 .Ll_slow:
