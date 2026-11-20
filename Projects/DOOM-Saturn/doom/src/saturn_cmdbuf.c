@@ -24,6 +24,7 @@ sub_range_t *saturn_sub_ranges = NULL;
 volatile uint16_t saturn_cmd_m_count = 0;
 volatile uint16_t saturn_cmd_s_count = 0;
 volatile uint16_t saturn_cmd_w_count = 0;
+volatile uint16_t saturn_cmd_sw_count = 0;
 int saturn_visit_count = 0;
 uint8_t saturn_cmd_m_needs_ytrim = 0;
 
@@ -68,7 +69,7 @@ void Saturn_CmdBuf_Init(void)
         return;
 
     /* Allocate 32-byte aligned in fast 32-bit WRAM-H SDRAM via Jo heap */
-    saturn_cmd_m = (vdp1_cmd_t *)cmdbuf_alloc_aligned32(CMDBUF_M_CAP * (int)sizeof(vdp1_cmd_t));
+    saturn_cmd_m = (vdp1_cmd_t *)cmdbuf_alloc_aligned32((CMDBUF_M_CAP + CMDBUF_SW_CAP) * (int)sizeof(vdp1_cmd_t));
     if (!saturn_cmd_m)
         I_Error("Saturn_CmdBuf_Init: Failed to allocate cmd_m in WRAM-H\n");
 
@@ -90,6 +91,7 @@ void Saturn_CmdBuf_Reset(void)
     saturn_cmd_m_count = 0;
     saturn_cmd_s_count = 0;
     saturn_cmd_w_count = 0;
+    saturn_cmd_sw_count = 0;
     saturn_visit_count = 0;
     saturn_cmd_m_needs_ytrim = 0;
 }
@@ -200,6 +202,11 @@ CMDBUF_INLINE uint32_t *copy_quads_32(uint32_t *dst, const uint32_t *src, int co
     }
     return dst;
 #else
+    /* Word 7 (CMDGRDA + dummy) is NOT copied: VDP1 reads the gouraud table
+     * address only when PMOD selects gouraud, and no command this renderer
+     * emits does (walls, flats, sprites, punch polygons: CC != 4). The copy
+     * is bound by the B-bus write rate to VDP1 VRAM, so 7 of 8 words is
+     * 12.5% less delivery time. */
     if (count > 0)
     {
         __asm__ volatile (
@@ -207,16 +214,16 @@ CMDBUF_INLINE uint32_t *copy_quads_32(uint32_t *dst, const uint32_t *src, int co
             "mov.l  @%0+, r0      \n\t"  "mov.l  @%0+, r1      \n\t"
             "mov.l  @%0+, r2      \n\t"  "mov.l  @%0+, r3      \n\t"
             "mov.l  @%0+, r4      \n\t"  "mov.l  @%0+, r5      \n\t"
-            "mov.l  @%0+, r6      \n\t"  "mov.l  @%0+, r7      \n\t"
+            "mov.l  @%0+, r6      \n\t"  "add    #4, %0        \n\t"
             "mov.l  r0, @%1       \n\t"  "mov.l  r1, @(4, %1)  \n\t"
             "mov.l  r2, @(8, %1)  \n\t"  "mov.l  r3, @(12, %1) \n\t"
             "mov.l  r4, @(16, %1) \n\t"  "mov.l  r5, @(20, %1) \n\t"
-            "mov.l  r6, @(24, %1) \n\t"  "mov.l  r7, @(28, %1) \n\t"
+            "mov.l  r6, @(24, %1) \n\t"
             "dt     %2            \n\t"
             "bf/s   1b            \n\t"
             "add    #32, %1       \n\t"
             : "+r" (src), "+r" (dst), "+r" (count)
-            :: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "t", "memory"
+            :: "r0", "r1", "r2", "r3", "r4", "r5", "r6", "t", "memory"
         );
     }
     return dst;
@@ -418,6 +425,13 @@ unsigned int Saturn_CmdBuf_ComputeDDA(void)
         for (; c32 != m_end; c32 += 8)
             dda_total += cmdbuf_quad_dda(c32);
     }
+    if (saturn_cmd_sw_count > 0)
+    {
+        const uint32_t *c32 = (const uint32_t *)&saturn_cmd_m[CMDBUF_M_CAP];
+        const uint32_t *m_end = c32 + ((uint32_t)saturn_cmd_sw_count << 3);
+        for (; c32 != m_end; c32 += 8)
+            dda_total += cmdbuf_quad_dda(c32);
+    }
     if (saturn_visit_count > 0)
     {
         const sub_range_t *ranges = saturn_sub_ranges;
@@ -490,7 +504,8 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     const uint32_t * const vram_limit = (const uint32_t *)(SATURN_VDP1_VRAM + saturn_v1_write_limit);
     /* unchecked fast path only when every quad surely fits before the limit */
     const uint32_t fit_slots = (uint32_t)(vram_limit - (const uint32_t *)vram32) >> 3;
-    if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
+    if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_sw_count +
+                         (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
     {
         for (int i = saturn_visit_count - 1; i >= 0; i--)
         {
@@ -526,14 +541,7 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     }
 
     /* 4. Terminate VDP1 command list with END packet */
-    vram32[0] = 0x80000000u; /* CTRL: END (0x8000), LINK (0x0000) */
-    vram32[1] = 0;
-    vram32[2] = 0;
-    vram32[3] = 0;
-    vram32[4] = 0;
-    vram32[5] = 0;
-    vram32[6] = 0;
-    vram32[7] = 0;
+    vram32[0] = 0x80000000u; /* CTRL: END (0x8000), LINK (0x0000); VDP1 reads nothing else of it */
     vram32 += 8;
 
     saturn_vdp1_bus_cmd_bytes = (uint32_t)((uintptr_t)vram32 - (uintptr_t)vram_start);

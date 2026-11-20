@@ -54,6 +54,7 @@ int   Saturn_TexInfoNoLoad(int texnum, stexinfo_t *out);
 /* Raw 64x64 8bpp pixels for flat `flatnum` (raw index, NOT through
  * flattranslation). Stable zone copy, cached. NULL if unavailable. */
 byte *Saturn_FlatData(int flatnum);
+byte *Saturn_FlatDataExact(int f);   /* no animation translation */
 /* Slave-safe twin of Saturn_FlatData: cached flats only. */
 byte *Saturn_FlatDataNoLoad(int flatnum);
 int   Saturn_FlatActive(void);

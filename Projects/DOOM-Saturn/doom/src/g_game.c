@@ -415,8 +415,21 @@ void Saturn_WarpToLevel(int episode, int map)
 #endif
 }
 
+#if SATURN_BENCH
+/* Bench-only world freeze (strip-LOD tuning harness, 2026-11-19): poked to 1
+ * by sdbg after the hold view settles, so every captured setting renders the
+ * same world state (monsters, lights, animated textures) and frames differ
+ * only by the setting under test. */
+int saturn_freeze_world = 0;
+#endif
+
 void Saturn_P_Ticker(void)
 {
+#if SATURN_BENCH
+    /* read cache-through: sdbg's poke does not reach the SH-2 cache */
+    if (*(const volatile int *)((uintptr_t)&saturn_freeze_world | 0x20000000u))
+        return;
+#endif
     P_Ticker();
 }
 

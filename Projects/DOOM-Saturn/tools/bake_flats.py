@@ -187,7 +187,11 @@ def quant16(v):
 #                  per 128 units), rows in tile texels
 # Encoding: bits 15-14 mode, bits 13-8 start row, bits 6-0 row count (1..64).
 QUV_NORMAL, QUV_TRANSPOSED, QUV_TILE = 1, 2, 3
+QUV_WARP = 0x80             # bit 7: piece needs its own warped texture
+WARP_MIN_ERR = float(os.environ.get("WARP_MIN_ERR", "3"))   # texels
 SUBFLAG_TRANSPOSED = 1      # subsector's LOD0 list uses the transposed texture
+SUBFLAG_WARP = 2            # subsector's LOD0 list has QUV_WARP quads
+SUBFLAG_WARP_LOD1 = 4       # subsector's LOD1 list has QUV_WARP quads
 
 def _match_corners(q, targets):
     """Reorder quad q (4 points, may repeat one) to best fit target corners,
@@ -216,7 +220,11 @@ def quad_uv(q, gx, gy, cell):
         # LOD1: tile texture, 2 world units per texel, normal orientation
         start, count = _row_range((128 - yt) / 2.0, (128 - yb) / 2.0, 64)
         targets = [(gx + xa, gy + yb), (gx + xb, gy + yb), (gx + xb, gy + yt), (gx + xa, gy + yt)]
-        return _match_corners(q, targets), (QUV_TILE << 14) | (start << 8) | count
+        rq = _match_corners(q, targets)
+        want = [(gx, gy + yb), (gx + 128, gy + yb), (gx + 128, gy + yt), (gx, gy + yt)]
+        # LOD1 tile texels are 2 units: error in texels = units / 2
+        err = max(max(abs(rq[i][0] - want[i][0]), abs(rq[i][1] - want[i][1])) for i in range(4)) / 2.0
+        return rq, (QUV_TILE << 14) | (start << 8) | (QUV_WARP if err > WARP_MIN_ERR else 0) | count
     if (64 - (xb - xa)) <= (64 - (yt - yb)):
         start, count = _row_range(64 - yt, 64 - yb, 64)
         targets = [(gx + xa, gy + yb), (gx + xb, gy + yb), (gx + xb, gy + yt), (gx + xa, gy + yt)]
@@ -225,7 +233,24 @@ def quad_uv(q, gx, gy, cell):
         start, count = _row_range(xa, xb, 64)
         targets = [(gx + xb, gy + yt), (gx + xb, gy + yb), (gx + xa, gy + yb), (gx + xa, gy + yt)]
         mode = QUV_TRANSPOSED
-    return _match_corners(q, targets), (mode << 14) | (start << 8) | count
+    # QUV_WARP (also set for LOD1 above): the row mapping is only exact for an axis-aligned
+    # rectangle spanning the full cell along the mode's column axis. Any
+    # other piece (cut by a diagonal, or trimmed on both axes) squashes the
+    # whole texture width into it; the runtime gives it its own warped
+    # texture (Saturn_Vdp1_GetWarpSrca) and keeps the rows as a fallback.
+    rq = _match_corners(q, targets)
+    # Texel error of the row mapping: the texture's full column range lands
+    # on p0-p1 / p3-p2, so a corner's error is its distance from where that
+    # texel belongs (cell edge along the column axis, row-range edge along
+    # the rows). Only pieces whose worst corner is off by more than
+    # WARP_MIN_ERR texels get a warped texture.
+    if mode == QUV_NORMAL:
+        want = [(gx, gy + yb), (gx + 64, gy + yb), (gx + 64, gy + yt), (gx, gy + yt)]
+    else:
+        want = [(gx + xb, gy + 64), (gx + xb, gy), (gx + xa, gy), (gx + xa, gy + 64)]
+    err = max(max(abs(rq[i][0] - want[i][0]), abs(rq[i][1] - want[i][1])) for i in range(4))
+    warp = QUV_WARP if err > WARP_MIN_ERR else 0
+    return rq, (mode << 14) | (start << 8) | warp | count
 
 def clip_plane(poly, nx, ny, c):
     """Keep the part of convex poly with nx*x + ny*y <= c (exact)."""
@@ -350,6 +375,53 @@ def mesh_subsector_poly(poly, skirt_segs, grid_size, track_skirt=False):
                 sub_quad_indices.append(q_idx)
 
     return sub_verts, sub_quad_indices
+
+# Spatial chunks (CHK1 block): a subsector with many LOD0 quads is split into
+# square chunks; each chunk's quads and vertices are contiguous ranges of the
+# subsector's arrays (boundary vertices duplicated, bit-identical), so the
+# slave can frustum-test a chunk's bbox and skip projecting / looping it.
+# A chunked subsector's quad indices are CHUNK-LOCAL (relative to
+# v_first + chunk v_off); loaders that don't know CHK1 must get an unchunked
+# file (write_flt_file(..., chunked=False)).
+FLAT_CHUNK_MIN   = int(os.environ.get("FLAT_CHUNK_MIN", "24"))    # 0 disables
+FLAT_CHUNK_SIZE  = int(os.environ.get("FLAT_CHUNK", "256"))       # map units
+FLAT_CHUNK_VMAX  = 960     # slave fast projection buffer (hw_wram_h_proj_verts_slave)
+FLAT_CHUNK_LIMIT = 16383   # 14-bit chunk index in the job word
+
+def chunk_subsector(sub_verts, sub_q_indices, sub_quv):
+    """Return (verts, quads, quv, chunks) or None. chunks: [(q_off, q_cnt, v_off, v_cnt, bbox)]."""
+    if FLAT_CHUNK_MIN <= 0 or len(sub_q_indices) < FLAT_CHUNK_MIN:
+        return None
+    cs16 = FLAT_CHUNK_SIZE * FRAC_ONE
+    groups = {}
+    for qi, q in enumerate(sub_q_indices):
+        cx = sum(sub_verts[k][0] for k in q) / 4.0
+        cy = sum(sub_verts[k][1] for k in q) / 4.0
+        groups.setdefault((int(cx // cs16), int(cy // cs16)), []).append(qi)
+    if len(groups) < 2:
+        return None
+    verts, quads, quv, chunks = [], [], [], []
+    for key in sorted(groups):
+        v_off, q_off = len(verts), len(quads)
+        vmap = {}
+        for qi in groups[key]:
+            idx = []
+            for k in sub_q_indices[qi]:
+                if k not in vmap:
+                    vmap[k] = len(verts)
+                    verts.append(sub_verts[k])
+                idx.append(vmap[k] - v_off)      # chunk-local index
+            quads.append(idx)
+            quv.append(sub_quv[qi])
+        cv = verts[v_off:]
+        bbox = (min(v[0] for v in cv) >> FRAC_BITS, -((-max(v[0] for v in cv)) >> FRAC_BITS),
+                min(v[1] for v in cv) >> FRAC_BITS, -((-max(v[1] for v in cv)) >> FRAC_BITS))
+        if len(verts) - v_off > FLAT_CHUNK_VMAX:
+            return None
+        chunks.append((q_off, len(quads) - q_off, v_off, len(verts) - v_off, bbox))
+    if len(verts) > 1536:      # HW_MAX_FLAT_VERTS: the unchunked fallback must still fit
+        return None
+    return verts, quads, quv, chunks
 
 def bake_map_adaptive(wad_data, directory, map_name):
     try:
@@ -555,6 +627,9 @@ def bake_map_adaptive(wad_data, directory, map_name):
             return res
 
     # Pass 2: Generate watertight, sector-bounded flat quads
+    sub_chunk  = [0] * nsssec
+    chunk_recs = [(0, 0, 0, 0, (0, 0, 0, 0))]   # record 0: "no chunks"
+    chunk_last = [1]
     for ss in range(nsssec):
         poly = sub_polys[ss]
         if not poly:
@@ -663,6 +738,13 @@ def bake_map_adaptive(wad_data, directory, map_name):
             lod1_sub_v_count.append(0)
             continue
 
+        ch = chunk_subsector(sub_verts, sub_q_indices, sub_quv)
+        if ch and len(chunk_recs) + len(ch[3]) <= FLAT_CHUNK_LIMIT:
+            sub_verts, sub_q_indices, sub_quv, recs = ch
+            sub_chunk[ss] = len(chunk_recs)
+            chunk_recs.extend(recs)
+            chunk_last.extend([0] * (len(recs) - 1) + [1])
+
         sub_q_first.append(len(all_quads))
         sub_q_count.append(len(sub_q_indices))
         sub_v_first.append(len(all_verts))
@@ -743,7 +825,11 @@ def bake_map_adaptive(wad_data, directory, map_name):
     for ss in range(nsssec):
         qf, qc = sub_q_first[ss], sub_q_count[ss]
         has_t = any((all_quv[i] >> 14) == QUV_TRANSPOSED for i in range(qf, qf + qc))
-        subflags.append(SUBFLAG_TRANSPOSED if has_t else 0)
+        has_w = any(all_quv[i] & QUV_WARP for i in range(qf, qf + qc))
+        lf, lc = lod1_sub_q_first[ss], lod1_sub_q_count[ss]
+        has_w1 = any(all_quv[i] & QUV_WARP for i in range(lf, lf + lc))
+        subflags.append((SUBFLAG_TRANSPOSED if has_t else 0) | (SUBFLAG_WARP if has_w else 0) |
+                        (SUBFLAG_WARP_LOD1 if has_w1 else 0))
 
     return {
         "quv": all_quv,
@@ -760,10 +846,33 @@ def bake_map_adaptive(wad_data, directory, map_name):
         "lod1_sub_v_count": lod1_sub_v_count,
         "sub_bbox": sub_bbox,
         "verts": all_verts,
-        "quads": all_quads
+        "quads": all_quads,
+        "sub_chunk": sub_chunk,
+        "chunks": chunk_recs,
+        "chunk_last": chunk_last,
     }
 
-def write_flt_file(bm, out_path):
+def unchunk_quads(bm):
+    """Quad list with chunk-local indices turned back into subsector-relative ones."""
+    quads = [list(q) for q in bm['quads']]
+    chunks = bm.get('chunks') or []
+    for ss, c0 in enumerate(bm.get('sub_chunk', [])):
+        if not c0:
+            continue
+        qf = bm['sub_q_first'][ss]
+        c = c0
+        while True:
+            q_off, q_cnt, v_off, v_cnt, _bb = chunks[c]
+            for qi in range(qf + q_off, qf + q_off + q_cnt):
+                quads[qi] = [k + v_off for k in quads[qi]]
+            if bm['chunk_last'][c]:
+                break
+            c += 1
+    return quads
+
+def write_flt_file(bm, out_path, chunked=True):
+    if not chunked and len(bm.get('chunks') or []) > 1:
+        bm = dict(bm, quads=unchunk_quads(bm), chunks=[], sub_chunk=[0] * bm['nsssec'])
     nsssec = bm['nsssec']
     numquads = len(bm['quads'])
     numverts = len(bm['verts'])
@@ -861,6 +970,20 @@ def write_flt_file(bm, out_path):
     quv_block += bytes(bm['subflags'])
     quv_block += b'\x00' * ((4 - (len(quv_block) % 4)) % 4)
 
+    # CHK1 extension block (spatial chunks, see chunk_subsector), right after
+    # QUV1. Layout: "CHK1", u32 numchunks, u32 numsubsectors,
+    # u16 sub_chunk[numsubsectors] (0 = none), pad4, then per chunk 16 bytes:
+    # i16 min_x, max_x, min_y, max_y; u16 q_off, q_cnt, v_off,
+    # v_cnt | 0x8000 on a subsector's last chunk. Offsets are subsector-relative.
+    chunks = bm.get('chunks') or []
+    if len(chunks) > 1:
+        quv_block += b"CHK1" + struct.pack(">II", len(chunks), nsssec)
+        quv_block += struct.pack(f">{nsssec}H", *bm['sub_chunk'])
+        quv_block += b'\x00' * ((4 - (len(quv_block) % 4)) % 4)
+        for (q_off, q_cnt, v_off, v_cnt, bb), last in zip(chunks, bm['chunk_last']):
+            quv_block += struct.pack(">4h4H", bb[0], bb[1], bb[2], bb[3],
+                                     q_off, q_cnt, v_off, v_cnt | (0x8000 if last else 0))
+
     data = (header + q_first_bytes + q_count_bytes + v_first_bytes + v_count_bytes +
             bbox_bytes + lod1_q_first_bytes + lod1_q_count_bytes +
             lod1_v_first_bytes + lod1_v_count_bytes +
@@ -869,7 +992,8 @@ def write_flt_file(bm, out_path):
         f.write(data)
     lod1_active_subs = sum(1 for c in bm['lod1_sub_q_count'] if c > 0)
     print(f"Wrote {out_path}: {len(data)} bytes ({nsssec} subsectors, {numquads} quads, {numverts} unique verts, "
-          f"{lod1_active_subs} subs with LOD1, {skirt_stats[0]}/{skirt_stats[1]} cells skirted)")
+          f"{lod1_active_subs} subs with LOD1, {skirt_stats[0]}/{skirt_stats[1]} cells skirted, "
+          f"{len(chunks) - 1 if chunks else 0} chunks in {sum(1 for c in bm.get('sub_chunk', []) if c)} subs)")
 
 def main():
     wad_data, directory = load_wad(WAD_PATH)
@@ -879,12 +1003,15 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     saturn_dir = os.path.abspath(os.path.join(script_dir, ".."))
-    cd_dir = os.path.join(saturn_dir, "cd")
-    stage_dir = os.path.join(saturn_dir, "staging_assets")
+    cd_dir = os.environ.get("BAKE_OUT") or os.path.join(saturn_dir, "cd")
+    stage_dir = os.environ.get("BAKE_OUT") or os.path.join(saturn_dir, "staging_assets")
 
     os.makedirs(cd_dir, exist_ok=True)
     os.makedirs(stage_dir, exist_ok=True)
-    win_cd_dir = os.path.abspath(os.path.join(saturn_dir, "..", "DOOM-Windows", "cd"))
+    win_name = "DOOM-Windows-rw" if saturn_dir.endswith("-rw") else "DOOM-Windows"
+    win_cd_dir = os.path.abspath(os.path.join(saturn_dir, "..", win_name, "cd"))
+    if os.environ.get("BAKE_OUT"):
+        win_cd_dir = os.environ["BAKE_OUT"]
     if os.path.exists(win_cd_dir):
         os.makedirs(win_cd_dir, exist_ok=True)
 
@@ -898,7 +1025,7 @@ def main():
             write_flt_file(bm, out_stage)
             if os.path.exists(os.path.join(win_cd_dir, os.path.basename(WAD_PATH))):
                 out_win = os.path.join(win_cd_dir, f"{m}.FLT")
-                write_flt_file(bm, out_win)
+                write_flt_file(bm, out_win, chunked=False)   # the Windows loader has no CHK1 support
 
 if __name__ == "__main__":
     main()

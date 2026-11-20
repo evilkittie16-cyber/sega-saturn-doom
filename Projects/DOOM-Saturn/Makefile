@@ -59,6 +59,7 @@ SRCS = main.c \
        doom/src/saturn_vdp1.c \
        doom/src/saturn_cmdbuf.c \
        doom/src/saturn_hw_render.c \
+       doom/src/saturn_hw_slave_walls.c \
        doom/src/saturn_vdp2_plane.c \
        doom/src/saturn_baked_flats.c \
        doom/src/saturn_baked_segs.c \
@@ -144,8 +145,8 @@ CCFLAGS += -ffunction-sections
 LDFILE := ./doom_hot.linker
 endif
 
-OBJS += doom/src/saturn_draw.o
-game.elf: doom/src/saturn_draw.o
+OBJS += doom/src/saturn_draw.o doom/src/saturn_hw_asm.o
+game.elf: doom/src/saturn_draw.o doom/src/saturn_hw_asm.o
 
 CCFLAGS_OPT = $(filter-out -Os,$(CCFLAGS)) -O2
 
@@ -172,6 +173,13 @@ HW_RENDER_FLAGS = $(CCFLAGS_OPT)
 endif
 doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c $(SATURN_HW_DEPS)
 	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+
+# Slave copy of the wall emitters (HW_SLAVE_WALLS; empty object otherwise).
+# Every global is weakened so the duplicated header globals bind to the
+# master object's definitions (saturn_hw_slave_walls.c).
+doom/src/saturn_hw_slave_walls.o: doom/src/saturn_hw_slave_walls.c $(SATURN_HW_DEPS)
+	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+	sh-elf-objcopy --weaken $@
 
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
@@ -200,6 +208,8 @@ doom/src/i_wad.o: doom/src/i_wad.c
 doom/src/d32xr_stubs.o: doom/src/d32xr_stubs.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) $(DIVLUT_DEFS) -ffixed-r2 -ffixed-r3 -ffixed-r6 -ffixed-r7 -o $@
 doom/src/saturn_draw.o: doom/src/saturn_draw.s
+	$(CC) $< $(DFLAGS) -c -o $@
+doom/src/saturn_hw_asm.o: doom/src/saturn_hw_asm.s
 	$(CC) $< $(DFLAGS) -c -o $@
 
 # Replace the jo_engine_makefile's broken `$(TARGET2):` rule.

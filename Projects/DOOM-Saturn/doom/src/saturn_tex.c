@@ -120,10 +120,23 @@ int saturn_tex_dirty = 1;
 #define SATURN_HRAM_BASE   (SATURN_WRAM_L_BASE + 0x00080000u)
 #define SATURN_HRAM_SIZE   0x00080000u
 #define SATURN_RTBL_SIZE   0x10000u
-#define SATURN_HWRAM_WANT  49152u
+/* High WRAM texture/flat/sprite source tier (hw_base, tried before the
+ * 16-bit Low WRAM tier and the very slow RAM cart). 2026-11-18: Jo 2026.1
+ * gives jo_malloc the High WRAM between its work area and the stack
+ * (zone 2, 0x060D5F00..0x060FBC00, ~138 KB free in game), so a large tier
+ * fits there; see SATURN_T0_OFF. */
+#ifndef SATURN_HWRAM_WANT
+#define SATURN_HWRAM_WANT  114688u   /* 112 KB (2026-11-18; was 48 KB with the tier off) */
+#endif
 
+/* T0 = the High WRAM tier. ON since 2026-11-18 (5thPlanet, 12 static views
+ * pixel-identical and 0.1-0.5 ms faster; turning with SATURN_FLAT_FASTCOPY:
+ * courtyard 33.7 -> 26.8 ms/frame, E1M7 26.1 -> 22.7, E1M2 start 39.2 -> 36.5). */
 #ifndef SATURN_T0_OFF
-#define SATURN_T0_OFF 1
+#define SATURN_T0_OFF 0
+#endif
+#ifndef SATURN_FLAT_FASTCOPY
+#define SATURN_FLAT_FASTCOPY 1
 #endif
 #ifndef SATURN_T1_OFF
 #define SATURN_T1_OFF 0
@@ -199,8 +212,18 @@ static void *hram_alloc(int size)
 
     if (hram_ok)
     {
+        /* Fence off everything fixed in the tier window: the shadow
+         * framebuffer, the deferred-wall queue and the v1_evict list
+         * (contiguous 0x2D0000..0x2EFFFF). 2026-11-18 bug: only the shadow FB
+         * was skipped, so texture/patch data landed in 0x2E4000+ (E1M1 tier
+         * top 0x2EE300) and was overwritten by deferred-wall records (garbage
+         * rows in the E1M1 courtyard window walls) - and, in default builds,
+         * could be by the evict candidate list. Overflow goes to Z_Malloc. */
         const unsigned int fb_lo = SATURN_WRAM_L_BASE + SATURN_WRAM_L_SHADOW_FB_OFF - SATURN_HRAM_BASE;
-        const unsigned int fb_hi = fb_lo + SATURN_WRAM_L_SHADOW_FB_SIZE;
+        const unsigned int fb_hi = SATURN_WRAM_L_BASE + SATURN_WRAM_L_EVICT_OFF + SATURN_WRAM_L_EVICT_SIZE - SATURN_HRAM_BASE;
+        _Static_assert(SATURN_WRAM_L_SHADOW_FB_OFF + SATURN_WRAM_L_SHADOW_FB_SIZE == SATURN_WRAM_L_DEFER_OFF &&
+                       SATURN_WRAM_L_DEFER_OFF + SATURN_WRAM_L_DEFER_SIZE == SATURN_WRAM_L_EVICT_OFF,
+                       "tier fence assumes shadow FB, defer queue and evict list are contiguous");
         if (hram_used < fb_hi && hram_used + (unsigned int)adv > fb_lo)
             hram_used = fb_hi;
     }
@@ -731,17 +754,34 @@ int Saturn_TexHeight(int texnum)
     return textures[t].height;
 }
 
-byte *Saturn_FlatData(int flatnum)
+/* Flat  itself, no animation translation (warp textures key on the
+ * translated flat, saturn_vdp1.c Saturn_Vdp1_GetWarpSrca). */
+byte *Saturn_FlatDataExact(int f)
 {
     extern flattex_t *flatpixels;
-    if (flatnum < 0 || flatnum >= numflats) return NULL;
-    int f = flattranslation[flatnum];
-    if (f < 0 || f >= numflats) f = flatnum;
+    if (f < 0 || f >= numflats) return NULL;
     
     if (!flat_cache[f])
     {
         if (flatpixels && flatpixels[f].data[0]) {
-            flat_cache[f] = (byte *)flatpixels[f].data[0];
+            byte *src = (byte *)flatpixels[f].data[0];
+#if !defined(SATURN_WIN32) && SATURN_FLAT_FASTCOPY
+            /* 2026-11-18: flatpixels live in the zone = the RAM cart
+             * (A-bus, ~23 cycles per access); the warp-texture and flat-
+             * variant builders read flat texels one by one while the
+             * player turns. Keep a copy in the fast tier (High WRAM, else
+             * Low WRAM) for the level. */
+            if (((uint32_t)src & 0x07000000u) == 0x02000000u)
+            {
+                byte *dst = (byte *)hram_alloc(4096);
+                if (dst)
+                {
+                    D_memcpy(dst, src, 4096);
+                    src = dst;
+                }
+            }
+#endif
+            flat_cache[f] = src;
             return flat_cache[f];
         }
 
@@ -759,6 +799,14 @@ byte *Saturn_FlatData(int flatnum)
             ReplaceZeroPixels(flat_cache[f], len);
     }
     return flat_cache[f];
+}
+
+byte *Saturn_FlatData(int flatnum)
+{
+    if (flatnum < 0 || flatnum >= numflats) return NULL;
+    int f = flattranslation[flatnum];
+    if (f < 0 || f >= numflats) f = flatnum;
+    return Saturn_FlatDataExact(f);
 }
 
 byte *Saturn_FlatDataNoLoad(int flatnum)
