@@ -124,6 +124,11 @@ void Saturn_CacheZoneReset(void);
 void Saturn_BakedTextures_Init(const char *lumpname);
 void Saturn_BakedSprites_Init(const char *lumpname);
 int  Saturn_BakedTextures_Parse(byte *blob, unsigned fsize);
+/* streaming MTEX load (saturn_pak.c): one entry per placed texture */
+typedef struct { byte *dst; uint32_t ofs, sz; uint8_t holes; } saturn_tex_place_t;
+int  Saturn_BakedTex_Plan(const byte *blob, unsigned dirbytes, unsigned fsize,
+                          saturn_tex_place_t *out, int max);
+void Saturn_BakedTex_Finish(const saturn_tex_place_t *p, int n);
 int  Saturn_BakedSprites_Parse(byte *blob, unsigned fsize);
 
 #endif

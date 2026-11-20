@@ -112,6 +112,23 @@ static byte   **sprite_raw;
 static sprhdr_t *sprite_hdr;
 
 static byte   *sprite_botz;
+/* 1 = sprite_cache[s] holds the row-trimmed MSPR form (per row: u8 left,
+ * u8 len, len pixels; 2026-11-20, -34% sprite memory so E3M6 fits the
+ * 2 MB zone) instead of a w*h rectangle. Expanded at VRAM upload. */
+static byte   *sprite_trim;
+/* bytes of the cart texture arena the current level's textures use */
+static unsigned int tex_arena_used;
+
+/* Free tail of the cart arena after this level's textures (16-aligned). */
+byte *Saturn_TexArenaFree(unsigned int *size)
+{
+    extern byte *Saturn_CartArena(unsigned int *size);
+    unsigned int asz = 0;
+    byte *a = Saturn_CartArena(&asz);
+    if (!a || tex_arena_used >= asz) { if (size) *size = 0; return NULL; }
+    if (size) *size = asz - tex_arena_used;
+    return a + tex_arena_used;
+}
 static byte   *sprite_gguard;
 
 int saturn_tex_comp_count = 0;
@@ -404,7 +421,7 @@ void Saturn_R_InitData(void)
             }
         }
 
-        texturetranslation = (uint8_t *)Z_Malloc((numtextures + 1) * sizeof(uint8_t), PU_STATIC);
+        texturetranslation = (uint16_t *)Z_Malloc((numtextures + 1) * sizeof(uint16_t), PU_STATIC);
         for (i = 0; i < numtextures; i++) texturetranslation[i] = i;
     }
     numdecals = 0; decals = NULL; texmips = false;
@@ -470,7 +487,9 @@ void Saturn_R_InitData(void)
     sprite_hdr = (sprhdr_t *)Z_Malloc(numsprites * sizeof(sprhdr_t), PU_STATIC);
     sprite_botz = (byte *)Z_Malloc(numsprites, PU_STATIC);
     sprite_gguard = (byte *)Z_Malloc(numsprites, PU_STATIC);
-    
+    sprite_trim = (byte *)Z_Malloc(numsprites, PU_STATIC);
+    D_memset(sprite_trim, 0, numsprites);
+
     D_memset(sprite_cache, 0, numsprites * sizeof(byte *));
     D_memset(sprite_raw, 0, numsprites * sizeof(byte *));
     D_memset(sprite_hdr, 0, numsprites * sizeof(sprhdr_t));
@@ -922,6 +941,7 @@ byte *Saturn_SpriteDataNoLoad(int s)
     return sprite_cache[s];
 }
 
+int Saturn_SpriteTrimmed(int s) { return (sprite_trim && s >= 0 && s < numsprites) ? sprite_trim[s] : 0; }
 int Saturn_SpriteBotz(int s) { return (!sprite_botz || s < 0 || s >= numsprites) ? -1 : sprite_botz[s]; }
 int Saturn_SpriteGuard(int s) { return (!sprite_gguard || s < 0 || s >= numsprites) ? -1 : sprite_gguard[s]; }
 int Saturn_SpritePlen(int s) { return (s < 0 || s >= numsprites) ? -1 : W_LumpLength(firstsprite + s); }
@@ -956,6 +976,12 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
     if (blob[0] != 'M' || blob[1] != 'T' || blob[2] != 'E' || blob[3] != 'X' || (((unsigned)blob[4] << 8) | blob[5]) != 1) return 0;
     
     unsigned count = ((unsigned)blob[6] << 8) | blob[7];
+    /* cart texture arena (i_wad.c Saturn_CartArena), reset per level; the
+     * sprite pack may take what textures leave (Saturn_TexArenaFree) */
+    extern byte *Saturn_CartArena(unsigned int *size);
+    unsigned int arena_size = 0, arena_used = 0;
+    byte *arena = Saturn_CartArena(&arena_size);
+    tex_arena_used = 0;
     hram_used = hram_used_boot;
     uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
     if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
@@ -988,9 +1014,16 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
             if (tex_holes) tex_holes[texnum] = (byte)holes;
 
             byte *fast_dst = (byte *)hram_alloc((int)sz);
+            unsigned int asz = (sz + 15u) & ~15u;
             if (fast_dst) {
                 D_memcpy(fast_dst, blob + ofs, sz);
                 tex_cache[texnum] = fast_dst;
+            } else if (arena && arena_used + asz <= arena_size) {
+                byte *adst = arena + arena_used;
+                arena_used += asz;
+                tex_arena_used = arena_used;
+                D_memcpy(adst, blob + ofs, sz);
+                tex_cache[texnum] = adst;
             } else {
                 byte *cart_dst = (byte *)Z_Malloc(sz, PU_LEVEL);
                 if (cart_dst) {
@@ -1005,6 +1038,79 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
     }
     saturn_tex_dirty = 1;
     return 1;
+}
+
+/* Streaming MTEX load (2026-11-20): Plan places every texture (WRAM-L, then
+ * the cart arena, then the zone) from the header + directory alone; the
+ * caller then streams the section from CD straight into those buffers and
+ * calls Finish. No staging copy of the whole section: retail E2M5 has
+ * 1.25 MB of textures, and staging + zone copies overflowed the zone.
+ * Same placement and pixel handling as Saturn_BakedTextures_Parse. */
+int Saturn_BakedTex_Plan(const byte *blob, unsigned dirbytes, unsigned fsize,
+                         saturn_tex_place_t *out, int max)
+{
+    if (!blob || dirbytes < 16) return 0;
+    if (blob[0] != 'M' || blob[1] != 'T' || blob[2] != 'E' || blob[3] != 'X' || (((unsigned)blob[4] << 8) | blob[5]) != 1) return 0;
+    unsigned count = ((unsigned)blob[6] << 8) | blob[7];
+    if (16u + count * 24u > dirbytes) return 0;
+    extern byte *Saturn_CartArena(unsigned int *size);
+    unsigned int arena_size = 0, arena_used = 0;
+    byte *arena = Saturn_CartArena(&arena_size);
+    tex_arena_used = 0;
+    hram_used = hram_used_boot;
+    uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
+    if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
+    if (tex_cache) D_memset(tex_cache, 0, numtextures * sizeof(byte *));
+    int n = 0;
+    for (unsigned i = 0; i < count && n < max; i++)
+    {
+        const byte *ent = blob + 16 + i * 24;
+        unsigned int texnum = ((unsigned int)ent[0] << 8) | ent[1];
+        unsigned int w      = ((unsigned int)ent[2] << 8) | ent[3];
+        unsigned int h      = ((unsigned int)ent[4] << 8) | ent[5];
+        unsigned int holes  = ent[6];
+        unsigned int ofs    = ((unsigned int)ent[8] << 24) | ((unsigned int)ent[9] << 16) | ((unsigned int)ent[10] << 8) | (unsigned int)ent[11];
+        unsigned int sz     = ((unsigned int)ent[12] << 24) | ((unsigned int)ent[13] << 16) | ((unsigned int)ent[14] << 8) | (unsigned int)ent[15];
+        if (ent[16])
+        {
+            char name_buf[9];
+            D_memcpy(name_buf, ent + 16, 8);
+            name_buf[8] = '\0';
+            int resolved = R_CheckTextureNumForName(name_buf);
+            if (resolved < 0)
+                continue;
+            texnum = (unsigned int)resolved;
+        }
+        if (texnum >= (unsigned int)numtextures || ofs + sz > fsize || sz == 0)
+            continue;
+        textures[texnum].width  = (short)w;
+        textures[texnum].height = (short)h;
+        if (tex_holes) tex_holes[texnum] = (byte)holes;
+        byte *dst = (byte *)hram_alloc((int)sz);
+        unsigned int asz = (sz + 15u) & ~15u;
+        if (!dst && arena && arena_used + asz <= arena_size)
+        {
+            dst = arena + arena_used;
+            arena_used += asz;
+            tex_arena_used = arena_used;
+        }
+        if (!dst)
+            dst = (byte *)Z_Malloc(sz, PU_LEVEL);
+        if (!dst)
+            continue;
+        tex_cache[texnum] = dst;
+        out[n].dst = dst; out[n].ofs = ofs; out[n].sz = sz; out[n].holes = (uint8_t)holes;
+        n++;
+    }
+    return n;
+}
+
+void Saturn_BakedTex_Finish(const saturn_tex_place_t *p, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (!p[i].holes)
+            ReplaceZeroPixels(p[i].dst, (int)p[i].sz);
+    saturn_tex_dirty = 1;
 }
 
 void Saturn_BakedTextures_Init(const char *lumpname)
@@ -1034,13 +1140,20 @@ void Saturn_BakedTextures_Init(const char *lumpname)
     Z_Free(temp_blob);
 }
 
-int Saturn_BakedSprites_Parse(byte *blob, unsigned fsize)
+/* Two-part form (2026-11-20): bytes [0, split) of the MSPR section at
+ * blob, [split, fsize) at blob2 (the sprite pack may start in the free tail
+ * of the cart texture arena and continue in the zone). A sprite crossing
+ * the split gets its own contiguous PU_LEVEL copy. */
+int Saturn_BakedSprites_Parse2(byte *blob, unsigned split, byte *blob2, unsigned fsize)
 {
-    if (!blob || fsize <= 16) return 0;
-    if (blob[0] != 'M' || blob[1] != 'S' || blob[2] != 'P' || blob[3] != 'R' || (((unsigned)blob[4] << 8) | blob[5]) != 1) return 0;
-    
+    if (!blob || fsize <= 16 || split < 16) return 0;
+    unsigned ver = ((unsigned)blob[4] << 8) | blob[5];
+    if (blob[0] != 'M' || blob[1] != 'S' || blob[2] != 'P' || blob[3] != 'R' || (ver != 1 && ver != 2)) return 0;
+
     unsigned count = ((unsigned)blob[6] << 8) | blob[7];
+    if (16u + count * 32u > split) return 0;          /* directory must be in part 1 */
     D_memset(sprite_cache, 0, numsprites * sizeof(byte *));
+    D_memset(sprite_trim, 0, numsprites);
 
     for (unsigned i = 0; i < count; i++)
     {
@@ -1069,11 +1182,28 @@ int Saturn_BakedSprites_Parse(byte *blob, unsigned fsize)
             sprite_hdr[sidx].h  = (short)h;
             sprite_hdr[sidx].lo = lo;
             sprite_hdr[sidx].to = to;
-            sprite_cache[sidx]  = blob + ofs;
+            byte *px;
+            if (ofs + sz <= split)
+                px = blob + ofs;
+            else if (ofs >= split)
+                px = blob2 + (ofs - split);
+            else
+            {
+                px = (byte *)Z_Malloc((int)sz, PU_LEVEL);
+                D_memcpy(px, blob + ofs, split - ofs);
+                D_memcpy(px + (split - ofs), blob2, ofs + sz - split);
+            }
+            sprite_cache[sidx]  = px;
+            sprite_trim[sidx]   = (byte)(ver >= 2 && (ent[11] & 1));   /* entry flags */
         }
     }
     saturn_tex_dirty = 1;
     return 1;
+}
+
+int Saturn_BakedSprites_Parse(byte *blob, unsigned fsize)
+{
+    return Saturn_BakedSprites_Parse2(blob, fsize, blob, fsize);
 }
 
 void Saturn_BakedSprites_Init(const char *lumpname)

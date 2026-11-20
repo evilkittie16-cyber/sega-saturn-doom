@@ -595,7 +595,16 @@ void R_FixupTextures(void)
 		/* Saturn: W_POINTLUMPNUM aliases cold flats to the shared CD
 		 * scratch — the stable accessor zero-copies hot (cart-
 		 * resident) flats and makes a PU_LEVEL copy of cold ones. */
-		data = I_PointStableLump(lump);
+		/* 2026-11-20: cart-resident flats only; a cold flat is no longer
+		 * copied into the zone for every level (retail: 107 x 4 KB) - the
+		 * HW renderer loads the flats a level uses on first use
+		 * (Saturn_FlatDataExact: WRAM first, then the zone). */
+		{
+			extern void *I_PointResidentLump(int lump);
+			data = I_PointResidentLump(lump);
+			if (!data)
+				continue;
+		}
 		length = W_LumpLength(lump);
 		if (W_IsCompressed(lump)) {
 			data = Z_Malloc (length, PU_LEVEL);

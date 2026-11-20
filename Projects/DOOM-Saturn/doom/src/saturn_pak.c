@@ -267,20 +267,104 @@ int Saturn_Pak_LevelLoad(const char *lumpname)
     }
 
     /* 5. Stream MTEX composited textures into high-end PU_STATIC staging, copy to WRAM-L/Cart, and free */
-    if (sec_tex && sec_tex->byte_size > 0)
+    if (sec_tex && sec_tex->byte_size > 16)
     {
-        extern void *Z_MallocHigh(int size, int tag);
-        unsigned alloc_sz = (sec_tex->byte_size + 2047) & ~2047;
-        byte *blob = (byte *)Z_MallocHigh(alloc_sz, PU_STATIC);
-        if (blob)
+        /* Streamed (2026-11-20): header + directory first, Plan places each
+         * texture, then every sector of the section is routed straight into
+         * the planned buffers - no staging copy of the whole section. */
+        uint32_t total = sec_tex->byte_size;
+        if (pak_read_stream(gfs, sec_tex->sec_offset, &cur_sec, pak_scratch, 2048u > total ? total : 2048u))
         {
-            if (pak_read_stream(gfs, sec_tex->sec_offset, &cur_sec, blob, sec_tex->byte_size))
-                Saturn_BakedTextures_Parse(blob, sec_tex->byte_size);
-            Z_Free(blob);
+            unsigned count  = ((unsigned)pak_scratch[6] << 8) | pak_scratch[7];
+            unsigned dirb   = 16u + count * 24u;
+            unsigned dsec   = (dirb + 2047u) / 2048u;
+            byte *tmp = (byte *)Z_Malloc((int)(dsec * 2048u + count * sizeof(saturn_tex_place_t) + 16), PU_STATIC);
+            saturn_tex_place_t *pl = (saturn_tex_place_t *)(tmp + dsec * 2048u);
+            pl = (saturn_tex_place_t *)(((uintptr_t)pl + 3u) & ~3u);
+            if (tmp && dirb <= total &&
+                pak_read_stream(gfs, sec_tex->sec_offset, &cur_sec, tmp, dirb))
+            {
+                int n = Saturn_BakedTex_Plan(tmp, dirb, total, pl, (int)count);
+                /* route the section: sector s covers bytes [s*2048, s*2048+2048) */
+                uint32_t nsec = (total + 2047u) / 2048u;
+                uint32_t s0 = 0;
+                int k = 0, ok = 1;
+                /* first sector holding pixel data: everything before is directory */
+                uint32_t first_pix = (n > 0) ? pl[0].ofs : total;
+                for (int i = 1; i < n; i++)
+                    if (pl[i].ofs < first_pix) first_pix = pl[i].ofs;
+                s0 = first_pix / 2048u;
+                if (n > 0 && __jo_fs_seek_sector(gfs, (int)(sec_tex->sec_offset + s0)))
+                {
+                    cur_sec = sec_tex->sec_offset + s0;
+                    for (uint32_t s = s0; s < nsec && ok; s++)
+                    {
+                        int retry;
+                        for (retry = 10; __jo_fs_read_sectors(gfs, 1, (void *)pak_scratch, 2048) <= 0; --retry)
+                        {
+                            if (!retry) { ok = 0; break; }
+                            jo_spin_wait(16);
+                        }
+                        if (!ok) break;
+                        cur_sec++;
+                        uint32_t b0 = s * 2048u, b1 = b0 + 2048u;
+                        /* entries are in ascending offset order (bake_textures.py) */
+                        while (k < n && pl[k].ofs + pl[k].sz <= b0) k++;
+                        for (int j = k; j < n && pl[j].ofs < b1; j++)
+                        {
+                            uint32_t lo = pl[j].ofs > b0 ? pl[j].ofs : b0;
+                            uint32_t hi = pl[j].ofs + pl[j].sz < b1 ? pl[j].ofs + pl[j].sz : b1;
+                            if (lo < hi)
+                                D_memcpy(pl[j].dst + (lo - pl[j].ofs), pak_scratch + (lo - b0), hi - lo);
+                        }
+                    }
+                }
+                else
+                    ok = 0;
+                if (ok)
+                    Saturn_BakedTex_Finish(pl, n);
+            }
+            if (tmp)
+                Z_Free(tmp);
         }
     }
 
     /* 6. Stream MSPR rectangular sprite bitmaps into PU_LEVEL */
+    /* 6a. Sprite pack bigger than what the zone can spare (retail E4M8,
+     * 1.7 MB): start it in the cart arena's free tail after the textures
+     * (whole sectors), continue in the zone. */
+    if (sec_spr && sec_spr->byte_size > 0)
+    {
+        extern byte *Saturn_TexArenaFree(unsigned int *size);
+        extern int Saturn_BakedSprites_Parse2(byte *blob, unsigned split, byte *blob2, unsigned fsize);
+        unsigned int afree = 0;
+        byte *atail = Saturn_TexArenaFree(&afree);
+        unsigned int split = afree & ~2047u;
+        if (atail && split >= 65536u)
+        {
+            uint32_t total = sec_spr->byte_size;
+            if (split >= total)
+            {
+                if (pak_read_stream(gfs, sec_spr->sec_offset, &cur_sec, atail, total))
+                    Saturn_BakedSprites_Parse2(atail, total, atail, total);
+            }
+            else
+            {
+                unsigned rest = total - split;
+                byte *zpart = (byte *)Z_Malloc((rest + 2047) & ~2047, PU_LEVEL);
+                if (zpart &&
+                    pak_read_stream(gfs, sec_spr->sec_offset, &cur_sec, atail, split) &&
+                    pak_read_stream(gfs, sec_spr->sec_offset + split / 2048u, &cur_sec, zpart, rest))
+                {
+                    if (!Saturn_BakedSprites_Parse2(atail, split, zpart, total))
+                        Z_Free(zpart);
+                }
+                else if (zpart)
+                    Z_Free(zpart);
+            }
+            sec_spr = NULL;     /* handled */
+        }
+    }
     if (sec_spr && sec_spr->byte_size > 0)
     {
         unsigned alloc_sz = (sec_spr->byte_size + 2047) & ~2047;

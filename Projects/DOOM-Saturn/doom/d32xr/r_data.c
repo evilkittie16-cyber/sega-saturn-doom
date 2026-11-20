@@ -25,7 +25,7 @@ spriteframe_t* spriteframes;
 VINT 			*spritelumps;
 
 uint8_t			*flattranslation;		/* for global animation */
-uint8_t			*texturetranslation;	/* for global animation */
+uint16_t		*texturetranslation;	/* for global animation */
 
 flattex_t		*flatpixels;
 
@@ -323,9 +323,11 @@ void R_InitTextures (void)
 /* */
 /* translation table for global animation (static 32-bit WRAM-H fast arrays avoid 16-bit CS0 Cart RAM stalls) */
 /* */
-	static __attribute__((aligned(16))) uint8_t hw_wram_h_textrans[256];
+	/* 16-bit entries (retail: 287 textures); 128 keeps the old 256 B of BSS
+	 * and still holds shareware's 125 + 1, retail takes the Z_Malloc path */
+	static __attribute__((aligned(16))) uint16_t hw_wram_h_textrans[128];
 
-	if (numtextures + 1 <= (int)sizeof(hw_wram_h_textrans))
+	if (numtextures + 1 <= (int)(sizeof(hw_wram_h_textrans) / sizeof(hw_wram_h_textrans[0])))
 		texturetranslation = hw_wram_h_textrans;
 	else
 		texturetranslation = Z_Malloc ((numtextures+1)*sizeof(*texturetranslation), PU_STATIC);

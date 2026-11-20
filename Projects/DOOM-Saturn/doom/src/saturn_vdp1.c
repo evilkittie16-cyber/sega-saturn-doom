@@ -15,6 +15,7 @@
 /* Stage 3a sprite sources (saturn_tex.c): the composited 8bpp pixels
  * (texel 0 = structural transparency) and the patch geometry. */
 extern byte *Saturn_SpriteData(int s);
+extern int   Saturn_SpriteTrimmed(int s);
 extern byte *Saturn_SpritePatch(int s, int *w, int *h, int *lofs,
                                 int *tofs);
 
@@ -1986,7 +1987,40 @@ static int v1_spr_get(int scache, int *pw_out, int *h_out)
     if (off == 0)
         return 0;
 
-    if (pw == w)
+    if (Saturn_SpriteTrimmed(scache))
+    {
+        /* row-trimmed MSPR: per row u8 left, u8 len, len pixels; expand
+         * to the same padded pw*h VRAM image as the rectangle path */
+        const byte *src = pix;
+        int y;
+#ifdef SATURN_WIN32
+        uint8_t *dst = (uint8_t *)(V1_BASE + off);
+        for (y = 0; y < h; y++)
+        {
+            int l = src[0], n = src[1], x;
+            src += 2;
+            for (x = 0; x < pw; x++)
+                dst[y * pw + x] = (x >= l && x < l + n) ? src[x - l] : 0;
+            src += n;
+        }
+#else
+        volatile unsigned short *dst = (volatile unsigned short *)(V1_BASE + off);
+        for (y = 0; y < h; y++)
+        {
+            int l = src[0], n = src[1], xw;
+            const byte *sr = src + 2 - l;           /* sr[x] valid for l <= x < l + n */
+            src += 2 + n;
+            for (xw = 0; xw < pw / 2; xw++)
+            {
+                int      xl = xw * 2, xr = xl + 1;
+                unsigned b_l = ((unsigned)(xl - l) < (unsigned)n) ? (unsigned)sr[xl] : 0u;
+                unsigned b_r = ((unsigned)(xr - l) < (unsigned)n) ? (unsigned)sr[xr] : 0u;
+                *dst++ = (unsigned short)((b_l << 8) | b_r);
+            }
+        }
+#endif
+    }
+    else if (pw == w)
     {
         v1_copy_block(off, pix, bytes); /* no pad columns: straight copy */
     }

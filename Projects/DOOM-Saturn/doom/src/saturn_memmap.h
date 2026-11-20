@@ -108,7 +108,11 @@
 #define SATURN_WRAM_L_FLAT_OFF      0x00040000u
 #define SATURN_WRAM_L_FLAT_ADDR     ((uint8_t *)(SATURN_WRAM_L_BASE + SATURN_WRAM_L_FLAT_OFF))
 #define SATURN_WRAM_L_FLAT_UNCACHED ((uint8_t *)(SATURN_WRAM_L_UNCACHED_BASE + SATURN_WRAM_L_FLAT_OFF))
-#define SATURN_WRAM_L_FLAT_CAP      0x00046000u     /* largest single .FLT (E3M6 284,544 B) */
+#define SATURN_WRAM_L_FLAT_CAP      0x00050000u     /* largest single .FLT: E3M6 294,244 B (2026-11-20
+                                                     * bake; the old 0x46000 cap made Saturn_Pak_LevelLoad
+                                                     * drop the WHOLE pack -> every texture composited at
+                                                     * runtime -> "Z_Malloc failed"). Walls get the rest
+                                                     * up to GEOM_END: 256 KB >= the largest .WL (E2M7 182 KB) */
 
 /* Walls (.WL blob + swizzled segs, 40 B each): packed after the flats.
  * Largest use: E2M7 = 299,528 B. */

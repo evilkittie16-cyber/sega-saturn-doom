@@ -89,7 +89,7 @@ def get_map_sprites(wad_data, directory, mapname, spr_lumps):
         15: ['PLAY'],
         # Monsters
         3004: ['POSS'], 9: ['SPOS'], 3001: ['TROO', 'BAL1'], 3002: ['SARG'],
-        58: ['SARG'], 3005: ['HEAD', 'BAL2'], 3003: ['BOSS', 'BRS1', 'BOSF'], 3006: ['SKUL'],
+        58: ['SARG'], 3005: ['HEAD', 'BAL2'], 3003: ['BOSS', 'BAL7', 'BRS1', 'BOSF'], 3006: ['SKUL'],
         16: ['CYBR', 'ROCK'], 7: ['SPID'],
         # Dead bodies & gore
         10: ['BLOD', 'POL2'], 12: ['POL5'], 24: ['POL4'], 25: ['POL1'], 26: ['POL6'],
@@ -142,15 +142,37 @@ def get_map_sprites(wad_data, directory, mapname, spr_lumps):
 
     return matched
 
+def trim_rows(c):
+    """Row-trimmed form (MSPR v2, flags bit 0): per row u8 left, u8 len,
+    then len pixels - the opaque span of the row (0 = transparent). ~-34%
+    vs the w*h rectangle; expanded back at VDP1 upload (saturn_vdp1.c)."""
+    w, h, px = c["w"], c["h"], c["pixels"]
+    out = bytearray()
+    for y in range(h):
+        row = px[y * w:(y + 1) * w]
+        nz = [x for x, v in enumerate(row) if v]
+        if not nz:
+            out += bytes((0, 0))
+            continue
+        l, r = nz[0], nz[-1] + 1
+        out += bytes((l, r - l)) + row[l:r]
+    return bytes(out)
+
 def write_map_spr(wad_data, mapname, matched_sprites, out_path):
-    # Header: "MSPR", ver=1 (u16), count (u16), total_size (u32), res (u32) = 16 bytes
+    # Header: "MSPR", ver=2 (u16), count (u16), total_size (u32), res (u32) = 16 bytes
     # Directory: count * 32 bytes:
-    #   sprite_idx (u16), w (u16), h (u16), lo (i16), to (i16), pad (u16),
+    #   sprite_idx (u16), w (u16), h (u16), lo (i16), to (i16), flags (u16),
     #   offset (u32), size (u32), name (8s), pad (4s) = 32 bytes
+    # flags bit 0: pixels are row-trimmed (trim_rows), else a w*h rectangle
     converted = []
     for s_idx, name, fpos, size in matched_sprites:
         c = parse_and_convert_sprite(wad_data[fpos:fpos + size])
         if c:
+            if c["w"] <= 255:
+                c["pixels"] = trim_rows(c)
+                c["flags"] = 1
+            else:
+                c["flags"] = 0
             converted.append((s_idx, name, c))
 
     n = len(converted)
@@ -163,14 +185,14 @@ def write_map_spr(wad_data, mapname, matched_sprites, out_path):
     total_file_size = pixel_offset + total_pixels
 
     buf = bytearray(total_file_size)
-    struct.pack_into(">4sHHII", buf, 0, b"MSPR", 1, n, total_file_size, 0)
+    struct.pack_into(">4sHHII", buf, 0, b"MSPR", 2, n, total_file_size, 0)
 
     cur_pix_off = pixel_offset
     for i, (s_idx, name, c) in enumerate(converted):
         name8 = name.encode("latin1").ljust(8, b"\0")[:8]
         pix_len = len(c["pixels"])
         struct.pack_into(">HHHhhHII8s4s", buf, header_size + i * entry_size,
-                         s_idx, c["w"], c["h"], c["lo"], c["to"], 0,
+                         s_idx, c["w"], c["h"], c["lo"], c["to"], c["flags"],
                          cur_pix_off, pix_len, name8, b"\0\0\0\0")
         buf[cur_pix_off:cur_pix_off + pix_len] = c["pixels"]
         cur_pix_off += pix_len

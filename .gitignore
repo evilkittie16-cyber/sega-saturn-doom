@@ -39,3 +39,8 @@ __pycache__/
 *.csv
 *.log
 staging_assets/
+
+# Retail (commercial) map data baked from DOOM.WAD - never commit
+Projects/DOOM-Saturn/cd/E[2-4]M*
+*_retail.iso
+*_retail.cue

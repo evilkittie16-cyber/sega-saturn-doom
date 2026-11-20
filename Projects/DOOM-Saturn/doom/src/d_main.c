@@ -53,7 +53,8 @@ extern void P_Init(void);
  * was within a hundred bytes of it), so keep this as small as still
  * serves its purpose — and trim it further whenever a debug build
  * needs the slack. */
-#define ZONE_POOL_BYTES    (2 * 1024)
+#define ZONE_POOL_BYTES    (1 * 1024)   /* 2026-11-20: 2 KB -> 1 KB for the
+                                         * sprite row expansion + cart texture arena code */
 
 static byte   z_zone_pool[ZONE_POOL_BYTES];
 

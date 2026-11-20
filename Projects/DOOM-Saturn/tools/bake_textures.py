@@ -227,6 +227,22 @@ def write_map_tex(mapname, textures, wad_data, directory, out_path):
                 twins.add(twin)
     used_names.update(twins)
 
+    # Animated wall textures (p_spec.c animdefs): any frame on the map pulls
+    # in the whole start..end run in texture-number order, as the engine
+    # animates it. Missing frames were composited at runtime into the zone.
+    anim_defs = [("BLODGR1", "BLODGR4"), ("SLADRIP1", "SLADRIP3"), ("BLODRIP1", "BLODRIP4"),
+                 ("FIREWALA", "FIREWALL"), ("GSTFONT1", "GSTFONT3"), ("FIRELAV3", "FIRELAVA"),
+                 ("FIREMAG1", "FIREMAG3"), ("FIREBLU1", "FIREBLU2"), ("ROCKRED1", "ROCKRED3"),
+                 ("BFALL1", "BFALL4"), ("SFALL1", "SFALL4"), ("WFALL1", "WFALL4"),
+                 ("DBRAIN1", "DBRAIN4")]
+    order = [t["name"].upper() for t in textures]
+    for a, b in anim_defs:
+        if a in order and b in order:
+            ia, ib = order.index(a), order.index(b)
+            run = order[min(ia, ib):max(ia, ib) + 1]
+            if any(n in used_names for n in run):
+                used_names.update(run)
+
     # Sky textures
     ep = int(mapname[1]) if (len(mapname) >= 2 and mapname[1].isdigit()) else 1
     used_names.add(f"SKY{ep}")

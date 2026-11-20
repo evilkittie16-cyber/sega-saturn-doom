@@ -102,7 +102,11 @@ typedef	struct
 typedef struct
 {
 	VINT		sector;
-	uint8_t		toptexture, bottomtexture, midtexture;
+	/* Saturn (2026-11-20): 16-bit texture numbers. The 32X port used
+	 * uint8_t; the retail IWAD has 287 textures (TEXTURE1+2), so every
+	 * texture numbered >= 256 wrapped to another one (E3M6 cached a dozen
+	 * wrong textures at level start and ran the zone out). */
+	uint16_t	toptexture, bottomtexture, midtexture;
 	uint8_t		rowoffset;			/* add this to the calculated texture top */
 	int16_t		textureoffset;		/* 8.4, add this to the calculated texture col */
 } side_t;
@@ -398,7 +402,7 @@ extern 	VINT 		numdecals;
 extern 	texdecal_t  *decals;
 
 extern	uint8_t			*flattranslation;		/* for global animation */
-extern	uint8_t			*texturetranslation;	/* for global animation */
+extern	uint16_t		*texturetranslation;	/* for global animation */
 extern	flattex_t		*flatpixels;
 
 extern	VINT		firstflat, numflats, col2flat;
