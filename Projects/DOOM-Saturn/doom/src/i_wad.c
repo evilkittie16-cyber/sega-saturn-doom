@@ -718,7 +718,22 @@ byte *Saturn_ZoneBase(int *size)
         return NULL;
     if (size)
         *size = (int)CART_ZONE_SIZE;
+#ifndef SATURN_ZONE_CACHED
+#define SATURN_ZONE_CACHED 0
+#endif
+#if SATURN_ZONE_CACHED
+    /* NOTE 2026-11-20: despite its name, CART_RAM_CACHED (0x22400000) is
+     * the SH-2 CACHE-THROUGH mirror (0x2xxxxxxx); the cached view of the
+     * cart is 0x02400000. The zone is written only by the master CPU, so
+     * the cached view would be coherent, but it MEASURED SLOWER (5thPlanet,
+     * w/p2/m1a: 2 fewer frames per 240 fields each; D-miss +0.4..0.8 ms vs
+     * uncached -0.2): zone data is read sparsely, a 16-byte line fill over
+     * the 16-bit A-bus costs 8 accesses and evicts the renderer's lines.
+     * So the zone stays uncached (the default below). */
+    return (byte *)((CART_RAM_CACHED & 0x0FFFFFFFUL) + CART_ZONE_OFF);
+#else
     return (byte *)(CART_RAM_CACHED + CART_ZONE_OFF);
+#endif
 }
 
 /* Compare 8-character big-endian DOOM lump name (case-insensitive).

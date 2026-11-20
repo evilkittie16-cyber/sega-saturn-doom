@@ -3765,7 +3765,7 @@ static void HW_V2PlaneAddSpan(int sp)
 #define HW_V2P_NEAR_U  160
 #define HW_V2P_ENDS    256
 static uint8_t    *hw_v2p_segf = NULL;      /* zone (level) memory, read only for flagged subsectors */
-static uint8_t     hw_v2p_portf[HW_MAX_PORTAL_SEGS];
+static uint8_t    *hw_v2p_portf = NULL;     /* [HW_MAX_PORTAL_SEGS], same zone block */
 /* subsector has a candidate (fast RAM bitmap, tested inline by the body;
  * subsectors past the bitmap always take the call) */
 static uint8_t     hw_v2p_subbits[(HW_MAX_AP_SUBSECTORS + 7) / 8];
@@ -3781,15 +3781,20 @@ static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
         return hw_v2p_segf != NULL;
     hw_v2p_key_gen = saturn_level_gen;
     D_memset(hw_v2p_subbits, 0, sizeof(hw_v2p_subbits));
-    D_memset(hw_v2p_portf, 0, sizeof(hw_v2p_portf));
-    hw_v2p_segf = (uint8_t *)Z_Malloc(nseg > 0 ? nseg : 1, PU_LEVEL);   /* freed with the level */
-    if (!hw_v2p_segf)
+    /* one level block: seg flags | portal flags | endpoint scratch (static
+     * arrays would cost High WRAM BSS under the 0x060C0000 ceiling) */
+    const int seg_bytes = (nseg + 3) & ~3;
+    uint8_t *blk = (uint8_t *)Z_Malloc(seg_bytes + HW_MAX_PORTAL_SEGS + 4 * HW_V2P_ENDS, PU_LEVEL);
+    hw_v2p_segf = blk;
+    if (!blk)
         return 0;
-    D_memset(hw_v2p_segf, 0, nseg);
+    hw_v2p_portf = blk + seg_bytes;
+    D_memset(blk, 0, seg_bytes + HW_MAX_PORTAL_SEGS);
+    int16_t *ex = (int16_t *)(blk + seg_bytes + HW_MAX_PORTAL_SEGS);
+    int16_t *ey = ex + HW_V2P_ENDS;
 #define HW_V2P_MARK_SUB(s) do { if ((unsigned)(s) < HW_MAX_AP_SUBSECTORS) \
                                     hw_v2p_subbits[(s) >> 3] |= (uint8_t)(1u << ((s) & 7)); } while (0)
 
-    static int16_t ex[HW_V2P_ENDS], ey[HW_V2P_ENDS];
     int ne = 0, overflow = 0;
     for (int s = 0; s < nsub && s < numsubsectors; s++)
     {
