@@ -1034,12 +1034,108 @@ static void saturn_vdp2_copy_back(void)
  *     its own completion path if that relies on interrupts masked at
  *     this IPL.
  * The queue is now drained from the main thread in D_DoomLoop. */
+/* NBG0 page flip (status bar + hardware-sky page). Whole-register writes
+ * only: VDP2 registers are write-only.
+ *
+ * Unlocked pacing (SATURN_VSYNC_DEFER, 2026-11-20): I_FinishUpdate used to
+ * spin until the next VBlank-IN before flipping a 3D page, so a frame that
+ * needed 18 ms took 33 ms (5thPlanet: w 30 -> 45 FPS, p2 20 -> 25.8, m1a
+ * 23.8 -> 27.5 FPS unlocked). Now it records the flip and the vblank
+ * callback writes it at that same VBlank-IN; the next frame starts at once
+ * and only its copy_back waits if the flip has not happened yet (never in
+ * practice: a frame takes more than one field). VDP1 was already decoupled
+ * (manual change mode, saturn_vdp1.c). 2D pages keep the synchronous wait
+ * (their flip also hides the sprite layer). */
+#ifndef SATURN_VSYNC_DEFER
+#define SATURN_VSYNC_DEFER 1
+#endif
+static volatile unsigned char nbg0_flip_pending = 0;
+static volatile unsigned int  nbg0_flip_addr = 0;
+static volatile unsigned int  nbg0_last_flip_vbl = 0xFFFFFFFFu;
+
+static void saturn_nbg0_flip_common(unsigned int fb_addr, int page_3d)
+{
+    unsigned short mpofn_bits = (unsigned short)(((fb_addr & 0x7FFFFu) >> 17) & 0x0007u);
+    unsigned int bk_addr = (((unsigned int)SATURN_FB_BACKCOL) & 0x7FFFFu) >> 1;
+
+    JO_VDP2_BKTAU  = (unsigned short)((bk_addr >> 16) & 0x0007u);
+    JO_VDP2_BKTAL  = (unsigned short)(bk_addr & 0xFFFFu);
+    JO_VDP2_RAMCTL = saturn_vdp2_ramctl;   /* whole: write-only register */
+    JO_VDP2_CHCTLA = 0x0012u;
+    JO_VDP2_MPOFN  = mpofn_bits;
+    JO_VDP2_CYCA0L = 0x44EEu;
+    JO_VDP2_CYCA0U = 0xEEEEu;
+    JO_VDP2_CYCA1L = 0x44EEu;
+    JO_VDP2_CYCA1U = 0xEEEEu;
+    /* RBG0 ground plane only under a 3D page -- never over the pause menu
+     * / 2D screens */
+    saturn_vdp2_rbg0_on = (unsigned char)(saturn_vdp2_plane_active && page_3d);
+    JO_VDP2_BGON   = (unsigned short)(JO_NBG0_SCREEN
+                     | (saturn_vdp2_rbg0_on ? JO_RBG0_SCREEN : 0));
+}
+
+/* 3D page: also the hardware sky. NBG0 line scroll (LSCX) + line zoom
+ * (LZMX), 8-line interval (LSS = 3), table in the shown page's rows 224..;
+ * window 0 keeps NBG0 inside the 320-px view (display x 16..335, WPSX/WPEX
+ * in half-dots, area = inside) so the panorama does not spill into the
+ * side borders. */
+static void saturn_nbg0_flip_3d(unsigned int fb_addr)
+{
+    unsigned int lsta = ((fb_addr & 0x7FFFFu) + HWSKY_TABLE_OFS) >> 1;
+
+    saturn_nbg0_flip_common(fb_addr, 1);
+    JO_VDP2_LSTA0U = (unsigned short)((lsta >> 16) & 0x0007u);
+    JO_VDP2_LSTA0L = (unsigned short)(lsta & 0xFFFFu);
+    /* whole writes (write-only registers; NBG1 fields unused = 0) */
+    JO_VDP2_SCRCTL = 0x003Au;
+    *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
+    *(volatile unsigned short *)0x25F800C2u = 0;
+    *(volatile unsigned short *)0x25F800C4u = (unsigned short)((SATURN_BORDER_X + FB_W - 1) * 2);
+    *(volatile unsigned short *)0x25F800C6u = (unsigned short)(SATURN_FB_LINES - 1);
+    JO_VDP2_WCTLA  = 0x0003u;
+    /* window 0 also keeps the RBG0 plane inside the 320-px view
+     * (RBG0 = WCTLC low byte, same W0E|W0A encoding as NBG0) */
+    JO_VDP2_WCTLC  = 0x0003u;
+}
+
+/* vblank callback side: write a recorded 3D flip at this VBlank-IN. */
+static void saturn_nbg0_flip_vblank(void)
+{
+    if (nbg0_flip_pending)
+    {
+        saturn_nbg0_flip_3d(nbg0_flip_addr);
+        nbg0_last_flip_vbl = saturn_vbl_count;
+        nbg0_flip_pending = 0;
+    }
+}
+
+/* Before writing the back page: the page flipped last must be on screen,
+ * else the back page is still the displayed one. */
+static void saturn_nbg0_wait_flip(void)
+{
+    extern volatile unsigned int saturn_vbl_dead;
+    unsigned int v0 = saturn_vbl_count;
+
+    while (nbg0_flip_pending && !saturn_vbl_dead)
+    {
+        if (saturn_vbl_count - v0 > 2u)
+        {
+            /* the callback should have flipped by now: do it here */
+            saturn_nbg0_flip_3d(nbg0_flip_addr);
+            nbg0_last_flip_vbl = saturn_vbl_count;
+            nbg0_flip_pending = 0;
+            break;
+        }
+    }
+}
+
 static void saturn_vblank_callback(void)
 {
     saturn_vbl_count++;
     *(volatile unsigned int *)
         ((unsigned int)&saturn_vbl_count + 0x20000000u)
         = saturn_vbl_count;
+    saturn_nbg0_flip_vblank();
 
     /* Jo Engine v2026.1 polls SMPC INTBACK on every VBlank-OUT automatically. */
 
@@ -4185,6 +4281,7 @@ void I_FinishUpdate(void)
             drow[0] = 'D'; drow[1] = 0;
             Saturn_StageTextHi(108, 186, drow);
         }
+        saturn_nbg0_wait_flip();   /* deferred flip of the last page done? */
         saturn_vdp2_copy_back();
         saturn_pf_acc[3] += Saturn_ProfSpan(pf_f0, pf_v0);
         /* Freeze-forensics: E = the full-page copy_back completed
@@ -4229,6 +4326,7 @@ void I_FinishUpdate(void)
 
         {
             unsigned short tf;
+            int in_new_vblank;
             do {
                 t0 = saturn_vbl_count;
                 tf = SAT_FRT();
@@ -4255,11 +4353,13 @@ void I_FinishUpdate(void)
                  * 224..262, when VBlank-IN fired during saturn_vdp2_copy_back() or at
                  * the tail end of Saturn_HW_RenderPlayerView()), flip NBG0 immediately
                  * instead of waiting a redundant 16.67 ms VBlank! */
-                static unsigned int last_flip_vbl = 0xFFFFFFFFu;
-                int in_new_vblank = (v0 != last_flip_vbl) &&
-                                    (v0 != v_pre_vdp1 || pre_vdp1_in_vbl ||
-                                     ((*(volatile unsigned short *)0x25F80004u) & 0x0008u) != 0);
-                if (!in_new_vblank)
+                in_new_vblank = (v0 != nbg0_last_flip_vbl) &&
+                                (v0 != v_pre_vdp1 || pre_vdp1_in_vbl ||
+                                 ((*(volatile unsigned short *)0x25F80004u) & 0x0008u) != 0);
+                /* Unlocked pacing (SATURN_VSYNC_DEFER): a 3D page outside
+                 * vblank is not waited for - the vblank callback flips it
+                 * (saturn_nbg0_flip_vblank) and the next frame starts now. */
+                if (!in_new_vblank && !(SATURN_VSYNC_DEFER && hwsky_back_on))
                 {
                     while (saturn_vbl_count == v0)
                     {
@@ -4277,7 +4377,8 @@ void I_FinishUpdate(void)
                         }
                     }
                 }
-                last_flip_vbl = saturn_vbl_count;
+                if (in_new_vblank || !(SATURN_VSYNC_DEFER && hwsky_back_on))
+                    nbg0_last_flip_vbl = saturn_vbl_count;
                 saturn_blit_frt_acc += acc_;
                 saturn_blit_frt_last = last_;
                 saturn_pf_acc[4] += Saturn_ProfSpan(pf_f0, pf_v0);
@@ -4285,48 +4386,23 @@ void I_FinishUpdate(void)
         saturn_frt_syn_syn = (int)Saturn_ProfSpan(tf, t0);
         saturn_master_site = 0xD;   /* r53: flip-write entered */
         {
-            extern int saturn_vdp2_plane_active;
             unsigned int fb_addr = saturn_fb_front ? SATURN_FB_PAGE_A : SATURN_FB_PAGE_B;
-            unsigned short mpofn_bits = (unsigned short)(((fb_addr & 0x7FFFFu) >> 17) & 0x0007u);
-            unsigned int bk_addr = (((unsigned int)SATURN_FB_BACKCOL) & 0x7FFFFu) >> 1;
 
-            JO_VDP2_BKTAU  = (unsigned short)((bk_addr >> 16) & 0x0007u);
-            JO_VDP2_BKTAL  = (unsigned short)(bk_addr & 0xFFFFu);
-            JO_VDP2_RAMCTL = saturn_vdp2_ramctl;   /* whole: write-only register */
-            JO_VDP2_CHCTLA = 0x0012u;
-            JO_VDP2_MPOFN  = mpofn_bits;
-            JO_VDP2_CYCA0L = 0x44EEu;
-            JO_VDP2_CYCA0U = 0xEEEEu;
-            JO_VDP2_CYCA1L = 0x44EEu;
-            JO_VDP2_CYCA1U = 0xEEEEu;
-            /* RBG0 ground plane only under a 3D page (hwsky_back_on: the
-             * page is a 3D frame) -- never over the pause menu / 2D screens */
-            saturn_vdp2_rbg0_on = (unsigned char)(saturn_vdp2_plane_active && hwsky_back_on);
-            JO_VDP2_BGON   = (unsigned short)(JO_NBG0_SCREEN
-                             | (saturn_vdp2_rbg0_on ? JO_RBG0_SCREEN : 0));
-            /* VDP2 hardware sky: NBG0 line scroll (LSCX) + line zoom (LZMX),
-             * 8-line interval (LSS = 3), table in the shown page's rows 224..;
-             * window 0 keeps NBG0 inside the 320-px view (display x 16..335,
-             * WPSX/WPEX in half-dots, area = inside) so the panorama does not
-             * spill into the side borders. Off for 2D frames. */
             if (hwsky_back_on)
             {
-                unsigned int lsta = ((fb_addr & 0x7FFFFu) + HWSKY_TABLE_OFS) >> 1;
-                JO_VDP2_LSTA0U = (unsigned short)((lsta >> 16) & 0x0007u);
-                JO_VDP2_LSTA0L = (unsigned short)(lsta & 0xFFFFu);
-                /* whole writes (write-only registers; NBG1 fields unused = 0) */
-                JO_VDP2_SCRCTL = 0x003Au;
-                *(volatile unsigned short *)0x25F800C0u = (unsigned short)(SATURN_BORDER_X * 2);
-                *(volatile unsigned short *)0x25F800C2u = 0;
-                *(volatile unsigned short *)0x25F800C4u = (unsigned short)((SATURN_BORDER_X + FB_W - 1) * 2);
-                *(volatile unsigned short *)0x25F800C6u = (unsigned short)(SATURN_FB_LINES - 1);
-                JO_VDP2_WCTLA  = 0x0003u;
-                /* window 0 also keeps the RBG0 plane inside the 320-px view
-                 * (RBG0 = WCTLC low byte, same W0E|W0A encoding as NBG0) */
-                JO_VDP2_WCTLC  = 0x0003u;
+                if (SATURN_VSYNC_DEFER && !in_new_vblank)
+                {
+                    /* the vblank callback writes the flip; the next
+                     * copy_back waits for it (saturn_nbg0_wait_flip) */
+                    nbg0_flip_addr = fb_addr;
+                    nbg0_flip_pending = 1;
+                }
+                else
+                    saturn_nbg0_flip_3d(fb_addr);
             }
             else
             {
+                saturn_nbg0_flip_common(fb_addr, 0);
                 /* 2D frames: no line scroll, but KEEP window 0 on - the
                  * panorama fills all 512 bitmap columns, so without it the
                  * side borders show sky (pause menu, bench summary). The
