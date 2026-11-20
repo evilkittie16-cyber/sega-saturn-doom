@@ -370,6 +370,116 @@ typedef struct {
 
 #define HW_BSP_STACK_MAX 64
 
+/* BSP node far plane in map units << 12 (adaptive detail; default the
+ * HW_FAR_Z limit). Read cache-through by hw_asm_cullbox so it can change
+ * between frames (and be poked by the 5thPlanet harness). */
+volatile int32_t hw_far_cull = HW_FAR_Z_UNITS << 12;
+
+/* Adaptive detail (2026-11-20, user: "try adaptive detail to keep the FPS
+ * high"). After each rendered 3D frame: frames slower than 30 FPS step the
+ * detail level up, a run of comfortably fast frames steps it back down.
+ * Levels first cap the BSP draw distance (the E1M1 courtyard spends ~8 ms
+ * on areas seen through far window openings: 5thPlanet p2 25.8 -> 30.0 FPS
+ * at 1536 units with 69 px changed, m1b 22.5 -> 30.0 at 1280 with 386 px;
+ * the other 10 tour views neither change nor gain), then coarsen the wall
+ * strip LOD (m1a, where distance does not help: +0.5..0.7 FPS).
+ * hw_ad_mode (cache-through, pokeable): 1 adaptive, 0 off (full detail). */
+volatile int32_t hw_ad_mode = 1;
+int saturn_hw_detail_level = 0;                 /* HUD */
+unsigned int saturn_hw_ad_avg = 0, saturn_hw_ad_last = 0;   /* debug: frame ticks (avg, last) */
+static const int16_t hw_ad_far[]   = { 16384, 2048, 1536, 1280, 1280, 1280 };
+static const uint8_t hw_ad_lodx[]  = {     1,    1,    1,    1,    2,    3 };
+#define HW_AD_LEVELS ((int)(sizeof(hw_ad_far) / sizeof(hw_ad_far[0])))
+static int hw_ad_rendered = 0;                  /* a 3D frame was drawn since the last call */
+
+static void HW_AdaptiveApply(int level)
+{
+    static int32_t base[16];
+    static int have_base = 0, lodx_now = 1;
+    if (!have_base)
+    {
+        for (int i = 0; i < 16; i++)
+            base[i] = hw_wall_lod[i];
+        have_base = 1;
+    }
+    hw_far_cull = (int32_t)hw_ad_far[level] << 12;
+    if (hw_ad_lodx[level] != lodx_now)
+    {
+        static const uint8_t dx_idx[] = { HW_LOD_M16_DX, HW_LOD_M16_FAR_DX, HW_LOD_M32_DX, HW_LOD_H64_DX,
+                                          HW_LOD_H64_NF_DX, HW_LOD_C4_NF_DX, HW_LOD_C4_DG_DX,
+                                          HW_LOD_MERGE_DX, HW_LOD_C8_DX };
+        lodx_now = hw_ad_lodx[level];
+        for (unsigned int k = 0; k < sizeof(dx_idx); k++)
+        {
+            int32_t v = base[dx_idx[k]];
+            hw_wall_lod[dx_idx[k]] = (v > 0) ? v * lodx_now : v;   /* <= 0: rule off, keep */
+        }
+    }
+    saturn_hw_detail_level = level;
+}
+
+/* d_main.c, after each displayed frame: frame_ticks = whole-frame FRT
+ * span, rate = FRT ticks per field. */
+void Saturn_HW_AdaptiveDetail(unsigned int frame_ticks, unsigned int rate)
+{
+    static int level = 0, slow_run = 0, fast_run = 0;
+    /* backoff: stepping down then straight back up (a view on the edge of
+     * 30 FPS) doubles the fast run needed for the next step down, so far
+     * detail does not pop in and out every couple of seconds */
+    static int down_need = 45, since_down = 1 << 20, since_up = 0;
+    if (!hw_ad_rendered || rate == 0)
+        return;                                 /* menus / 2D frames: leave it */
+    hw_ad_rendered = 0;
+    if (since_down < (1 << 20)) since_down++;
+    if (++since_up > 1800)                      /* ~1 min without stepping up */
+    {
+        down_need = 45;
+        since_up = 0;
+    }
+    if (!*(const volatile int32_t *)((const char *)&hw_ad_mode + 0x20000000u))
+    {
+        if (level != 0)
+            HW_AdaptiveApply(level = 0);
+        slow_run = fast_run = 0;
+        return;
+    }
+    const unsigned int slow = 2u * rate + rate / 16u;   /* > ~34.4 ms: under 30 FPS */
+    const unsigned int fast = 2u * rate - rate / 8u;    /* < ~31.3 ms (backoff handles a view on the edge) */
+    /* decide on a running average (1/8 per frame), not single frames:
+     * texture-upload spikes while turning would otherwise pin the level at
+     * the top although the average frame has headroom */
+    static unsigned int avg = 0;
+    saturn_hw_ad_last = frame_ticks;
+    if (frame_ticks > 6u * rate)
+        frame_ticks = 6u * rate;                /* a load hitch must not swamp it */
+    avg = avg ? avg + (unsigned int)(((int)frame_ticks - (int)avg) >> 3) : frame_ticks;
+    frame_ticks = avg;
+    saturn_hw_ad_avg = avg;
+    if (frame_ticks > slow)
+    {
+        fast_run = 0;
+        if (++slow_run >= 6 && level < HW_AD_LEVELS - 1)   /* ~ the average's lag */
+        {
+            HW_AdaptiveApply(++level);
+            slow_run = 0;
+            since_up = 0;
+            if (since_down < 120 && down_need < 600)
+                down_need *= 2;                 /* bounced: wait longer next time */
+        }
+    }
+    else if (frame_ticks < fast)
+    {
+        slow_run = 0;
+        if (++fast_run >= down_need && level > 0)   /* >= ~1.5 s of headroom */
+        {
+            HW_AdaptiveApply(--level);
+            fast_run = 0;
+            since_down = 0;
+        }
+    }
+    else
+        slow_run = 0;           /* in between: neither counts (keeps fast_run) */
+}
 #if HW_ASM_BSP
 /* Stage E1 (saturn_hw_asm.s): hw_asm_bsp(root, inside) walks the tree,
  * hw_asm_cullbox(bbox, fully_inside) = HW_CullBSPBBox. Table: */
@@ -380,7 +490,7 @@ _Static_assert(sizeof(bsp_stack_t) == 8, "hw_asm_bsp: 8-byte stack entries");
 _Static_assert(sizeof(node_t) == 16, "hw_asm_bsp: 16-byte nodes");
 _Static_assert(HW_VIEW_W == 320 && HW_VIEW_CX == 160, "hw_asm_cullbox: 320 columns");
 _Static_assert(HW_NEAR_Z_UNITS == 4 && HW_FAR_Z_UNITS == 16384, "hw_asm_cullbox: near/far");
-const void *const hw_asm_bsp_ctx[20] = {
+const void *const hw_asm_bsp_ctx[21] = {
     &hw_frust, &hw_cam_x, &hw_cam_y, &hw_solid_count,                    /*  0 */
     &saturn_hw_bsp_occl, &saturn_hw_occl_culls, saturn_master_oclut,     /* 16 */
     hw_solid_mask, hw_mask_left, hw_mask_right, hw_span_mask_lut,        /* 28 */
@@ -390,7 +500,8 @@ const void *const hw_asm_bsp_ctx[20] = {
 #else
     &nodes, hw_bsp_stack, (const void *)HW_RenderSubsector_Body,         /* 56 */
 #endif
-    &hw_node_bboxes, &saturn_baked_flat_bboxes, &saturn_hw_bsp_abort     /* 68 */
+    &hw_node_bboxes, &saturn_baked_flat_bboxes, &saturn_hw_bsp_abort,    /* 68 */
+    (const void *)((const char *)&hw_far_cull + 0x20000000u)             /* 80: cache-through */
 };
 #if HW_ASM_CHECK
 /* cullbox: [0] calls [1] mismatches [2] bbox [3] fully [4] asm [5] C */
@@ -847,6 +958,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_render_frame++;
     if (hw_render_frame == 0)
         hw_render_frame = 1;
+    hw_ad_rendered = 1;             /* adaptive detail: a 3D frame */
     hw_fc = &hw_fsc_none;       /* per-frame sector cache: nothing active, */
     if (++hw_fsc_gen == 0)      /* every slot invalid */
         hw_fsc_gen = 1;

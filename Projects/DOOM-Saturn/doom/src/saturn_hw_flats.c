@@ -3365,8 +3365,14 @@ static void HW_RenderSubsectorBakedFlats(int sub_idx, int subnum, sector_t *sec,
  * frame already built, else fills the slot. Frame start points hw_fc at an
  * empty entry and bumps hw_fsc_gen, which invalidates every slot. */
 #define HW_FSC_WAYS 32
-static hw_flat_sec_cache_t hw_fsc_store[HW_FSC_WAYS];
-static uint32_t            hw_fsc_frame[HW_FSC_WAYS];
+/* The store comes from the Jo heap on first use (High WRAM BSS is at its
+ * 0x060C0000 ceiling); if that fails, one built-in entry (= the old
+ * one-entry cache). */
+typedef struct { hw_flat_sec_cache_t e[HW_FSC_WAYS]; uint32_t frame[HW_FSC_WAYS]; } hw_fsc_store_t;
+static hw_fsc_store_t     *hw_fsc = NULL;
+static hw_flat_sec_cache_t hw_fsc_one;
+static uint32_t            hw_fsc_one_frame;
+static unsigned int        hw_fsc_mask = 0;
 static uint32_t            hw_fsc_gen = 1;   /* ++ at each frame start (saturn_hw_render.c); never 0 */
 static hw_flat_sec_cache_t hw_fsc_none;      /* sec NULL: matches nothing */
 static hw_flat_sec_cache_t *hw_fc = &hw_fsc_none;
@@ -3375,11 +3381,25 @@ static hw_flat_sec_cache_t *hw_fc = &hw_fsc_none;
 static HW_NOINLINE HW_HOT_O2 void HW_CacheFlatSectorInfo(const sector_t *sec)
 {
     {
-        unsigned k = (unsigned)(sec - sectors) & (HW_FSC_WAYS - 1);
-        hw_fc = &hw_fsc_store[k];
-        if (hw_fsc_frame[k] == hw_fsc_gen && hw_fc->sec == sec)
+        static int tried = 0;
+        if (__builtin_expect(!tried, 0))
+        {
+            extern byte *I_AllocHigh(int length);
+            tried = 1;
+            hw_fsc = (hw_fsc_store_t *)I_AllocHigh((int)sizeof(hw_fsc_store_t));
+            if (hw_fsc)
+            {
+                for (int i = 0; i < HW_FSC_WAYS; i++)
+                    hw_fsc->frame[i] = 0;
+                hw_fsc_mask = HW_FSC_WAYS - 1;
+            }
+        }
+        unsigned k = (unsigned)(sec - sectors) & hw_fsc_mask;
+        uint32_t *fr = hw_fsc ? &hw_fsc->frame[k] : &hw_fsc_one_frame;
+        hw_fc = hw_fsc ? &hw_fsc->e[k] : &hw_fsc_one;
+        if (*fr == hw_fsc_gen && hw_fc->sec == sec)
             return;                 /* built earlier this frame */
-        hw_fsc_frame[k] = hw_fsc_gen;
+        *fr = hw_fsc_gen;
     }
     const fixed_t vz = hw_viewz;
     int is_sky     = ((int16_t)sec->ceilingpic == -1);

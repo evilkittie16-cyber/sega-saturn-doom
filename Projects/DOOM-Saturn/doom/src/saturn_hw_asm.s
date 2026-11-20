@@ -5550,9 +5550,9 @@ _hw_asm_cullbox:
 	cmp/ge	r2,r1
 	bf	.Lb_retm1
 	BFDOT	6, 7, 12, 14, 24
-	mov	#4,r2
-	shll8	r2
-	shll16	r2			! 16384 << 12
+	mov	#80,r0
+	mov.l	@(r0,r7),r2		! [20] &hw_far_cull (cache-through)
+	mov.l	@r2,r2			! far plane, units << 12 (adaptive detail)
 	cmp/gt	r2,r1
 	bt	.Lb_retm1
 	mov	#64,r2

@@ -1621,7 +1621,12 @@ void D_DoomLoop(void)
                 D_Display();
                 saturn_prof_disp_comp = saturn_tex_comp_count - comp0;
             }
-            saturn_prof_frame_frt = (unsigned short)Saturn_ProfSpan(frame_f0, frame_v0);
+            {
+                unsigned int frame_span = Saturn_ProfSpan(frame_f0, frame_v0);
+                extern void Saturn_HW_AdaptiveDetail(unsigned int frame_ticks, unsigned int rate);
+                saturn_prof_frame_frt = (unsigned short)frame_span;
+                Saturn_HW_AdaptiveDetail(frame_span, (unsigned int)saturn_frt_rate);
+            }
             saturn_prof_frame_vbl = (int)(saturn_vbl_count - frame_v0);
             /* Hitch latch: freeze the breakdown of any >=10-vbl frame
              * (see the block comment above the definitions). */

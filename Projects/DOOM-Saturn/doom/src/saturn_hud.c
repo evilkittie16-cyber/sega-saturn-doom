@@ -1208,6 +1208,12 @@ void Saturn_HUD_Draw(void)
                         dbg[dn++] = ' ';
                         dn = hud_tiny_tag(dbg, dn, 'W', (int)(saturn_v1m_watchdog & 0xFFFFu));
                     }
+                    {
+                        /* L: adaptive detail level (saturn_hw_render.c; 0 = full detail) */
+                        extern int saturn_hw_detail_level;
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'L', saturn_hw_detail_level);
+                    }
                     (void)pf_ring_depth;
                     (void)saturn_prof_hitch_comp;
                     (void)saturn_prof_hitch_bg; (void)saturn_prof_hitch_slv; (void)saturn_prof_hitch_cull;

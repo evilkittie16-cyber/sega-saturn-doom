@@ -528,15 +528,17 @@ void Saturn_Pause_Tick(int edges)
 
     menu_frame++;
 
+    extern volatile int hw_ad_mode;     /* saturn_hw_render.c: 1 = adaptive detail */
+
     if (edges & BT_MOVEUP)
     {
         if (--pause_cursor < 0)
-            pause_cursor = 5;
+            pause_cursor = 6;
         S_StartSound(0, sfx_pstop);
     }
     if (edges & BT_MOVEDOWN)
     {
-        if (++pause_cursor >= 6)
+        if (++pause_cursor >= 7)
             pause_cursor = 0;
         S_StartSound(0, sfx_pstop);
     }
@@ -565,6 +567,11 @@ void Saturn_Pause_Tick(int edges)
     {
         saturn_quiet_hud ^= 1;
         saturn_show_fps  = !saturn_quiet_hud;
+        S_StartSound(0, sfx_swtchn);
+    }
+    else if (pause_cursor == 5 && (edges & (BT_MOVELEFT | BT_MOVERIGHT | BT_STRAFELEFT | BT_STRAFERIGHT)))
+    {
+        hw_ad_mode = !hw_ad_mode;
         S_StartSound(0, sfx_swtchn);
     }
 
@@ -600,6 +607,10 @@ void Saturn_Pause_Tick(int edges)
             saturn_show_fps  = !saturn_quiet_hud;
         }
         else if (pause_cursor == 5)
+        {
+            hw_ad_mode = !hw_ad_mode;
+        }
+        else if (pause_cursor == 6)
         {
             saturn_quit_to_title = 1;
             gamepaused           = 0;
@@ -652,7 +663,11 @@ void Saturn_Pause_Draw(void)
     Saturn_Print(76, 76, "RESTART LEVEL");
     Saturn_Print(76, 94, saturn_wall_subdivision ? "WALL STRIPS: ON" : "WALL STRIPS: OFF");
     Saturn_Print(76, 112, (!saturn_quiet_hud || saturn_show_fps) ? "PERF HUD: ON" : "PERF HUD: OFF");
-    Saturn_Print(76, 130, "QUIT TO TITLE");
+    {
+        extern volatile int hw_ad_mode;
+        Saturn_Print(76, 130, hw_ad_mode ? "DETAIL: AUTO" : "DETAIL: FULL");
+    }
+    Saturn_Print(76, 148, "QUIT TO TITLE");
 
     draw_skull(48, 34 + pause_cursor * 18);
 }
