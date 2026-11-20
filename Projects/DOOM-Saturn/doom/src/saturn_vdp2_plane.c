@@ -300,35 +300,43 @@ static void v2_load_flatnum(int flatnum)
      * 8 x 4 into the 512x256 bitmap: texel (x, y) = world (x, y) mod 512/256,
      * which keeps 64-unit flat alignment. Palette index 0 is transparent in
      * an 8bpp bitmap, so it is remapped to the black 247. */
-    static uint8_t tile[64 * 64] __attribute__((aligned(4)));
+    /* The tile is built straight into the bitmap's top-left 64x64 and
+     * replicated from VRAM (level load only; a 4 KB static staging buffer
+     * cost static space under the 0x060C0000 ceiling). */
     const byte *src = NULL;
     if (flatnum >= 0 && !(src = Saturn_FlatData(flatnum)))
         return;
     for (int y = 0; y < 64; y++)
     {
-        for (int x = 0; x < 64; x++)
+        volatile uint32_t *dst = V2_BITMAP + y * (512 / 4);
+        for (int x4 = 0; x4 < 64; x4 += 4)
         {
-            unsigned char p;
-            if (src)
-                p = src[y * 64 + x];
-            else if (x < 2 || x >= 62 || y < 2 || y >= 62 || x == 31 || x == 32 || y == 31 || y == 32)
-                p = 231;                                     /* yellow border + crosshair */
-            else if (y < 31)
+            uint32_t w4 = 0;
+            for (int x = x4; x < x4 + 4; x++)
             {
-                int qx = x - 10, qy = y - 10;                /* white quadrant with a black 'N' */
-                p = (x >= 31) ? 176 : ((qx >= 0 && qx < 11 && qy >= 0 && qy < 11 &&
-                                        (qx <= 1 || qx >= 9 || qx == qy || qx == qy + 1)) ? 247 : 4);
+                unsigned char p;
+                if (src)
+                    p = src[y * 64 + x];
+                else if (x < 2 || x >= 62 || y < 2 || y >= 62 || x == 31 || x == 32 || y == 31 || y == 32)
+                    p = 231;                                 /* yellow border + crosshair */
+                else if (y < 31)
+                {
+                    int qx = x - 10, qy = y - 10;            /* white quadrant with a black 'N' */
+                    p = (x >= 31) ? 176 : ((qx >= 0 && qx < 11 && qy >= 0 && qy < 11 &&
+                                            (qx <= 1 || qx >= 9 || qx == qy || qx == qy + 1)) ? 247 : 4);
+                }
+                else
+                    p = (x < 31) ? 112 : 251;                /* green / magenta */
+                w4 = (w4 << 8) | ((p == 0) ? 247u : p);      /* big-endian: first texel high */
             }
-            else
-                p = (x < 31) ? 112 : 251;                    /* green / magenta */
-            tile[y * 64 + x] = (p == 0) ? 247 : p;
+            dst[x4 >> 2] = w4;
         }
     }
     for (int y = 0; y < 256; y++)
     {
-        const uint32_t *row = (const uint32_t *)&tile[(y & 63) * 64];
+        const volatile uint32_t *row = V2_BITMAP + (y & 63) * (512 / 4);
         volatile uint32_t *dst = V2_BITMAP + y * (512 / 4);
-        for (int x = 0; x < 512 / 4; x++)
+        for (int x = (y < 64) ? 16 : 0; x < 512 / 4; x++)
             dst[x] = row[x & 15];
     }
 }

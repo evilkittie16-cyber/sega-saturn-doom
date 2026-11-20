@@ -13,7 +13,7 @@ def busy(view_dir, name):
     tmp = tempfile.mkdtemp()
     shutil.copy(prof, os.path.join(tmp, 'prof.csv'))
     shutil.copy(os.path.join(view_dir, 'syms.txt'), os.path.join(tmp, 'syms.txt'))
-    out = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'costmap.py'), tmp, '5'],
+    out = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'costmap.py'), tmp, '400'],
                          capture_output=True, text=True).stdout
     frames = int(out.split(':')[1].split()[0])
     allv = fu = None
@@ -42,7 +42,7 @@ def busy(view_dir, name):
         if syms[i][1] == '_Saturn_HW_RenderPlayerView' and int(x[3]) > 8000:
             spin += int(x[2])
     shutil.rmtree(tmp)
-    return allv - fu, spin / CLK / frames
+    return allv - (fu or 0.0), spin / CLK / frames
 
 
 args = sys.argv[1:]

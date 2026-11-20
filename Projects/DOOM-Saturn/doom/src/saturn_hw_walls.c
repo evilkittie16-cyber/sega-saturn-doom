@@ -3619,6 +3619,196 @@ static const void *const hw_asm_walk_ctx[30] = {
 /* Master Blueprint: Zero-Runtime-Math 1D LOD Subsector Wall Renderer (Phase 3)
  * Fast Culling & Pillar Projection Loop (< 400 bytes, zero register spills):
  * rejects ~72% of segs in registers and dispatches surviving visible segs to HW_EmitVisibleBakedSeg. */
+/* VDP2 floor plane punch-through (2026-11-20, user report: E1M1 X2122
+ * Y-3167 A274, a dark box under the outdoor hut's doorway).
+ *
+ * A plane sector's floor is drawn by VDP2 RBG0, BEHIND every VDP1 pixel,
+ * so it cannot hide anything. On VDP1 a farther surface seen through a
+ * portal is normally covered below the portal's floor line by the nearer
+ * sector's floor quads, drawn later; with the plane those quads are gone
+ * and the farther wall (here the hut's inner back wall, below the
+ * courtyard floor) shows on top of the plane. For each front-facing
+ * portal of a plane-floored subsector into a sector that is NOT
+ * plane-floored, emit one polygon in the transparent colour from the
+ * portal's floor line to the bottom of the view, after the farther
+ * geometry and before this subsector's sprites: it erases exactly what
+ * this floor hides and lets the plane show (the same colour-0 polygon the
+ * list's clear uses). The back sector's own riser and floor lie above the
+ * line, so a higher back floor is unaffected; what lies below it is
+ * hidden by this floor whatever the back floor's height (E1M1: courtyard
+ * -> doorway at the same height -> lower hut interior). Portals into
+ * other plane sectors are punched by those sectors' own subsectors. */
+#ifndef HW_V2P_PUNCH
+#define HW_V2P_PUNCH 1
+#endif
+#if HW_V2P_PUNCH
+#define HW_V2P_SPILL_PX 24   /* widest far-strip spill past a portal edge */
+#define HW_V2P_SPANS    16
+/* screen spans (+- spill) of this frame's punched portals (frame = hw_render_frame) */
+static int16_t  hw_v2p_lo[HW_V2P_SPANS], hw_v2p_hi[HW_V2P_SPANS];
+static int      hw_v2p_n = 0;
+static unsigned hw_v2p_frame = 0xFFFFFFFFu;
+
+/* Punch below one seg's floor line, from its two projected ends. Returns
+ * its screen span (xa << 16 | xb) or -1 when it emitted nothing.
+ * near_only: punch only if the span overlaps one of this frame's
+ * punched-portal spans. */
+static HW_NOINLINE HW_COLD_OS int HW_V2PlanePunchProj(const hw_trans_pillar_t *pa, const hw_trans_pillar_t *pb,
+                                                      int dz, int near_only)
+{
+    const hw_trans_pillar_t a = *pa, b = *pb;
+    if (a.cz < HW_NEAR_Z || b.cz < HW_NEAR_Z)
+        return -1;                              /* crosses the near plane: skip */
+    int xa = a.px, xb = b.px;
+    if (xb <= xa || xb <= 0 || xa >= HW_VIEW_W || xa < -30000 || xb > 30000)
+        return -1;                              /* off screen / extreme projection */
+    if (near_only)
+    {
+        int k = 0;
+        while (k < hw_v2p_n && (xb < hw_v2p_lo[k] || xa > hw_v2p_hi[k]))
+            k++;
+        if (k == hw_v2p_n)
+            return -1;                          /* not next to a punched portal */
+    }
+    int ya, yb;
+    HW_ProjYPair(HW_VIEW_CY, dz, a.s, dz, b.s, &ya, &yb);
+    const int vh = HW_VIEW_H;
+    if (ya >= vh && yb >= vh)
+        return -1;                              /* floor line below the view */
+    const int span = (int)(((uint32_t)(uint16_t)xa << 16) | (uint16_t)xb);
+    if (ya < -1000) ya = -1000;
+    if (yb < -1000) yb = -1000;
+    if (ya > vh) ya = vh;
+    if (yb > vh) yb = vh;
+    /* keep VDP1's 11-bit coordinates: clip the top edge to x in [-512, 832]
+     * (|dy| <= 1168 and |dx| < 30512: the products fit in 32 bits) */
+    if (xa < -512)
+    {
+        ya += (yb - ya) * (-512 - xa) / (xb - xa);
+        xa = -512;
+    }
+    if (xb > 832)
+    {
+        yb = ya + (yb - ya) * (832 - xa) / (xb - xa);
+        xb = 832;
+    }
+
+    uint16_t m_cnt = saturn_cmd_m_count;
+    if (m_cnt >= CMDBUF_M_CAP - 1)
+        return -1;
+    saturn_cmd_m_count = m_cnt + 1;
+    aliased_uint32_t *c = (aliased_uint32_t *)&saturn_cmd_m[m_cnt];
+    uint32_t xa_p = (uint32_t)xa << 16, xb_p = (uint32_t)xb << 16;
+    c[0] = 0x00040000u;                         /* polygon */
+    c[1] = 0x00C00000u;                         /* PMOD ECD|SPD (no user clip), COLR 0 = transparent */
+    c[2] = 0;
+    c[3] = xa_p | (uint16_t)ya;                 /* A: floor line left  */
+    c[4] = xb_p | (uint16_t)yb;                 /* B: floor line right */
+    c[5] = xb_p | (uint16_t)vh;                 /* C: bottom right */
+    c[6] = xa_p | (uint16_t)vh;                 /* D: bottom left  */
+    c[7] = 0;
+    return span;
+}
+
+/* unbaked portal: world coords, projected here */
+static HW_NOINLINE HW_COLD_OS int HW_V2PlanePunchSeg(int x0, int y0, int seg_dx, int seg_dy, int dz)
+{
+    hw_trans_pillar_t a, b;
+    int obj_dx = x0 - hw_cam_x;
+    int obj_dy = y0 - hw_cam_y;
+
+    if (HW_CrossBackface(obj_dy, seg_dx, obj_dx, seg_dy) <= 0)
+        return -1;                              /* faces away */
+    HW_ProjectPortalEndpoint(&a, obj_dx, obj_dy);
+    HW_ProjectPortalEndpoint(&b, obj_dx + seg_dx, obj_dy + seg_dy);
+    return HW_V2PlanePunchProj(&a, &b, dz, 0);
+}
+
+/* baked seg: its pillars as the walk transformed them this frame; a pillar
+ * the walk did not transform belongs to a wall it already culled */
+static int HW_V2PlanePunchBaked(const saturn_wl_pillar_t *pil, const baked_seg_t *seg, int dz, int near_only)
+{
+    int i0 = seg->pillar_idx[0], i1 = seg->pillar_idx[1];
+    uint8_t gen = hw_cur_pil_gen;
+    const saturn_wl_pillar_t *p0 = &pil[i0], *p1 = &pil[i1];
+    int obj_dx = (int)p0->x - hw_cam_x, obj_dy = (int)p0->z - hw_cam_y;
+    int seg_dx = (int)p1->x - p0->x, seg_dy = (int)p1->z - p0->z;
+    if (HW_CrossBackface(obj_dy, seg_dx, obj_dx, seg_dy) <= 0)
+        return -1;                              /* faces away */
+    if (hw_pil_gen[i0] == gen && hw_pil_gen[i1] == gen)
+        return HW_V2PlanePunchProj(&local_trans_pillars[i0], &local_trans_pillars[i1], dz, near_only);
+    if (seg->flags)
+        return -1;                              /* a wall the walk culled */
+    /* a geometry-less seg the walk skips (flags 0): project it here */
+    hw_trans_pillar_t a, b;
+    HW_ProjectPortalEndpoint(&a, obj_dx, obj_dy);
+    HW_ProjectPortalEndpoint(&b, obj_dx + seg_dx, obj_dy + seg_dy);
+    return HW_V2PlanePunchProj(&a, &b, dz, near_only);
+}
+
+static void HW_V2PlaneAddSpan(int sp)
+{
+    if (sp == -1 || hw_v2p_n >= HW_V2P_SPANS)
+        return;
+    hw_v2p_lo[hw_v2p_n] = (int16_t)((int16_t)(sp >> 16) - HW_V2P_SPILL_PX);
+    hw_v2p_hi[hw_v2p_n] = (int16_t)((int16_t)sp + HW_V2P_SPILL_PX);
+    hw_v2p_n++;
+}
+
+static HW_NOINLINE HW_COLD_OS void HW_V2PlanePunch(int subnum, const hw_sec_fast_t *sf)
+{
+    const int dz = sf->dz_floor;
+    if (dz >= 0 || !saturn_baked_walls_active || (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
+        return;                                 /* eye at/below the floor: plane not seen */
+    const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[subnum];
+    const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
+    const baked_seg_t *seg0 = &saturn_baked_wall_segs[ss->seg_start];
+    const baked_seg_t *seg = seg0;
+    /* Far walls are drawn in coalesced strips that spill past a portal's
+     * screen edge into columns hidden by solid walls, and below those walls
+     * only the plane floor is left to hide them. So one-sided walls whose
+     * span comes within HW_V2P_SPILL_PX of a portal punched this frame (in
+     * this or an earlier-walked plane subsector) are punched below their
+     * floor line too (they lie above it and were drawn first: they stay
+     * intact). */
+    if (hw_v2p_frame != (unsigned)hw_render_frame)
+    {
+        hw_v2p_frame = (unsigned)hw_render_frame;
+        hw_v2p_n = 0;
+    }
+    int last_key = -1;
+    for (int i = 0; i < (int)ss->num_segs; i++, seg++)
+    {
+        int bs = seg->back_sec_idx;
+        int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
+        if (bs < 0 || key == last_key || SATURN_V2P_SKIP_FLOOR(&sectors[bs]))
+            continue;
+        last_key = key;
+        HW_V2PlaneAddSpan(HW_V2PlanePunchBaked(pil, seg, dz, 0));
+    }
+    const hw_portal_seg_t *p = &HW_PORTAL_SEGS[ss->portal_first];
+    for (int i = 0; i < (int)ss->portal_count; i++, p++)
+    {
+        int bs = p->back_sec_idx;
+        if (bs < 0 || SATURN_V2P_SKIP_FLOOR(&sectors[bs]))
+            continue;
+        HW_V2PlaneAddSpan(HW_V2PlanePunchSeg(p->x0, p->y0, p->dx, p->dy, dz));
+    }
+    if (!hw_v2p_n)
+        return;
+    last_key = -1;
+    seg = seg0;
+    for (int i = 0; i < (int)ss->num_segs; i++, seg++)
+    {
+        int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
+        if (seg->back_sec_idx >= 0 || key == last_key)
+            continue;
+        last_key = key;
+        HW_V2PlanePunchBaked(pil, seg, dz, 1);
+    }
+}
+#endif
+
 static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const hw_sec_fast_t *sf)
 {
     if (!saturn_baked_walls_active || (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
