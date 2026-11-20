@@ -1952,6 +1952,46 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
 }
 #endif /* HW_SLAVE_TU */
 
+/* Compact rewrite stage H: HW_EmitMultiBandBakedWall in saturn_hw_asm.s
+ * (hw_asm_multiband). Loop state stays in registers (GCC spilled ~12
+ * words per band); globals are direct literals, only the static helpers
+ * go through hw_asm_multiband_ctx. */
+#ifndef HW_ASM_MULTIBAND
+#if HW_ASM && HW_STRIP_FASTPATH && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+#define HW_ASM_MULTIBAND 1
+#else
+#define HW_ASM_MULTIBAND 0
+#endif
+#endif
+#if HW_ASM_MULTIBAND
+extern void hw_asm_multiband(hw_wall_emit_ctx_t *ctx);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, top_overlap) == 5 && offsetof(hw_wall_emit_ctx_t, bot_overlap) == 6 &&
+               offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 && offsetof(hw_wall_emit_ctx_t, ybot_max) == 14 &&
+               offsetof(hw_wall_emit_ctx_t, ya0) == 16 && offsetof(hw_wall_emit_ctx_t, ya1) == 18 &&
+               offsetof(hw_wall_emit_ctx_t, yb0) == 20 && offsetof(hw_wall_emit_ctx_t, yb1) == 22 &&
+               offsetof(hw_wall_emit_ctx_t, th) == 26 && offsetof(hw_wall_emit_ctx_t, wall_h) == 28 &&
+               offsetof(hw_wall_emit_ctx_t, cur_v) == 30 && offsetof(hw_wall_emit_ctx_t, p0) == 40 &&
+               offsetof(hw_wall_emit_ctx_t, p1) == 44 && offsetof(hw_wall_emit_ctx_t, seg) == 48 &&
+               offsetof(hw_wall_emit_ctx_t, dz_top) == 52 && offsetof(hw_wall_emit_ctx_t, dz_bot) == 56 &&
+               offsetof(hw_wall_emit_ctx_t, should_subdivide) == 64 && offsetof(hw_wall_emit_ctx_t, needs_clip) == 65 &&
+               offsetof(hw_wall_emit_ctx_t, persp_strips) == 66 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
+               offsetof(hw_wall_emit_ctx_t, last_clip_x1) == 78 && offsetof(hw_wall_emit_ctx_t, mono_tw) == 80 &&
+               offsetof(hw_wall_emit_ctx_t, mono_base_srca) == 82 && offsetof(hw_wall_emit_ctx_t, rem_h) == 84 &&
+               offsetof(hw_wall_emit_ctx_t, q_xa) == 86 && offsetof(hw_wall_emit_ctx_t, q_xb) == 88 &&
+               offsetof(hw_wall_emit_ctx_t, rows) == 90 && offsetof(hw_wall_emit_ctx_t, u_start) == 92 &&
+               offsetof(hw_wall_emit_ctx_t, u_span) == 96 && offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104 &&
+               offsetof(hw_trans_pillar_t, s) == 8 && offsetof(baked_seg_t, flags) == 3 &&
+               SEG_FLAG_UPPER == 2 && CMDBUF_M_CAP == 1280 && HW_VIEW_W == 320 && sizeof(vdp1_cmd_t) == 32,
+               "hw_asm_multiband: layout");
+const void *const hw_asm_multiband_ctx[6] = {
+    hw_wall_coord_tmp, (const void *)HW_ExtrapolateMonoWallY, (const void *)HW_WallXYClamp_Slow,
+    (const void *)HW_EmitWallStrips_Linear, (const void *)HW_EmitWallStrips_Persp, (const void *)HW_EmitUserClip
+};
+#else
+const void *const hw_asm_multiband_ctx[1] = { NULL };
+#endif
+
+#if !HW_ASM_MULTIBAND || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 void HW_EmitMultiBandBakedWall(hw_wall_emit_ctx_t *ctx)
 {
     const baked_seg_t *seg = ctx->seg;
@@ -2087,6 +2127,65 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMultiBandBakedWall(hw_wall_emit_ctx_t *
         yb0 = raw_yb1;
     }
 }
+#endif /* !HW_ASM_MULTIBAND || HW_ASM_CHECK */
+
+#if HW_ASM_MULTIBAND && HW_ASM_CHECK
+/* Self-check: run the asm, hash its output (commands + counters) and keep
+ * the ctx it leaves, roll everything back, run C, compare.
+ * [0] calls [1] mismatches [2] rem_h [3] subdivide|needs_clip<<8|persp<<16
+ * [4] asm quads [5] C quads [6] 1 + first differing ctx byte (0: cmds/counters) [7] - */
+static volatile uint32_t hw_asm_chk_multiband[8];
+static uint32_t HW_MultiBandHash(uint16_t m0)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *p = (const uint32_t *)&saturn_cmd_m[m0];
+    const uint32_t *e = (const uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+    for (; p < e; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ (uint32_t)saturn_cmd_m_count) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_cells) * 16777619u;
+    h = (h ^ saturn_hw_wall_quads) * 16777619u;
+    h = (h ^ saturn_hw_wall_strips) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_drop) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_captured) * 16777619u;
+    return h;
+}
+static HW_NOINLINE void HW_MultiBandCheck(hw_wall_emit_ctx_t *ctx)
+{
+    static hw_wall_emit_ctx_t c0, ca;
+    uint16_t m0 = saturn_cmd_m_count;
+    int cells0 = saturn_v1w_cells, drop0 = saturn_v1w_drop, cap0 = saturn_v1w_captured;
+    unsigned int q0 = saturn_hw_wall_quads, st0 = saturn_hw_wall_strips;
+    c0 = *ctx;
+    hw_asm_multiband(ctx);
+    uint32_t ha = HW_MultiBandHash(m0);
+    unsigned int qa = saturn_hw_wall_quads - q0;
+    ca = *ctx;
+    saturn_cmd_m_count = m0;
+    saturn_v1w_cells = cells0; saturn_v1w_drop = drop0; saturn_v1w_captured = cap0;
+    saturn_hw_wall_quads = q0; saturn_hw_wall_strips = st0;
+    *ctx = c0;
+    HW_EmitMultiBandBakedWall(ctx);
+    uint32_t hc = HW_MultiBandHash(m0);
+    unsigned int diff = 0;
+    for (unsigned int i = 0; i < sizeof(ca); i++)
+        if (((const uint8_t *)&ca)[i] != ((const uint8_t *)ctx)[i]) { diff = i + 1; break; }
+    hw_asm_chk_multiband[0]++;
+    if ((ha != hc || diff) && hw_asm_chk_multiband[1]++ == 0)
+    {
+        hw_asm_chk_multiband[2] = (uint32_t)(int)c0.rem_h;
+        hw_asm_chk_multiband[3] = c0.should_subdivide | ((uint32_t)c0.needs_clip << 8) | ((uint32_t)c0.persp_strips << 16);
+        hw_asm_chk_multiband[4] = qa;
+        hw_asm_chk_multiband[5] = saturn_hw_wall_quads - q0;
+        hw_asm_chk_multiband[6] = diff;
+    }
+}
+#define HW_MULTIBAND HW_MultiBandCheck
+#elif HW_ASM_MULTIBAND
+#define HW_MULTIBAND hw_asm_multiband
+#else
+#define HW_MULTIBAND HW_EmitMultiBandBakedWall
+#endif
+
 static HW_NOINLINE HW_COLD_OS void HW_ClipPortalScales(
     int xa, int xb, int s_A, int s_B)
 {
@@ -2355,7 +2454,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitSubdividedBakedSeg(
         ctx->rem_h            = (int16_t)rem_h;
         ctx->q_xa             = (int16_t)p0->px;
         ctx->q_xb             = (int16_t)p1->px;
-        HW_EmitMultiBandBakedWall(ctx);
+        HW_MULTIBAND(ctx);
     }
 }
 
@@ -2523,7 +2622,7 @@ static HW_WFUSE HW_WFUSE_O2 void HW_EmitMonolithicBakedSeg(
         ctx->rem_h            = (int16_t)rem_h;
         ctx->q_xa             = (int16_t)q_xa;
         ctx->q_xb             = (int16_t)q_xb;
-        HW_EmitMultiBandBakedWall(ctx);
+        HW_MULTIBAND(ctx);
     }
 }
 
@@ -3474,7 +3573,7 @@ static const void *const hw_asm_em_ctx[20] = {
     NULL,
 #endif
     &saturn_wall_subdivision, (const void *)HW_ModNonPow2, (const void *)HW_WallXYClamp_Slow,
-    hw_wall_coord_tmp, (const void *)HW_EmitSubdividedBakedSeg, (const void *)HW_EmitMultiBandBakedWall,
+    hw_wall_coord_tmp, (const void *)HW_EmitSubdividedBakedSeg, (const void *)HW_MULTIBAND,
     hw_wall_lod                                     /* [19] strip-LOD tuning table */
 };
 #endif

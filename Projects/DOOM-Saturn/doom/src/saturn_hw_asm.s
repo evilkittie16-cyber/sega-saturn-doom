@@ -7157,3 +7157,421 @@ _hw_asm_flatsub:
 .Lfj_t3:
 	rts
 	nop
+
+! ---------------------------------------------------------------------------
+! Compact rewrite stage H: hw_asm_multiband(ctx) = HW_EmitMultiBandBakedWall.
+! r14 ctx, r11 ctx+64, r13 cur_v, r12 rem_h, r9/r10 ya0/yb0 (raw, carried),
+! r8 band_h. dz_top is derived as dz_end + (rem_h << 16).
+! frame: @0 s_A @4 s_B @8 cy @12 last bot_overlap @16 dz_end @20 cmd_size_hi
+!        @24 tw_stride @28 mono_base_srca @32 cmd_header1 @36 top_overlap @40 th
+! hw_asm_multiband_ctx: [0] hw_wall_coord_tmp [4] ExtrapolateMonoWallY
+!        [8] WallXYClamp_Slow [12] Strips_Linear [16] Strips_Persp [20] EmitUserClip
+	.align	2
+	.global	_hw_asm_multiband
+_hw_asm_multiband:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-44,r15
+	mov	r4,r14
+	mov	r4,r11
+	add	#64,r11
+	mov.l	@(40,r14),r0		! p0
+	mov.l	@(8,r0),r1		! s_A
+	mov.l	@(44,r14),r0		! p1
+	mov.l	@(8,r0),r2		! s_B
+	mov.l	r1,@r15
+	mov.l	.Lmb_cy,r0
+	mov.l	r2,@(4,r15)
+	mov.l	@r0,r0
+	mov.l	r0,@(8,r15)
+! bot_overlap of the last band: UPPER ? (wall_h <= 16 ? 0 : 2) : 1
+	mov.l	@(48,r14),r0		! seg
+	mov.b	@(3,r0),r0		! seg->flags
+	tst	#2,r0
+	bt/s	.Lmb_bo
+	mov	#1,r1
+	mov.w	@(28,r14),r0		! wall_h
+	mov	#16,r2
+	cmp/gt	r2,r0
+	movt	r1
+	add	r1,r1
+.Lmb_bo:
+	mov.l	r1,@(12,r15)
+	mov.w	@(20,r11),r0		! rem_h
+	mov	r0,r12
+	mov.w	@(30,r14),r0		! cur_v
+	mov	r0,r13
+	mov.l	@(52,r14),r1		! dz_top
+	mov	r12,r2
+	shll16	r2
+	sub	r2,r1
+	mov.l	r1,@(16,r15)		! dz_end
+	mov.w	@(16,r11),r0		! mono_tw
+	shar	r0
+	shar	r0
+	shar	r0
+	mov.l	r0,@(24,r15)		! tw_stride
+	shll8	r0
+	mov.l	r0,@(20,r15)		! cmd_size_hi
+	mov.w	@(18,r11),r0		! mono_base_srca
+	extu.w	r0,r0
+	mov.l	r0,@(28,r15)
+	mov.l	@(40,r11),r0		! cmd_header1
+	mov.l	r0,@(32,r15)
+	mov.b	@(5,r14),r0		! top_overlap
+	extu.b	r0,r0
+	mov.l	r0,@(36,r15)
+	mov.w	@(26,r14),r0		! th
+	mov.l	r0,@(40,r15)
+	mov.w	@(16,r14),r0		! ya0
+	mov	r0,r9
+	mov.w	@(20,r14),r0		! yb0
+	mov	r0,r10
+! !should_subdivide && !needs_clip && last_clip_x0 != -1: full-view user clip
+	mov.w	@r11,r0
+	tst	r0,r0
+	bf	.Lmb_go
+	mov.w	@(12,r11),r0		! last_clip_x0
+	cmp/eq	#-1,r0
+	bt	.Lmb_go
+	mov	#0,r4
+	mov	#0,r5
+	mov.w	.Lmb_k319,r6
+	mov.l	.Lmb_vh,r7
+	mov.l	@r7,r7
+	mov.l	.Lmb_ctx,r0
+	mov.l	@(20,r0),r0		! HW_EmitUserClip
+	jsr	@r0
+	add	#-1,r7
+	mov	#-1,r0
+	mov.w	r0,@(12,r11)
+	mov.w	r0,@(14,r11)
+.Lmb_go:
+	cmp/pl	r12
+	bf	.Lmb_done
+.Lmb_loop:
+! band_h = th > 0 ? th - cur_v : rem_h; > rem_h or <= 0 -> rem_h; cap 255
+	mov.l	@(40,r15),r1
+	mov	r12,r8
+	cmp/pl	r1
+	bf	.Lmb_bh1
+	mov	r1,r0
+	sub	r13,r0
+	cmp/gt	r12,r0
+	bt	.Lmb_bh1
+	cmp/pl	r0
+	bf	.Lmb_bh1
+	mov	r0,r8
+.Lmb_bh1:
+	mov	#-1,r0
+	extu.b	r0,r0
+	cmp/gt	r0,r8
+	bf	.Lmb_bh2
+	mov	r0,r8
+.Lmb_bh2:
+	mov	r12,r2
+	sub	r8,r2
+	shll16	r2
+	mov.l	@(16,r15),r0
+	add	r0,r2			! dz_bot
+	mov.l	@r15,r0
+	dmuls.l	r2,r0			! dz_bot * s_A
+	mov.l	@(4,r15),r1
+	mov.l	@(8,r15),r4		! cy
+	mov	r9,r3			! ya0
+	sts	mach,r0
+	dmuls.l	r2,r1			! dz_bot * s_B
+	mov	r4,r9
+	sub	r0,r9			! raw_ya1
+	mov	r10,r5			! yb0
+	cmp/gt	r8,r12			! rem_h > band_h: not the last band
+	bt/s	.Lmb_bo0
+	mov	#0,r1
+	mov.l	@(12,r15),r1
+.Lmb_bo0:
+	sts	mach,r0
+	mov	r4,r10
+	sub	r0,r10			! raw_yb1
+	mov	r9,r6
+	add	r1,r6			! ya1
+	mov	r10,r7
+	add	r1,r7			! yb1
+	mov.b	@r11,r0			! should_subdivide
+	tst	r0,r0
+	bf	.Lmb_sub
+! visible: (ya0 < ya1 || yb0 < yb1) && !(both <= ytop_min) && !(both >= ybot_max)
+	cmp/gt	r3,r6
+	bt	.Lmb_v1
+	cmp/gt	r5,r7
+	bf	.Lmb_next
+.Lmb_v1:
+	mov.w	@(12,r14),r0		! ytop_min
+	cmp/gt	r0,r6
+	bt	.Lmb_v2
+	cmp/gt	r0,r7
+	bf	.Lmb_next
+.Lmb_v2:
+	mov.w	@(14,r14),r0		! ybot_max
+	cmp/ge	r0,r3
+	bf	.Lmb_v3
+	cmp/ge	r0,r5
+	bt	.Lmb_next
+.Lmb_v3:
+	mov.w	@(22,r11),r0		! q_xa
+	mov	r0,r1
+	mov.w	@(24,r11),r0		! q_xb
+	mov	r0,r2
+	mov.b	@(1,r11),r0		! needs_clip
+	tst	r0,r0
+	bf	.Lmb_ext
+.Lmb_clamp:
+! HW_WALL_XYCLAMP fast test
+	mov.w	.Lmb_k500,r0
+	mov	r1,r4
+	add	r0,r4
+	sub	r2,r0
+	or	r0,r4
+	mov	r6,r0
+	sub	r3,r0
+	or	r0,r4
+	mov	r7,r0
+	sub	r5,r0
+	or	r0,r4
+	mov.w	.Lmb_k1023,r0
+	cmp/hi	r0,r4
+	bt	.Lmb_slow
+	mov.w	.Lmb_k1024,r0
+	mov	r3,r4
+	add	r0,r4
+	add	r0,r5
+	or	r5,r4
+	sub	r0,r5
+	add	r0,r6
+	or	r6,r4
+	sub	r0,r6
+	add	r0,r7
+	or	r7,r4
+	sub	r0,r7
+	mov.w	.Lmb_k2047,r0
+	cmp/hi	r0,r4
+	bt	.Lmb_slow
+.Lmb_emit:
+! pack the vertex words: r3 = A0, r5 = B0, r7 = B1, r6 = A1
+	shll16	r1
+	shll16	r2
+	extu.w	r3,r3
+	or	r1,r3
+	extu.w	r5,r5
+	or	r2,r5
+	extu.w	r7,r7
+	or	r2,r7
+	extu.w	r6,r6
+	or	r1,r6
+	mov.l	.Lmb_mcnt,r4
+	mov.w	@r4,r0
+	mov.w	.Lmb_k1279,r1
+	extu.w	r0,r0
+	cmp/hs	r1,r0
+	bt	.Lmb_drop
+	mov	r0,r1
+	add	#1,r1
+	mov.w	r1,@r4
+	shll2	r0
+	shll2	r0
+	mov.l	.Lmb_cmdm,r1
+	shll	r0
+	mov.l	@r1,r1
+	mov.l	@(24,r15),r2		! tw_stride
+	add	r0,r1			! cmd
+	mul.l	r13,r2			! cur_v * tw_stride
+	mov.l	.Lmb_k20000,r0
+	mov.l	r0,@r1
+	mov.l	@(32,r15),r0		! cmd_header1
+	mov.l	@(28,r15),r2		! mono_base_srca
+	mov.l	r0,@(4,r1)
+	sts	macl,r0
+	add	r2,r0
+	mov.l	@(20,r15),r2		! cmd_size_hi
+	shll16	r0
+	or	r2,r0
+	or	r8,r0			! rows = band_h (1..255)
+	mov.l	r0,@(8,r1)
+	mov.l	.Lmb_cells,r2
+	mov.l	@r2,r0
+	mov.l	r3,@(12,r1)
+	add	#1,r0
+	mov.l	.Lmb_quads,r4
+	mov.l	r0,@r2
+	mov.l	@r4,r0
+	mov.l	r5,@(16,r1)
+	add	#1,r0
+	mov.l	r0,@r4
+	mov	#0,r0
+	mov.l	r7,@(20,r1)
+	mov.l	r6,@(24,r1)
+	mov.l	r0,@(28,r1)
+.Lmb_next:
+	sub	r8,r12			! rem_h -= band_h
+	mov.l	@(40,r15),r1		! th
+	add	r8,r13
+	cmp/pl	r1
+	bf	.Lmb_cv0
+	cmp/gt	r13,r1			! cur_v + band_h < th
+	bt	.Lmb_cv1
+.Lmb_cv0:
+	mov	#0,r13
+.Lmb_cv1:
+	cmp/pl	r12
+	bt	.Lmb_loop
+.Lmb_done:
+	add	#44,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+	.align	2
+.Lmb_k319:	.word	319
+.Lmb_k500:	.word	500
+.Lmb_k1023:	.word	1023
+.Lmb_k1024:	.word	1024
+.Lmb_k2047:	.word	2047
+.Lmb_k1279:	.word	1279
+.Lmb_cy:	.long	_saturn_view_cy
+.Lmb_vh:	.long	_saturn_view_h
+.Lmb_ctx:	.long	_hw_asm_multiband_ctx
+.Lmb_mcnt:	.long	_saturn_cmd_m_count
+.Lmb_cmdm:	.long	_saturn_cmd_m
+.Lmb_cells:	.long	_saturn_v1w_cells
+.Lmb_quads:	.long	_saturn_hw_wall_quads
+.Lmb_k20000:	.long	0x00020000
+
+
+! subdivided band: publish the band to ctx, run the strip emitter
+.Lmb_sub:
+	mov	r12,r2
+	shll16	r2
+	mov.l	@(16,r15),r0
+	add	r0,r2			! dz_top
+	mov.l	r2,@(52,r14)
+	mov	r8,r0
+	shll16	r0
+	sub	r0,r2
+	mov.l	r2,@(56,r14)		! dz_bot
+	mov.l	@(36,r15),r0
+	mov.b	r0,@(5,r14)		! top_overlap
+	mov	#0,r0
+	mov.l	r0,@(36,r15)
+	mov	r1,r0
+	mov.b	r0,@(6,r14)		! bot_overlap
+	mov	r3,r0
+	mov.w	r0,@(16,r14)		! ya0
+	mov	r6,r0
+	mov.w	r0,@(18,r14)		! ya1
+	mov	r5,r0
+	mov.w	r0,@(20,r14)		! yb0
+	mov	r7,r0
+	mov.w	r0,@(22,r14)		! yb1
+	mov	r13,r0
+	mov.w	r0,@(30,r14)		! cur_v
+	mov	r8,r0
+	mov.w	r0,@(26,r11)		! rows
+	mov.l	@(32,r11),r6		! u_span
+	cmp/pl	r6
+	bf	.Lmb_next
+	mov.l	@(28,r11),r5		! u_start
+	add	r5,r6
+	add	#-1,r6
+	shar	r5
+	shar	r6
+	shar	r5
+	shar	r6
+	shar	r5
+	shar	r6
+	shar	r5
+	shar	r6
+	mov.b	@(2,r11),r0		! persp_strips
+	mov.l	.Lmb_ctx2,r1
+	tst	r0,r0
+	bt/s	.Lmb_s1
+	mov.l	@(12,r1),r2		! Strips_Linear
+	mov.l	@(16,r1),r2		! Strips_Persp
+.Lmb_s1:
+	jsr	@r2
+	mov	r14,r4
+	bra	.Lmb_next
+	nop
+
+! cold: extrapolate clipped mono wall Y, then the clamp test
+.Lmb_ext:
+	mov.l	.Lmb_ctx2,r0
+	mov.l	@r0,r4
+	mov.l	r1,@r4
+	mov.l	r2,@(4,r4)
+	mov.l	r3,@(8,r4)
+	mov.l	r5,@(12,r4)
+	mov.l	r6,@(16,r4)
+	mov.l	r7,@(20,r4)
+	mov	r4,r5
+	mov.l	@(4,r0),r0
+	jsr	@r0
+	mov	r14,r4
+	mov.l	.Lmb_ctx2,r0
+	mov.l	@r0,r4
+	mov.l	@r4,r1
+	mov.l	@(4,r4),r2
+	mov.l	@(8,r4),r3
+	mov.l	@(12,r4),r5
+	mov.l	@(16,r4),r6
+	bra	.Lmb_clamp
+	mov.l	@(20,r4),r7
+
+! cold: out-of-range coords -> HW_WallXYClamp_Slow(hw_wall_coord_tmp)
+.Lmb_slow:
+	mov.l	.Lmb_ctx2,r0
+	mov.l	@r0,r4
+	mov.l	r1,@r4
+	mov.l	r2,@(4,r4)
+	mov.l	r3,@(8,r4)
+	mov.l	r5,@(12,r4)
+	mov.l	r6,@(16,r4)
+	mov.l	r7,@(20,r4)
+	mov.l	@(8,r0),r0
+	jsr	@r0
+	nop
+	mov.l	.Lmb_ctx2,r0
+	mov.l	@r0,r4
+	mov.l	@r4,r1
+	mov.l	@(4,r4),r2
+	mov.l	@(8,r4),r3
+	mov.l	@(12,r4),r5
+	mov.l	@(16,r4),r6
+	bra	.Lmb_emit
+	mov.l	@(20,r4),r7
+
+! cold: command table full
+.Lmb_drop:
+	mov.l	.Lmb_dropp,r1
+	mov.l	@r1,r0
+	add	#1,r0
+	mov.l	r0,@r1
+	mov.l	.Lmb_capt,r1
+	mov	#1,r0
+	bra	.Lmb_next
+	mov.l	r0,@r1
+
+	.align	2
+.Lmb_ctx2:	.long	_hw_asm_multiband_ctx
+.Lmb_dropp:	.long	_saturn_v1w_drop
+.Lmb_capt:	.long	_saturn_v1w_captured
