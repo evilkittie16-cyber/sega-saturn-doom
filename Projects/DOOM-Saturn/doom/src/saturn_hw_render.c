@@ -167,6 +167,13 @@ const void *const hw_asm_sub_ctx[21] = {
 #if HW_ASM
 const void *const hw_asm_sub_ctx[1] = { 0 };   /* asm stays linked, unused */
 #endif
+#ifndef HW_SSMAP_DBG
+#define HW_SSMAP_DBG 0
+#endif
+#if HW_SSMAP_DBG
+volatile uint8_t hw_ssmap_dbg[256];
+volatile uint8_t hw_ssmap_last[256];   /* copy of the last complete frame */
+#endif
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
                                                          unsigned int *sp_parts)
 {
@@ -238,6 +245,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
         o->ytop_min = ap->cur_ytop_min;
         o->ybot_max = ap->cur_ybot_max;
     }
+#endif
+#if HW_SSMAP_DBG
+    /* debug (-DHW_SSMAP_DBG=1): [0..127] leaves reached, [128..255] leaves
+     * rendered, bitmaps; cleared at frame start */
+    hw_ssmap_dbg[subnum >> 3] |= (uint8_t)(1u << (subnum & 7));
+    if (flat_flags >= 0)
+        hw_ssmap_dbg[128 + (subnum >> 3)] |= (uint8_t)(1u << (subnum & 7));
 #endif
     if (flat_flags < 0)
     {
@@ -384,7 +398,8 @@ volatile int32_t hw_far_cull = HW_FAR_Z_UNITS << 12;
  * the other 10 tour views neither change nor gain), then coarsen the wall
  * strip LOD (m1a, where distance does not help: +0.5..0.7 FPS).
  * hw_ad_mode (cache-through, pokeable): 1 adaptive, 0 off (full detail). */
-volatile int32_t hw_ad_mode = 1;
+volatile int32_t hw_ad_mode = 0;   /* default DETAIL: FULL (user, 2026-11-20: the distance cut
+                                    * visibly removes far geometry, e.g. E1M8 over the low fence) */
 int saturn_hw_detail_level = 0;                 /* HUD */
 unsigned int saturn_hw_ad_avg = 0, saturn_hw_ad_last = 0;   /* debug: frame ticks (avg, last) */
 static const int16_t hw_ad_far[]   = { 16384, 2048, 1536, 1280, 1280, 1280 };
@@ -933,6 +948,38 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             s_out->has_things = (uint8_t)(s_in->thinglist != NULL);
             s_out->light_delta = (int16_t)(HW_SecLight16(s_in->lightlevel) - (int)hw_sec_light0[i]);
         }
+        if (hw_sec_nb)
+        {
+            /* sky sectors: highest drawable point from the current heights
+             * (lower-wall tops = higher neighbour floors; an upper wall to a
+             * lower non-sky ceiling, a one-sided/masked wall or things in the
+             * sector reach the ceiling) */
+            for (int i = 0; i < n_ap_sec; i++)
+            {
+                const hw_sec_fast_t *sf = &hw_sec_fast[i];
+                if (!sf->is_sky)
+                    continue;
+                fixed_t top = sf->dz_ceil;
+                if (hw_sec_ztop[i] != HW_SEC_ZTOP_CEIL && !sf->has_things)
+                {
+                    top = sf->dz_floor;
+                    for (int k = hw_sec_nb_first[i], e = hw_sec_nb_first[i + 1]; k < e; k++)
+                    {
+                        const hw_sec_fast_t *bf = &hw_sec_fast[hw_sec_nb[k]];
+                        if (!bf->is_sky && bf->dz_ceil < sf->dz_ceil)
+                        {
+                            top = sf->dz_ceil;
+                            break;
+                        }
+                        if (bf->dz_floor > top)
+                            top = bf->dz_floor;
+                    }
+                    if (top > sf->dz_ceil)
+                        top = sf->dz_ceil;
+                }
+                hw_sec_dz_top[i] = top;
+            }
+        }
         hw_psec_fast = (hw_psec && (unsigned)(hw_psec - sectors) < HW_MAX_AP_SECTORS)
                      ? &hw_sec_fast[hw_psec - sectors]
                      : NULL;
@@ -959,6 +1006,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     if (hw_render_frame == 0)
         hw_render_frame = 1;
     hw_ad_rendered = 1;             /* adaptive detail: a 3D frame */
+#if HW_SSMAP_DBG
+    for (int i = 0; i < 256; i++) { hw_ssmap_last[i] = hw_ssmap_dbg[i]; hw_ssmap_dbg[i] = 0; }
+#endif
     hw_fc = &hw_fsc_none;       /* per-frame sector cache: nothing active, */
     if (++hw_fsc_gen == 0)      /* every slot invalid */
         hw_fsc_gen = 1;

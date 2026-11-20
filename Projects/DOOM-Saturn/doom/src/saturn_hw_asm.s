@@ -5339,14 +5339,35 @@ _hw_asm_subsec:
 	add	r3,r0
 	cmp/gt	r5,r0
 	bf	.Lv_evcull
+	mov.l	@r9,r1			! dz_ceil
 	mov.b	@(12,r9),r0
 	tst	r0,r0
-	bf	.Lv_evret
-	mov.l	@r9,r1			! dz_ceil
+	bf	.Lv_sky			! sky: project the content top instead
 	cmp/pl	r1
 	bf	.Lv_s3
 	bra	.Lv_s4
 	mov	r7,r0			! sub_y_min = yc_min
+.Lv_sky:				! r1 = hw_sec_dz_top[sf - hw_sec_fast] if built
+	mov.l	.Lv_ctx,r0
+	mov.l	@(40,r0),r2		! hw_sec_fast
+	mov.l	@(44,r0),r0
+	mov.l	@r0,r0			! hw_sec_dz_top
+	tst	r0,r0
+	bt	.Lv_s3
+	mov	r9,r1
+	sub	r2,r1			! secnum * 16
+	shlr2	r1			! secnum * 4
+	mov.l	@(r0,r1),r1
+	mov.l	@(4,r9),r2		! dz_floor
+	cmp/eq	r1,r2
+	bf	.Lv_skp			! something rises above the floor
+	cmp/pl	r2
+	bf	.Lv_skp			! floor at/below the eye: visible from above
+	mov.l	@r9,r0
+	cmp/gt	r2,r0
+	bt	.Lv_evcull		! open sector, floor above the eye, nothing higher
+.Lv_skp:
+	mov	#0,r3			! exact map heights: no pad
 .Lv_s3:
 	cmp/pz	r1
 	bf/s	.Lv_s3b

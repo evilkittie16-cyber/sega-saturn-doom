@@ -230,6 +230,9 @@ __attribute__((optimize("Os")))
 #endif
 void Saturn_HW_RenderInit(void)
 {
+    hw_sec_nb_first = NULL;     /* previous level's PU_LEVEL lists are gone */
+    hw_sec_nb = NULL;
+    hw_sec_dz_top = NULL;
     Saturn_CmdBuf_Init();
     Saturn_Vdp1_ClearPages();
 
@@ -497,6 +500,78 @@ void Saturn_HW_RenderInit(void)
             }
             if (!changed)
                 break;
+        }
+        /* HW_BuildSecContentTop: highest drawable point per sector */
+        if (!hw_sec_ztop)
+        {
+            extern byte *I_AllocHigh(int length);
+            byte *mem = I_AllocHigh(HW_MAX_AP_SECTORS * (int)(sizeof(int16_t) + sizeof(int32_t)));
+            if (mem)
+            {
+                hw_sec_dz_mem = (int32_t *)mem;
+                hw_sec_ztop = (int16_t *)(mem + HW_MAX_AP_SECTORS * sizeof(int32_t));
+            }
+        }
+        /* Static part only: HW_SEC_ZTOP_CEIL for sectors with a one-sided or
+         * masked wall (always reach the ceiling), else 0 plus the list of
+         * two-sided neighbours (PU_LEVEL); the top itself is evaluated per
+         * frame from the current heights (saturn_hw_render.c), so lifts,
+         * doors and stairs need no special case. */
+        if (hw_sec_ztop)
+        {
+            int n_sec = (numsectors < HW_MAX_AP_SECTORS) ? numsectors : HW_MAX_AP_SECTORS;
+            uint16_t *first = (uint16_t *)Z_Malloc((HW_MAX_AP_SECTORS + 1) * (int)sizeof(uint16_t), PU_LEVEL);
+            for (int s = 0; s <= HW_MAX_AP_SECTORS; s++)
+                first[s] = 0;
+            for (int s = 0; s < HW_MAX_AP_SECTORS; s++)
+                hw_sec_ztop[s] = (s < n_sec) ? 0 : (int16_t)HW_SEC_ZTOP_CEIL;
+            /* pass 0 counts, pass 1 fills */
+            uint8_t *nb = NULL;
+            for (int pass = 0; pass < 2; pass++)
+            {
+                uint16_t fill[1];   /* unused in pass 0 */
+                (void)fill;
+                for (int l = 0; l < numlines; l++)
+                {
+                    for (int side = 0; side < 2; side++)
+                    {
+                        int sn = lines[l].sidenum[side];
+                        if ((unsigned)sn >= (unsigned)numsides)
+                            continue;
+                        int f = sides[sn].sector;
+                        if ((unsigned)f >= (unsigned)n_sec)
+                            continue;
+                        int on = lines[l].sidenum[side ^ 1];
+                        int b = ((unsigned)on < (unsigned)numsides) ? sides[on].sector : -1;
+                        if (pass == 0)
+                        {
+                            if (b < 0 || (unsigned)b >= (unsigned)n_sec || sides[sn].midtexture)
+                                hw_sec_ztop[f] = (int16_t)HW_SEC_ZTOP_CEIL;
+                            else
+                                first[f + 1]++;
+                        }
+                        else if (b >= 0 && (unsigned)b < (unsigned)n_sec && !sides[sn].midtexture)
+                        {
+                            nb[first[f]++] = (uint8_t)b;
+                        }
+                    }
+                }
+                if (pass == 0)
+                {
+                    for (int s = 0; s < HW_MAX_AP_SECTORS; s++)
+                        first[s + 1] = (uint16_t)(first[s + 1] + first[s]);
+                    nb = (uint8_t *)Z_Malloc(first[HW_MAX_AP_SECTORS] + 4, PU_LEVEL);
+                }
+            }
+            /* pass 1 advanced first[s] to the end of list s: shift back */
+            for (int s = HW_MAX_AP_SECTORS; s > 0; s--)
+                first[s] = first[s - 1];
+            first[0] = 0;
+            hw_sec_nb_first = first;
+            hw_sec_nb = nb;
+            for (int s = 0; s < HW_MAX_AP_SECTORS; s++)
+                hw_sec_dz_mem[s] = 0x7FFFFFFF;      /* filled per frame before any use */
+            hw_sec_dz_top = hw_sec_dz_mem;
         }
         hw_portal_seg_t *portal_segs = HW_PORTAL_SEGS;
         int p_total = 0;

@@ -389,6 +389,18 @@ static_assert(sizeof(hw_sec_fast_t) == 16,
 static HW_ALIGN16 hw_aperture_state_t hw_aperture_state;
 static HW_ALIGN16 hw_ap_word_t hw_ap_words[HW_SOLID_WORDS];
 static HW_ALIGN16 hw_sec_fast_t hw_sec_fast[HW_MAX_AP_SECTORS];
+/* Height-aware culling (2026-11-20): per sector the highest point anything
+ * in it can be drawn, in world units (HW_SEC_ZTOP_CEIL = use the ceiling:
+ * one-sided/upper/masked walls, moving sectors). Built per level in
+ * saturn_hw_sky.c; hw_sec_dz_top = that minus viewz per frame (dz_ceil when
+ * the sector holds things). Used for sky sectors, whose ceiling is not
+ * drawn. Jo heap (BSS is at its 0x060C0000 ceiling). */
+#define HW_SEC_ZTOP_CEIL 0x7FFF
+static int16_t *hw_sec_ztop;
+static int32_t *hw_sec_dz_top;            /* published (non-NULL) only while the lists are valid */
+static int32_t *hw_sec_dz_mem;
+static const uint16_t *hw_sec_nb_first;   /* PU_LEVEL: neighbour list offsets, [s]..[s+1] */
+static const uint8_t  *hw_sec_nb;         /* PU_LEVEL: two-sided neighbour sectors */
 extern uint32_t hw_wram_h_sub_flat_info[HW_MAX_AP_SUBSECTORS * 4];
 extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_WRAM_L_SCRATCH ((hw_wram_l_scratch_t *)SATURN_WRAM_L_PILLARS_ADDR)

@@ -336,7 +336,10 @@ int Saturn_Bench_Step(void)
     if (saturn_map != bench_map)
     {
         bench_built = 0;
-        Saturn_WarpToLevel(1, bench_map);
+#ifndef BENCH_HOLD_EP
+#define BENCH_HOLD_EP 1     /* -DBENCH_HOLD_EP=3 for E3Mx (retail WAD) */
+#endif
+        Saturn_WarpToLevel(BENCH_HOLD_EP, bench_map);
         return 1;
     }
     if (!bench_built)

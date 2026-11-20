@@ -4647,12 +4647,29 @@ static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) int HW_EvalSubsectorFlatApe
             : HW_ProjY(dzf, (dzf <= 0) ? s_max : s_min, vcy);
         if (sub_y_max + pad <= ytop_min)
             return -1;
-        if (!is_sky)
+        /* Height-aware (2026-11-20): sky sectors too. Their walls and
+         * things still end at the ceiling height; the sky above it is the
+         * VDP2 back layer, drawn whether or not this subsector is. Without
+         * this, outdoor areas seen over a low wall (E1M8, E1M1 courtyard)
+         * were walked and drawn although hidden below the window. */
         {
-            int sub_y_min = (dzc > 0)
+            /* sky: the ceiling is not drawn, so the top of what can be
+             * drawn is the content top (saturn_hw_sky.c HW_BuildSecContentTop) */
+            fixed_t dzt = dzc;
+            int pad_t = pad;
+            if (is_sky && hw_sec_dz_top)
+            {
+                dzt = hw_sec_dz_top[sf - hw_sec_fast];
+                /* open sector, floor above the eye, nothing higher: nothing
+                 * in it can be seen (floors only show from above) */
+                if (dzt == sf->dz_floor && dzt > 0 && sf->dz_ceil > sf->dz_floor)
+                    return -1;
+                pad_t = 0;      /* exact map heights (lower-wall tops) */
+            }
+            int sub_y_min = (dzc > 0 && !is_sky)
                 ? yc_min
-                : HW_ProjY(dzc, (dzc >= 0) ? s_max : s_min, vcy);
-            if (sub_y_min - pad >= ybot_max)
+                : HW_ProjY(dzt, (dzt >= 0) ? s_max : s_min, vcy);
+            if (sub_y_min - pad_t >= ybot_max)
                 return -1;
         }
     }
@@ -4854,11 +4871,12 @@ _Static_assert(sizeof(saturn_flat_bbox_t) == 8 && offsetof(hw_sec_fast_t, is_sky
                HW_FLAT_CHECK_AP == 0x100 && HW_FLAT_NEAR_OR_PSEC == 0x200 &&
                (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK) == 0x13 && HW_FLAT_ALLOW_BOTH == 12,
                "hw_asm_subsec: layout");
-const void *const hw_asm_subsec_ctx[10] = {
+const void *const hw_asm_subsec_ctx[12] = {
     &saturn_baked_flat_bboxes, &hw_aperture_state, &saturn_view_h, &saturn_view_cy,
     hw_asm_subap_ctx, &hw_psec_fast, saturn_master_oclut,
     (const void *)HW_CheckNearSubsectorFrustum, (const void *)HW_EvalSubsectorSpanSlow,
-    (const void *)HW_CheckPortalSubsectorStepCull
+    (const void *)HW_CheckPortalSubsectorStepCull,
+    hw_sec_fast, &hw_sec_dz_top                     /* [40] [44] sky content top */
 };
 #if HW_ASM_CHECK
 /* [0] calls [1] mismatches [2] subnum [3] C result [4] asm result
