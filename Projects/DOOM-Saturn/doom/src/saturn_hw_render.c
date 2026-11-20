@@ -847,7 +847,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     hw_render_frame++;
     if (hw_render_frame == 0)
         hw_render_frame = 1;
-    hw_flat_sec_cache.sec = NULL;
+    hw_fc = &hw_fsc_none;       /* per-frame sector cache: nothing active, */
+    if (++hw_fsc_gen == 0)      /* every slot invalid */
+        hw_fsc_gen = 1;
     hw_submax_tot = 0;
     hw_submax_num = -1;
     hw_prof_segs_acc = 0;

@@ -3354,12 +3354,33 @@ HW_ALWAYS_INLINE uint32_t HW_WarpJobBits(int subnum, int use_lod1, const sector_
     return (ff << 24) | (cf << 16);
 }
 
-static hw_flat_sec_cache_t hw_flat_sec_cache = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
 static void HW_RenderSubsectorBakedFlats(int sub_idx, int subnum, sector_t *sec, int fully_inside);
+
+/* Per-frame sector cache (2026-11-20). Walk order alternates sectors (p2:
+ * 37 flat jobs, 25 refills per frame with a one-entry cache), so a refill
+ * used to recompute a sector already seen this frame - including its
+ * alternate-pyramid packs (HW_FlatAltPack). Now a 32-way direct-mapped
+ * store; hw_fc points at the active entry (the asm reads it through
+ * hw_asm_flatsub_ctx[2] = &hw_fc). A miss repoints hw_fc at a slot this
+ * frame already built, else fills the slot. Frame start points hw_fc at an
+ * empty entry and bumps hw_fsc_gen, which invalidates every slot. */
+#define HW_FSC_WAYS 32
+static hw_flat_sec_cache_t hw_fsc_store[HW_FSC_WAYS];
+static uint32_t            hw_fsc_frame[HW_FSC_WAYS];
+static uint32_t            hw_fsc_gen = 1;   /* ++ at each frame start (saturn_hw_render.c); never 0 */
+static hw_flat_sec_cache_t hw_fsc_none;      /* sec NULL: matches nothing */
+static hw_flat_sec_cache_t *hw_fc = &hw_fsc_none;
+#define hw_flat_sec_cache (*hw_fc)
 
 static HW_NOINLINE HW_HOT_O2 void HW_CacheFlatSectorInfo(const sector_t *sec)
 {
+    {
+        unsigned k = (unsigned)(sec - sectors) & (HW_FSC_WAYS - 1);
+        hw_fc = &hw_fsc_store[k];
+        if (hw_fsc_frame[k] == hw_fsc_gen && hw_fc->sec == sec)
+            return;                 /* built earlier this frame */
+        hw_fsc_frame[k] = hw_fsc_gen;
+    }
     const fixed_t vz = hw_viewz;
     int is_sky     = ((int16_t)sec->ceilingpic == -1);
     int emit_ceil  = (vz < sec->ceilingheight && !is_sky);
@@ -3592,9 +3613,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     if (q_count <= 0 || v_count <= 0)
         return;
 
-    hw_flat_sec_cache_t *fc = &hw_flat_sec_cache;
-    if (__builtin_expect(sec != fc->sec, 0))
-        HW_CacheFlatSectorInfo(sec);
+    if (__builtin_expect(sec != hw_fc->sec, 0))
+        HW_CacheFlatSectorInfo(sec);        /* repoints hw_fc */
+    hw_flat_sec_cache_t *fc = hw_fc;
 
     uint32_t u_flags = (uint32_t)fully_inside;
     uint32_t allow_sky  = (u_flags >> 3) & 1u;
@@ -3702,7 +3723,7 @@ static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, in
  * [32] solid count [33] solid summary [34] solid mask [35] solid any
  * [36] steal snaps [37] HW_CacheFlatSectorInfo [38] HW_FlatAltPack */
 const void *const hw_asm_flatsub_ctx[39] = {
-    &saturn_baked_flat_q_count, hw_wram_h_sub_flat_info, &hw_flat_sec_cache, (const void *)HW_SubmitFlatJob_Fallback,
+    &saturn_baked_flat_q_count, hw_wram_h_sub_flat_info, (const void *)&hw_fc, (const void *)HW_SubmitFlatJob_Fallback,
     &saturn_baked_flat_quv, &saturn_baked_flat_subflags, &saturn_baked_flat_bboxes, &hw_cam_x,
     &hw_cam_y, &flattranslation, &numflats, &saturn_baked_flat_sub_chunk,
     &hw_frame_flat_jobs, &saturn_hw_sky_visible, &hw_def_flat_count, &saturn_master_flat_q,
@@ -3730,6 +3751,7 @@ static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, in
 }
 typedef struct {
     hw_flat_sec_cache_t fc;
+    hw_flat_sec_cache_t *fcp;
     hw_steal_snap_t snap;
     uint32_t job[24];
     uint32_t lod_saved, lod1, lod0, def_alt, def_warp, tail, dirty, jtail;
@@ -3739,7 +3761,8 @@ static void HW_FlatSubSave(hw_flatsub_snap_t *s, volatile hw_slave_ipc_t *ipc,
                            volatile aliased_uint32_t *job, unsigned int tail)
 {
     memset(s, 0, sizeof(*s));
-    s->fc = hw_flat_sec_cache;
+    s->fcp = hw_fc;
+    s->fc = *hw_fc;
     s->snap = hw_steal_snap[tail & (HW_STEAL_SNAPS - 1)];
     for (int i = 0; i < 24; i++)
         s->job[i] = job[i];
@@ -3750,7 +3773,8 @@ static void HW_FlatSubSave(hw_flatsub_snap_t *s, volatile hw_slave_ipc_t *ipc,
 }
 static void HW_FlatSubLoad(const hw_flatsub_snap_t *s)
 {
-    hw_flat_sec_cache = s->fc;
+    hw_fc = s->fcp;
+    *hw_fc = s->fc;
     saturn_hw_flat_lod_saved_quads = s->lod_saved; saturn_hw_flat_lod1_subs = s->lod1;
     saturn_hw_flat_lod0_subs = s->lod0; hw_def_alt_pack = s->def_alt; hw_def_warp_bits = s->def_warp;
     hw_master_job_tail = s->tail; hw_slave_dirty_words = s->dirty;

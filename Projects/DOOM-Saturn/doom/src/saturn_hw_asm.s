@@ -6560,7 +6560,8 @@ _hw_asm_flatsub:
 	extu.w	r0,r2			! v_count
 	tst	r2,r2
 	bt	.Lfj_ret
-	mov.l	@(8,r8),r9		! fc
+	mov.l	@(8,r8),r9		! &hw_fc
+	mov.l	@r9,r9			! fc = hw_fc (per-frame sector cache entry)
 	mov.l	@r9,r0
 	cmp/eq	r14,r0
 	bt	.Lfj_hit
@@ -6569,6 +6570,8 @@ _hw_asm_flatsub:
 	mov.l	@(r0,r8),r0		! [37] HW_CacheFlatSectorInfo
 	jsr	@r0
 	mov	r14,r4
+	mov.l	@(8,r8),r9		! the call repointed hw_fc
+	mov.l	@r9,r9
 	mov.w	@(4,r10),r0
 	extu.w	r0,r1			! q_count
 	mov.w	@(6,r10),r0
