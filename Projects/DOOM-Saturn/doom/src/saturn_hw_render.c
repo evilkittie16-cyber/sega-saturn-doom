@@ -299,7 +299,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
 #if HW_V2P_PUNCH
     /* plane floor: erase farther geometry below this subsector's portal
      * floor lines (before its sprites; saturn_hw_walls.c) */
-    if (__builtin_expect(SATURN_V2P_SKIP_FLOOR(&sectors[secnum]), 0))
+    if (__builtin_expect(SATURN_V2P_SKIP_FLOOR(&sectors[secnum]), 0) && HW_V2PlaneWanted(subnum))
         HW_V2PlanePunch(subnum, sf);
 #endif
     HW_SUBPROF_MARK(2);

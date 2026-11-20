@@ -3755,57 +3755,169 @@ static void HW_V2PlaneAddSpan(int sp)
     hw_v2p_n++;
 }
 
+/* Per-level candidate flags (built lazily on the first punch of a level):
+ * which segs can ever need a punch is fixed by the map and the plane's
+ * sector set. Baked seg flag 1 = portal into a non-plane sector (first
+ * entry of its pillar-pair group), 2 = one-sided wall with an endpoint
+ * within HW_V2P_NEAR_U map units of such a portal's endpoint (the
+ * far-strip spill; the screen-span test still applies per frame).
+ * Subsector flag: any candidate. Unbaked portal flag: 1 = punch. */
+#define HW_V2P_NEAR_U  160
+#define HW_V2P_ENDS    256
+static uint8_t    *hw_v2p_segf = NULL;      /* zone (level) memory, read only for flagged subsectors */
+static uint8_t     hw_v2p_portf[HW_MAX_PORTAL_SEGS];
+/* subsector has a candidate (fast RAM bitmap, tested inline by the body;
+ * subsectors past the bitmap always take the call) */
+static uint8_t     hw_v2p_subbits[(HW_MAX_AP_SUBSECTORS + 7) / 8];
+static unsigned    hw_v2p_key_gen = 0xFFFFFFFFu;
+extern unsigned int saturn_level_gen;        /* g_game.c, ++ at every level load */
+
+#define HW_V2P_PLANE_SEC(s) (saturn_vdp2_plane_secmask[(unsigned)(s) & (SATURN_V2P_MAX_SECTORS - 1)])
+
+static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
+{
+    const int nseg = saturn_baked_wall_num_segs, nsub = saturn_baked_wall_num_subsectors;
+    if (hw_v2p_key_gen == saturn_level_gen)
+        return hw_v2p_segf != NULL;
+    hw_v2p_key_gen = saturn_level_gen;
+    D_memset(hw_v2p_subbits, 0, sizeof(hw_v2p_subbits));
+    D_memset(hw_v2p_portf, 0, sizeof(hw_v2p_portf));
+    hw_v2p_segf = (uint8_t *)Z_Malloc(nseg > 0 ? nseg : 1, PU_LEVEL);   /* freed with the level */
+    if (!hw_v2p_segf)
+        return 0;
+    D_memset(hw_v2p_segf, 0, nseg);
+#define HW_V2P_MARK_SUB(s) do { if ((unsigned)(s) < HW_MAX_AP_SUBSECTORS) \
+                                    hw_v2p_subbits[(s) >> 3] |= (uint8_t)(1u << ((s) & 7)); } while (0)
+
+    static int16_t ex[HW_V2P_ENDS], ey[HW_V2P_ENDS];
+    int ne = 0, overflow = 0;
+    for (int s = 0; s < nsub && s < numsubsectors; s++)
+    {
+        if (!HW_V2P_PLANE_SEC(subsectors[s].sector))
+            continue;
+        const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[s];
+        const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
+        int last_key = -1;
+        for (int i = 0; i < (int)ss->num_segs; i++)
+        {
+            const baked_seg_t *seg = &saturn_baked_wall_segs[ss->seg_start + i];
+            int bs = seg->back_sec_idx;
+            int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
+            if (bs < 0 || key == last_key || HW_V2P_PLANE_SEC(bs))
+                continue;
+            last_key = key;
+            hw_v2p_segf[ss->seg_start + i] = 1;
+            HW_V2P_MARK_SUB(s);
+            for (int e = 0; e < 2; e++)
+            {
+                if (ne >= HW_V2P_ENDS) { overflow = 1; break; }
+                ex[ne] = pil[seg->pillar_idx[e]].x;
+                ey[ne] = pil[seg->pillar_idx[e]].z;
+                ne++;
+            }
+        }
+        for (int i = 0; i < (int)ss->portal_count; i++)
+        {
+            int pi = ss->portal_first + i;
+            const hw_portal_seg_t *p = &HW_PORTAL_SEGS[pi];
+            if (pi >= HW_MAX_PORTAL_SEGS || p->back_sec_idx < 0 || HW_V2P_PLANE_SEC(p->back_sec_idx))
+                continue;
+            hw_v2p_portf[pi] = 1;
+            HW_V2P_MARK_SUB(s);
+            if (ne + 2 > HW_V2P_ENDS) { overflow = 1; continue; }
+            ex[ne] = p->x0;          ey[ne] = p->y0;          ne++;
+            ex[ne] = p->x0 + p->dx;  ey[ne] = p->y0 + p->dy;  ne++;
+        }
+    }
+    if (!ne)
+        return 1;
+    for (int s = 0; s < nsub && s < numsubsectors; s++)
+    {
+        if (!HW_V2P_PLANE_SEC(subsectors[s].sector))
+            continue;
+        const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[s];
+        const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
+        int last_key = -1;
+        for (int i = 0; i < (int)ss->num_segs; i++)
+        {
+            const baked_seg_t *seg = &saturn_baked_wall_segs[ss->seg_start + i];
+            int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
+            if (seg->back_sec_idx >= 0 || key == last_key)
+                continue;
+            last_key = key;
+            int near = overflow;            /* endpoint list full: keep every wall */
+            for (int e = 0; e < 2 && !near; e++)
+            {
+                int x = pil[seg->pillar_idx[e]].x, y = pil[seg->pillar_idx[e]].z;
+                for (int k = 0; k < ne; k++)
+                {
+                    int dx = x - ex[k], dy = y - ey[k];
+                    if (dx < 0) dx = -dx;
+                    if (dy < 0) dy = -dy;
+                    if (dx <= HW_V2P_NEAR_U && dy <= HW_V2P_NEAR_U) { near = 1; break; }
+                }
+            }
+            if (near)
+            {
+                hw_v2p_segf[ss->seg_start + i] = 2;
+                HW_V2P_MARK_SUB(s);
+            }
+        }
+    }
+    return 1;
+}
+
 static HW_NOINLINE HW_COLD_OS void HW_V2PlanePunch(int subnum, const hw_sec_fast_t *sf)
 {
     const int dz = sf->dz_floor;
     if (dz >= 0 || !saturn_baked_walls_active || (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
         return;                                 /* eye at/below the floor: plane not seen */
+    if (!hw_v2p_segf)
+        return;
     const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[subnum];
     const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
     const baked_seg_t *seg0 = &saturn_baked_wall_segs[ss->seg_start];
-    const baked_seg_t *seg = seg0;
+    const uint8_t *f0 = &hw_v2p_segf[ss->seg_start];
     /* Far walls are drawn in coalesced strips that spill past a portal's
      * screen edge into columns hidden by solid walls, and below those walls
-     * only the plane floor is left to hide them. So one-sided walls whose
-     * span comes within HW_V2P_SPILL_PX of a portal punched this frame (in
-     * this or an earlier-walked plane subsector) are punched below their
-     * floor line too (they lie above it and were drawn first: they stay
-     * intact). */
+     * only the plane floor is left to hide them. So one-sided walls near a
+     * portal (flag 2) whose span comes within HW_V2P_SPILL_PX of a portal
+     * punched this frame (in this or an earlier-walked plane subsector) are
+     * punched below their floor line too (they lie above it and were drawn
+     * first: they stay intact). */
     if (hw_v2p_frame != (unsigned)hw_render_frame)
     {
         hw_v2p_frame = (unsigned)hw_render_frame;
         hw_v2p_n = 0;
     }
-    int last_key = -1;
-    for (int i = 0; i < (int)ss->num_segs; i++, seg++)
+    int n2 = 0;
+    for (int i = 0; i < (int)ss->num_segs; i++)
     {
-        int bs = seg->back_sec_idx;
-        int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
-        if (bs < 0 || key == last_key || SATURN_V2P_SKIP_FLOOR(&sectors[bs]))
-            continue;
-        last_key = key;
-        HW_V2PlaneAddSpan(HW_V2PlanePunchBaked(pil, seg, dz, 0));
+        if (f0[i] == 1)
+            HW_V2PlaneAddSpan(HW_V2PlanePunchBaked(pil, &seg0[i], dz, 0));
+        else if (f0[i] == 2)
+            n2++;
     }
     const hw_portal_seg_t *p = &HW_PORTAL_SEGS[ss->portal_first];
     for (int i = 0; i < (int)ss->portal_count; i++, p++)
-    {
-        int bs = p->back_sec_idx;
-        if (bs < 0 || SATURN_V2P_SKIP_FLOOR(&sectors[bs]))
-            continue;
-        HW_V2PlaneAddSpan(HW_V2PlanePunchSeg(p->x0, p->y0, p->dx, p->dy, dz));
-    }
-    if (!hw_v2p_n)
+        if (hw_v2p_portf[ss->portal_first + i])
+            HW_V2PlaneAddSpan(HW_V2PlanePunchSeg(p->x0, p->y0, p->dx, p->dy, dz));
+    if (!n2 || !hw_v2p_n)
         return;
-    last_key = -1;
-    seg = seg0;
-    for (int i = 0; i < (int)ss->num_segs; i++, seg++)
-    {
-        int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
-        if (seg->back_sec_idx >= 0 || key == last_key)
-            continue;
-        last_key = key;
-        HW_V2PlanePunchBaked(pil, seg, dz, 1);
-    }
+    for (int i = 0; i < (int)ss->num_segs; i++)
+        if (f0[i] == 2)
+            HW_V2PlanePunchBaked(pil, &seg0[i], dz, 1);
+}
+
+/* Body-side gate: build the level's flags once, then call the punch only
+ * for subsectors that have a candidate. */
+HW_ALWAYS_INLINE int HW_V2PlaneWanted(int subnum)
+{
+    if (__builtin_expect(hw_v2p_key_gen != saturn_level_gen, 0))
+        HW_V2PlaneBuild();
+    if ((unsigned)subnum >= HW_MAX_AP_SUBSECTORS)
+        return hw_v2p_segf != NULL;
+    return (hw_v2p_subbits[subnum >> 3] >> (subnum & 7)) & 1;
 }
 #endif
 

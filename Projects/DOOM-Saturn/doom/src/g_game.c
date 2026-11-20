@@ -94,6 +94,7 @@ volatile unsigned int saturn_init_site = 0;
  * Saturn_G_InitNew. d32xr's g_game.c (not linked) never tracked one —
  * the Jaguar WI screen was cut. */
 int saturn_leveltime = 0;
+unsigned int saturn_level_gen = 0;   /* ++ at every level load */
 
 /* 1 = the next Saturn_G_InitNew is a FRESH GAME start (pistol + 50
  * bullets via P_ResetResp); 0 = a level ADVANCE (the loadout saved by
@@ -147,6 +148,7 @@ void Saturn_G_InitNew(int skill, int episode, int map)
     totalitems  = 0;
     totalsecret = 0;
     saturn_leveltime = 0;
+    saturn_level_gen++;     /* per-level caches (e.g. saturn_hw_walls.c plane punch) rebuild */
 
     /* Level setup with the correct lump name. */
     {
