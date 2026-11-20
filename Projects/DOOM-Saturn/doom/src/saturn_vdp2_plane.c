@@ -519,11 +519,28 @@ void Saturn_VDP2_Plane_VBlank(void)
         /* rebuild the buffer only when the shown slot or its banks changed */
         if (s != v2_dma_slot || v2_slot_gen[s] != v2_dma_gen)
         {
-            const uint8_t *bank = v2_bank[s];
-            for (int k = 0; k < 2 * V2_LINES; k++)
+            /* entry k = bank[k mod V2_LINES] for lines < 224, else 0. The
+             * zero lines never change: write them once; per rebuild only the
+             * 224 bank lines of both fields (was 526 entries with a modulo
+             * each, ~0.55 ms of master time per rendered frame). */
+            static int zeroed = 0;
+            if (!zeroed)
             {
-                unsigned int ln = (unsigned int)k % V2_LINES;
-                v2_light_dma[k] = (ln < 224u) ? bank[ln] : 0u;
+                for (int k = 224; k < V2_LINES; k++)
+                {
+                    v2_light_dma[k] = 0u;
+                    v2_light_dma[V2_LINES + k] = 0u;
+                }
+                zeroed = 1;
+            }
+            const uint8_t *bank = v2_bank[s];
+            uint32_t *d0 = (uint32_t *)&v2_light_dma[0];
+            uint32_t *d1 = (uint32_t *)&v2_light_dma[V2_LINES];
+            for (int k = 0; k < 224; k++)
+            {
+                uint32_t b = bank[k];
+                d0[k] = b;
+                d1[k] = b;
             }
             v2_dma_slot = s;
             v2_dma_gen = v2_slot_gen[s];
