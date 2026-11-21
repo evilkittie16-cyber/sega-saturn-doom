@@ -26,6 +26,27 @@
 #error "HW_ORACLE keeps its list in the deferred-wall region"
 #endif
 
+/* SH-2 cache-policy experiment (2026-11-21, off by default). CCR bits OD (2)
+ * and ID (1) are REPLACEMENT disables (SH7604 HW manual 8.2 / 8.4.5): lines
+ * already in the cache keep hitting, a miss is read straight from memory and
+ * evicts nothing. HW_CCR_WALK = the CCR value held during the master's BSP
+ * walk + emission (e.g. 0x05 = CE|OD: data reads stop evicting code;
+ * 0x03 = CE|ID: code misses stop evicting data). Written from the
+ * cache-through alias like _hw_purge_cache. */
+#ifndef HW_CCR_WALK
+#define HW_CCR_WALK 0
+#endif
+#if HW_CCR_WALK && !defined(SATURN_WIN32)
+static HW_NOINLINE void hw_ccr_write(unsigned int v)
+{
+    (*(volatile unsigned char *)0xFFFFFE92u) = (unsigned char)v;
+    __asm__ volatile("nop; nop; nop; nop; nop; nop; nop; nop;" ::: "memory");
+}
+#define HW_CCR_SET(v) ((void (*)(unsigned int))((uintptr_t)hw_ccr_write | SATURN_WRAM_H_UNCACHED))(v)
+#else
+#define HW_CCR_SET(v) ((void)0)
+#endif
+
 static unsigned int hw_prof_ap_acc = 0;
 static unsigned int hw_prof_fsub_acc = 0;
 static unsigned int hw_prof_spr_acc = 0;
@@ -1188,9 +1209,11 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
     }
 #else
+    HW_CCR_SET(HW_CCR_WALK);
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
 #endif
     HW_EmitDeferredWalls();         /* pass 2: wall quads + sprites */
+    HW_CCR_SET(0x01u);
     saturn_hw_prof_segs = hw_prof_segs_acc;
     saturn_hw_prof_ap = hw_prof_ap_acc;
     saturn_hw_prof_fsub = hw_prof_fsub_acc;
