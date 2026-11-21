@@ -208,18 +208,19 @@ static void print_centered(int y, const char *s)
 }
 
 /* ---- next-map progression (vanilla Doom 1 rules) ----
- * secret exit -> E*M9 (from E*M9 the normal exit rejoins at E*M4);
- * normal exit -> map+1; E*M8 ends the episode; E*M9's normal exit
- * rejoins at E*M4.
+ * secret exit -> E*M9; normal exit -> map+1; E*M8 ends the episode;
+ * E*M9 rejoins after its secret-exit map: E1M4, E2M6, E3M7, E4M3.
  * Returns 0 = episode finished. */
-static int next_map(int map, int secretexit)
+static int next_map(int episode, int map, int secretexit)
 {
+    static const unsigned char rejoin[5] = { 4, 4, 6, 7, 3 };
+    int back = rejoin[(episode >= 1 && episode <= 4) ? episode : 1];
+    if (map == 9)
+        return back;
     if (secretexit)
-        return map == 9 ? 4 : 9;
+        return 9;
     if (map == 8)
         return 0;
-    if (map == 9)
-        return 4;
     return map + 1;
 }
 
@@ -278,13 +279,13 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
     };
     extern void Saturn_Vdp1_Enter2D(void);
     player_t *pl = &players[consoleplayer];
-    int       next = next_map(map, secretexit);
+    int       next = next_map(episode, map, secretexit);
     int       pct_k, pct_i, pct_s, secs, par;
     int       cnt_k = 0, cnt_i = 0, cnt_s = 0, cnt_t = 0, cnt_par = 0;
     int       stats_done = 0;
     int       stage = 0; /* 0 = stats, 1 = entering next map / victory */
     int       stage_frame = 0;
-    int       epi = (episode > 3) ? 2 : (episode < 1 ? 0 : episode - 1);
+    int       epi = (episode > 3) ? 3 : (episode < 1 ? 0 : episode - 1);
     int       frame, prev = ~0;
     char      nm[9];
 
@@ -314,7 +315,8 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
         {
             if (wi_bg)
                 Z_Free(wi_bg);
-            wi_bg     = Saturn_CachePatchBig(bgname[epi]);
+            /* E4 has no world map in vanilla: plain INTERPIC */
+            wi_bg     = Saturn_CachePatchBig(epi >= 3 ? "INTERPIC" : bgname[epi]);
             if (!wi_bg)
                 wi_bg = Saturn_CachePatchBig("WIMAP0");
             wi_bg_epi = epi;
@@ -358,7 +360,7 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
         /* background + map dots */
         if (wi_bg)
             Saturn_DrawPatchFS(0, 0, wi_bg);
-        if (wi_splat)
+        if (wi_splat && episode <= 3)
         {
             int i;
             int max_splat = (map <= 9) ? map : 9;
@@ -395,7 +397,7 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
                 }
             }
 
-            if (next > 0 && wi_yah && ((frame >> 4) & 1))
+            if (next > 0 && wi_yah && episode <= 3 && ((frame >> 4) & 1))
                 draw_wi(lnodes[epi][next - 1][0], lnodes[epi][next - 1][1], wi_yah);
 
             /* title: level name + FINISHED (vanilla WI_drawLF) */
@@ -460,7 +462,7 @@ int Saturn_Inter_Run(int episode, int map, int secretexit)
                 if (wi_next_lname)
                     draw_wi((DOOM_SCREENWIDTH - wi_width(wi_next_lname)) / 2,
                             WI_TITLEY + WI_LH - 2, wi_next_lname);
-                if (wi_yah && ((stage_frame >> 4) & 1))
+                if (wi_yah && episode <= 3 && ((stage_frame >> 4) & 1))
                     draw_wi(lnodes[epi][next - 1][0], lnodes[epi][next - 1][1], wi_yah);
 
                 if (press || stage_frame >= 150)
