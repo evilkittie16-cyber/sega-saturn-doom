@@ -1483,8 +1483,17 @@ static int v1_evict(unsigned int target)
      * wall missing) every frame, forever (hardware E3M6: steady HUD X4,
      * half the walls gone). Two evictions in a row that leave the refused
      * size without a hole report failure -> the caller full-flushes. */
+    /* Exponential cooldown (2026-11-21 hardware, retail E3M6 2.4 FPS with
+     * HUD Y3 X5): when the textures in view simply do not fit, a flush
+     * cannot help and flushing every frame re-uploaded everything each
+     * frame (~380 ms). After a no-hole flush the next one waits 1 s, then
+     * 2, 4 ... 32 s; 10 s without a no-hole eviction resets it. In between,
+     * a refused texture is just skipped for that frame, as before. */
     {
+        extern volatile unsigned int saturn_vbl_count;
         static int nohole_streak = 0;
+        static unsigned int nohole_until = 0, nohole_wait = 60u, nohole_last = 0;
+        const unsigned int now = saturn_vbl_count;
         const unsigned int need_b = (v1_want_bytes + 31u) & ~31u;
         int pos_unused;
         v1_want_bytes = 0;
@@ -1492,9 +1501,15 @@ static int v1_evict(unsigned int target)
         saturn_v1_evictions++;
         if (need_b > 0 && v1_find_gap(need_b, &pos_unused) == 0)
         {
-            if (++nohole_streak >= 2)
+            if (now - nohole_last > 600u)
+                nohole_wait = 60u;          /* calm for 10 s: back to 1 s */
+            nohole_last = now;
+            if (++nohole_streak >= 2 && (int)(now - nohole_until) >= 0)
             {
                 nohole_streak = 0;
+                nohole_until = now + nohole_wait;
+                if (nohole_wait < 1920u)
+                    nohole_wait <<= 1;
                 return 0;
             }
         }
