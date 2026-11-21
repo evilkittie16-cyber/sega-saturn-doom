@@ -737,7 +737,7 @@ void I_FinishUpdate(void)
                     dst->x = mo->x;
                     dst->y = mo->y;
                     dst->z = mo->z;
-                    dst->angle = mo->angle;
+                    dst->angle = (mo->flags & MF_STATIC) ? 0 : mo->angle;   /* static mobjs end before angle */
                     memcpy(dst->name, sprnames[st->sprite], 4);
                     dst->frame = st->frame;
                     /* Only MF_SHADOW means the same thing in both trees. d32xr
@@ -1220,7 +1220,13 @@ void I_FinishUpdate(void)
                     for (mo2 = mobjhead.next; mo2 != (void *)&mobjhead; mo2 = mo2->next)
                         if (mo2 != players[0].mo) {
                             mo2->tics = -1;
-                            mo2->momx = mo2->momy = mo2->momz = 0;
+                            /* MF_STATIC mobjs are allocated only up to
+                             * offsetof(mobj_t, angle): writing the momenta
+                             * of the pool's last one overran into the next
+                             * zone block header, cutting the zone chain
+                             * (Z_Malloc failed on the 3rd level load). */
+                            if (!(mo2->flags & MF_STATIC))
+                                mo2->momx = mo2->momy = mo2->momz = 0;
                         }
                     players[0].cheats |= CF_GODMODE;
                     players[0].health = 100;
@@ -1281,6 +1287,40 @@ void I_FinishUpdate(void)
                         for (int vi = 0; vi < saturn_visit_count; vi++) {
                             const sub_range_t *r = &saturn_sub_ranges[vi];
                             int sn = r->subnum;
+                            {
+                                /* screen footprint of this visit's commands: summed
+                                 * quad area (shoelace, clamped to the view) and the
+                                 * union bbox - for the "tiny subsector" study */
+                                extern vdp1_cmd_t *saturn_cmd_m, *saturn_cmd_s;
+                                double area = 0;
+                                int bx0 = 9999, by0 = 9999, bx1 = -9999, by1 = -9999, nq = 0;
+                                for (int pass = 0; pass < 2; pass++) {
+                                    const vdp1_cmd_t *base = pass ? saturn_cmd_s : saturn_cmd_m;
+                                    int st = pass ? r->s_start : r->m_start, ct = pass ? r->s_count : r->m_count;
+                                    if (!base) continue;
+                                    for (int q = st; q < st + ct; q++) {
+                                        const uint32_t *c = (const uint32_t *)&base[q];
+                                        if ((c[0] >> 16) & 0x8000u) continue;
+                                        if (((c[0] >> 16) & 0xFu) > 4u) continue;
+                                        int px[4], py[4];
+                                        for (int k = 0; k < 4; k++) {
+                                            px[k] = (int)(int16_t)(c[3 + k] >> 16);
+                                            py[k] = (int)(int16_t)(c[3 + k] & 0xFFFFu);
+                                            if (px[k] < 0) px[k] = 0; if (px[k] > 320) px[k] = 320;
+                                            if (py[k] < 0) py[k] = 0; if (py[k] > 168) py[k] = 168;
+                                            if (px[k] < bx0) bx0 = px[k]; if (px[k] > bx1) bx1 = px[k];
+                                            if (py[k] < by0) by0 = py[k]; if (py[k] > by1) by1 = py[k];
+                                        }
+                                        double s2 = 0;
+                                        for (int k = 0; k < 4; k++)
+                                            s2 += (double)px[k] * py[(k + 1) & 3] - (double)px[(k + 1) & 3] * py[k];
+                                        area += (s2 < 0 ? -s2 : s2) * 0.5;
+                                        nq++;
+                                    }
+                                }
+                                printf("[SWAREA] v%d ss %d quads %d area %.0f bbox %d %d %d %d\n", vi, sn, nq, area,
+                                       nq ? bx0 : 0, nq ? by0 : 0, nq ? bx1 : 0, nq ? by1 : 0);
+                            }
                             extern int hw_dbg_visit_flags[1024];
                             extern const uint16_t *saturn_baked_flat_q_count;
                             extern const saturn_wl_subsector_t *saturn_baked_wall_subsectors;

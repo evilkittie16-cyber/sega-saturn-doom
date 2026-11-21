@@ -1292,6 +1292,10 @@ D_printf ("P_SetupLevel(%s,%i)\n",lumpname,skill);
 		Saturn_BakedTextures_Init(lumpname);
 #ifdef SATURN_WIN32
 		printf("P_SetupLevel: Saturn_BakedSprites_Init\n"); fflush(stdout);
+		{
+			extern void Z_ZoneSummary(memzone_t *z, const char *where);
+			Z_ZoneSummary(mainzone, lumpname);   /* prints only with ZCHK=1 */
+		}
 #endif
 		Saturn_BakedSprites_Init(lumpname);
 	}
