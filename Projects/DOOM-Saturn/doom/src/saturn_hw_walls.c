@@ -3243,9 +3243,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_ProjectPortalEndpoint(hw_trans_pillar_t *tp
     }
 }
 
-static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals(hw_wall_emit_ctx_t *ctx)
+/* portal-seg endpoints (file scope: asm stage K reads them through its table) */
+static hw_trans_pillar_t hw_unbp_tp0, hw_unbp_tp1;
+
+static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals_C(hw_wall_emit_ctx_t *ctx)
 {
-    static hw_trans_pillar_t p_tp0, p_tp1;
+#define p_tp0 hw_unbp_tp0
+#define p_tp1 hw_unbp_tp1
 #if HW_AP_1D
     ctx->portal_recorded = 0;
     return;
@@ -3383,7 +3387,70 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals(hw_wall_emit_
         ctx->portal_recorded = 0;
         HW_RecordSegPortalAperture(ctx, (int)p->back_sec_idx);
     }
+#undef p_tp0
+#undef p_tp1
 }
+
+/* Asm stage K (saturn_hw_asm.s hw_asm_unbp): the function above. */
+#ifndef HW_ASM_UNBP
+#define HW_ASM_UNBP (HW_ASM && !HW_AP_1D)
+#endif
+#if HW_ASM_UNBP
+extern void hw_asm_unbp(hw_wall_emit_ctx_t *ctx);
+static HW_NOINLINE int HW_UnbpSpanAperture(int sx, int ex) { return HW_GetSpanAperture(sx, ex); }
+_Static_assert(offsetof(hw_wall_emit_ctx_t, portal_recorded) == 0 && offsetof(hw_wall_emit_ctx_t, seg_sx) == 8 &&
+               offsetof(hw_wall_emit_ctx_t, seg_ex) == 10 && offsetof(hw_wall_emit_ctx_t, portal_first) == 120 &&
+               offsetof(hw_wall_emit_ctx_t, portal_count) == 122 && sizeof(hw_portal_seg_t) == 12 &&
+               offsetof(hw_portal_seg_t, back_sec_idx) == 8 && offsetof(hw_portal_seg_t, chain_prev) == 10 &&
+               sizeof(hw_ap_word_t) == 8 && offsetof(hw_ap_word_t, yb_max) == 2 &&
+               offsetof(hw_aperture_state_t, aperture_active) == 2 && sizeof(hw_trans_pillar_t) == 16 &&
+               offsetof(hw_frust_t, Ny) - offsetof(hw_frust_t, Nx) == 2 &&
+               offsetof(hw_frust_t, cz_origin) - offsetof(hw_frust_t, Nx) == 32 &&
+               offsetof(hw_frust_t, cx_origin) - offsetof(hw_frust_t, Nx) == 36 &&
+               sizeof(saturn_view_h) == 4 && HW_FAR_Z == 0x40000000, "hw_asm_unbp: layout");
+const void *const hw_asm_unbp_ctx[20] = {
+    &hw_cam_x, &hw_cam_y, &hw_frust.Nx, saturn_master_oclut, HW_PORTAL_SEGS, &hw_unbp_tp0, &hw_unbp_tp1,
+    hw_solid_mask, hw_mask_left, hw_mask_right, hw_ap_words, &hw_solid_count, &hw_aperture_state,
+    &saturn_view_h, (const void *)HW_CheckSpanOcclusion, (const void *)HW_UnbpSpanAperture,
+    (const void *)HW_ClipWallNearPlane, (const void *)HW_RecordSegPortalAperture,
+    &hw_p0_clipped, &hw_p1_clipped
+};
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] first differing byte of the ctx [3] portal count */
+static volatile uint32_t hw_asm_chk_unbp[8];
+static HW_NOINLINE void HW_UnbpCheck(hw_wall_emit_ctx_t *ctx)
+{
+    /* the portal records go to the aperture state: compare that whole state
+     * plus the ctx after asm vs after C (rolled back in between) */
+    static hw_aperture_state_t ap0, apa;
+    static hw_wall_emit_ctx_t c0, ca;
+    static hw_trans_pillar_t t0[2], ta[2];
+    ap0 = hw_aperture_state; c0 = *ctx; t0[0] = hw_unbp_tp0; t0[1] = hw_unbp_tp1;
+    hw_asm_unbp(ctx);
+    apa = hw_aperture_state; ca = *ctx; ta[0] = hw_unbp_tp0; ta[1] = hw_unbp_tp1;
+    hw_aperture_state = ap0; *ctx = c0; hw_unbp_tp0 = t0[0]; hw_unbp_tp1 = t0[1];
+    HW_RecordSubsectorUnbakedPortals_C(ctx);
+    hw_asm_chk_unbp[0]++;
+    if ((memcmp(&apa, &hw_aperture_state, sizeof(apa)) != 0 || memcmp(&ca, ctx, sizeof(ca)) != 0) &&
+        hw_asm_chk_unbp[1]++ == 0)
+    {
+        const uint8_t *a = (const uint8_t *)&ca, *c = (const uint8_t *)ctx;
+        hw_asm_chk_unbp[2] = 0xFFFFu;
+        for (uint32_t i = 0; i < sizeof(ca); i++)
+            if (a[i] != c[i]) { hw_asm_chk_unbp[2] = i; break; }
+        hw_asm_chk_unbp[3] = ctx->portal_count;
+    }
+}
+#define HW_RecordSubsectorUnbakedPortals HW_UnbpCheck
+#else
+#define HW_RecordSubsectorUnbakedPortals hw_asm_unbp
+#endif
+#else
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+const void *const hw_asm_unbp_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+#define HW_RecordSubsectorUnbakedPortals HW_RecordSubsectorUnbakedPortals_C
+#endif
 
 /* Outlined Pillar Pair Projection + 1D Frustum + Occlusion + Aperture Check
  * Takes 3 register arguments (r4=pair_key, r5=obj_dx, r6=obj_dy), 0 stack arguments! */

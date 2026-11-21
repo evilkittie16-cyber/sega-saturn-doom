@@ -9205,3 +9205,357 @@ _hw_asm_persp:
 .Lp_320l:	.long	320
 .Lp_ff00:	.long	0x0000FF00
 .Lp_capm1:	.long	1279
+
+! ===================================================================
+! Stage K: hw_asm_unbp(ctx) = HW_RecordSubsectorUnbakedPortals
+! (saturn_hw_walls.c): back-face test the subsector's unbaked portal segs,
+! project both ends (shared with the previous seg when chained), cull,
+! set the span's aperture window and record the portal.
+! Table hw_asm_unbp_ctx: [0] &hw_cam_x [4] &hw_cam_y [8] &hw_frust.Nx
+! [12] saturn_master_oclut [16] portal seg base [20] &tp0 [24] &tp1
+! [28] hw_solid_mask [32] hw_mask_left [36] hw_mask_right [40] hw_ap_words
+! [44] &hw_solid_count [48] &hw_aperture_state [52] &saturn_view_h
+! [56] span occlusion [60] span aperture [64] HW_ClipWallNearPlane
+! [68] portal record [72] &hw_p0_clipped [76] &hw_p1_clipped.
+! portal seg 12 B: x0 0, y0 2, dx 4, dy 6, back_sec_idx 8, chain_prev 10.
+! Frame 16 B: [0] obj_dx0 / seg_sx [4] obj_dy0 / seg_ex [8] dx [12] dy.
+! Regs: r8 ctx, r9 seg, r10 count, r11 prev_projected, r12 tp0, r13 tp1,
+! r14 table.
+! ===================================================================
+	.align	2
+	.global	_hw_asm_unbp
+_hw_asm_unbp:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-16,r15
+	mov	r4,r8
+	mov.l	.Lup_ctx,r14
+	mov	#122,r0
+	mov.w	@(r0,r8),r10
+	extu.w	r10,r10			! portal_count
+	mov	#120,r0
+	mov.w	@(r0,r8),r0
+	extu.w	r0,r0			! portal_first
+	mov	r0,r1
+	add	r0,r0
+	add	r1,r0
+	shll2	r0			! * 12
+	mov.l	@(16,r14),r9
+	add	r0,r9			! first seg
+	mov	#0,r11
+	mov.l	@(20,r14),r12
+	mov.l	@(24,r14),r13
+	tst	r10,r10
+	bt	.Lup_done
+.Lup_loop:
+	mov.l	@r14,r0
+	mov.l	@r0,r1			! cam_x
+	mov.l	@(4,r14),r0
+	mov.l	@r0,r2			! cam_y
+	mov.w	@r9,r4
+	sub	r1,r4			! obj_dx0
+	mov.w	@(2,r9),r0
+	mov	r0,r5
+	sub	r2,r5			! obj_dy0
+	mov.w	@(4,r9),r0
+	mov	r0,r6			! dx
+	mov.w	@(6,r9),r0
+	mov	r0,r7			! dy
+	muls.w	r5,r6
+	sts	macl,r1
+	muls.w	r4,r7
+	sts	macl,r2
+	sub	r2,r1			! cross
+	cmp/pl	r1
+	bt	.Lup_front
+	bra	.Lup_next
+	mov	#0,r11
+.Lup_front:
+	mov.l	r4,@r15
+	mov.l	r5,@(4,r15)
+	mov.l	r6,@(8,r15)
+	mov.l	r7,@(12,r15)
+	tst	r11,r11
+	bt	.Lup_p0
+	mov.b	@(10,r9),r0		! chain_prev
+	tst	r0,r0
+	bt	.Lup_p0
+	mov.l	@r13,r0
+	mov.l	r0,@r12
+	mov.l	@(4,r13),r0
+	mov.l	r0,@(4,r12)
+	mov.l	@(8,r13),r0
+	mov.l	r0,@(8,r12)
+	mov.l	@(12,r13),r0
+	bra	.Lup_p1
+	mov.l	r0,@(12,r12)		! tp0 = tp1
+.Lup_p0:
+	bsr	.Lup_proj
+	mov	r12,r6
+.Lup_p1:
+	mov.l	@r15,r4
+	mov.l	@(8,r15),r0
+	add	r0,r4
+	mov.l	@(4,r15),r5
+	mov.l	@(12,r15),r0
+	add	r0,r5
+	bsr	.Lup_proj
+	mov	r13,r6
+	mov	#1,r11
+	mov.l	@(4,r12),r1		! cz0
+	mov.l	@(4,r13),r2		! cz1
+	mov.l	.Lup_nearz,r0
+	cmp/ge	r0,r1
+	bt	1f
+	cmp/ge	r0,r2
+	bf	.Lup_next		! both behind the near plane
+1:	mov.l	.Lup_farz,r3
+	cmp/gt	r3,r1
+	bf	2f
+	cmp/gt	r3,r2
+	bt	.Lup_next		! both past the far plane
+2:	cmp/ge	r0,r1
+	bf	.Lup_clip
+	cmp/ge	r0,r2
+	bf	.Lup_clip
+	mov.l	@(12,r12),r4		! xa
+	mov.l	@(12,r13),r5		! xb
+	cmp/gt	r4,r5
+	bf	.Lup_next
+	cmp/pl	r5
+	bf	.Lup_next
+	mov.l	.Lup_320,r0
+	cmp/ge	r0,r4
+	bt	.Lup_next
+	cmp/pz	r4
+	bt	3f
+	mov	#0,r4			! seg_sx
+3:	cmp/gt	r0,r5
+	bf	4f
+	mov	r0,r5			! seg_ex
+4:	mov.l	r4,@r15
+	mov.l	r5,@(4,r15)
+	mov	r5,r6
+	add	#-1,r6			! ex_m1
+	mov	r4,r0
+	xor	r6,r0
+	mov	#32,r1
+	cmp/hs	r1,r0
+	bt	.Lup_multi
+	mov	r4,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(32,r14),r1
+	mov.l	@(r0,r1),r1		! hw_mask_left[sx & 31]
+	mov	r6,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(36,r14),r2
+	mov.l	@(r0,r2),r2		! hw_mask_right[ex_m1 & 31]
+	and	r2,r1			! mask
+	mov	r4,r0
+	shlr2	r0
+	shlr	r0
+	and	#0xFC,r0
+	mov.l	@(28,r14),r2
+	mov.l	@(r0,r2),r2
+	and	r1,r2
+	cmp/eq	r1,r2
+	bt	.Lup_next		! fully solid
+	mov	r4,r0
+	shlr2	r0
+	and	#0xF8,r0		! w0 * 8
+	mov.l	@(40,r14),r1
+	add	r0,r1			! &hw_ap_words[w0]
+	mov.w	@r1,r2			! yt_min
+	mov.w	@(2,r1),r0
+	mov	r0,r3			! yb_max
+	cmp/ge	r3,r2
+	bt	.Lup_next
+	mov	r2,r0
+	mov.w	r0,@(12,r8)		! ctx->ytop_min
+	mov	r3,r0
+	bra	.Lup_seg
+	mov.w	r0,@(14,r8)		! ctx->ybot_max
+.Lup_multi:
+	mov.l	@(44,r14),r0
+	mov.l	@r0,r0			! hw_solid_count
+	cmp/pl	r0
+	bf	5f
+	mov.l	@(56,r14),r0
+	jsr	@r0			! span occlusion (2 = fully occluded)
+	nop
+	cmp/eq	#2,r0
+	bt	.Lup_next
+5:	mov.l	@(48,r14),r0
+	mov.b	@(2,r0),r0		! aperture_active
+	tst	r0,r0
+	bt	6f
+	mov.l	@r15,r4
+	mov.l	@(4,r15),r5
+	mov.l	@(60,r14),r0
+	jsr	@r0			! span aperture
+	nop
+	cmp/pz	r0
+	bf	.Lup_next
+	mov	r0,r1
+	shlr16	r0
+	mov.w	r0,@(12,r8)
+	mov	r1,r0
+	bra	.Lup_seg
+	mov.w	r0,@(14,r8)
+6:	mov	#0,r0
+	mov.w	r0,@(12,r8)
+	mov.l	@(52,r14),r0
+	mov.l	@r0,r0
+	mov.w	r0,@(14,r8)		! ybot_max = view_h
+.Lup_seg:
+	mov.l	@r15,r0
+	mov.w	r0,@(8,r8)		! seg_sx
+	mov.l	@(4,r15),r0
+	mov.w	r0,@(10,r8)		! seg_ex
+	mov.l	r12,@(40,r8)		! ctx->p0 = &tp0
+	bra	.Lup_rec
+	mov.l	r13,@(44,r8)		! ctx->p1 = &tp1
+.Lup_clip:
+	mov	#0,r1
+	mov	#92,r0
+	mov.l	r1,@(r0,r8)		! u_start = 0
+	mov	#64,r1
+	mov	#96,r0
+	mov.l	r1,@(r0,r8)		! u_span = 64
+	mov	r12,r4
+	mov	r13,r5
+	mov	r8,r6
+	mov	#64,r0
+	mov.l	@(r0,r14),r0
+	jsr	@r0			! HW_ClipWallNearPlane
+	nop
+	tst	r0,r0
+	bt	.Lup_next
+	mov.l	@(48,r14),r0
+	mov.b	@(2,r0),r0
+	tst	r0,r0
+	bt	7f
+	mov.w	@(8,r8),r0
+	mov	r0,r4
+	mov.w	@(10,r8),r0
+	mov	r0,r5
+	mov.l	@(60,r14),r0
+	jsr	@r0			! span aperture
+	nop
+	cmp/pz	r0
+	bf	.Lup_next
+	mov	r0,r1
+	shlr16	r0
+	mov.w	r0,@(12,r8)
+	mov	r1,r0
+	bra	8f
+	mov.w	r0,@(14,r8)
+7:	mov	#0,r0
+	mov.w	r0,@(12,r8)
+	mov.l	@(52,r14),r0
+	mov.l	@r0,r0
+	mov.w	r0,@(14,r8)
+8:	mov	#72,r0
+	mov.l	@(r0,r14),r1
+	mov.l	r1,@(40,r8)		! ctx->p0 = &hw_p0_clipped
+	mov	#76,r0
+	mov.l	@(r0,r14),r1
+	mov.l	r1,@(44,r8)		! ctx->p1 = &hw_p1_clipped
+.Lup_rec:
+	mov	#0,r0
+	mov.b	r0,@(0,r8)		! portal_recorded = 0
+	mov	r8,r4
+	mov.w	@(8,r9),r0
+	mov	r0,r5			! back_sec_idx
+	mov	#68,r0
+	mov.l	@(r0,r14),r0
+	jsr	@r0			! record the portal
+	nop
+.Lup_next:
+	add	#12,r9
+	dt	r10
+	bf	.Lup_loop
+.Lup_done:
+	add	#16,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+! project (r4 dx, r5 dy) into the pillar at r6 (HW_ProjectPortalEndpoint);
+! r14 = table; clobbers r0-r3, r7, mach/macl
+.Lup_proj:
+	mov.l	@(8,r14),r7		! &hw_frust.Nx
+	mov.w	@r7,r1			! Nx
+	mov.w	@(2,r7),r0
+	mov	r0,r2			! Ny
+	muls.w	r4,r1
+	sts	macl,r0
+	muls.w	r5,r2
+	sts	macl,r3
+	add	r3,r0
+	shll2	r0
+	shll2	r0
+	mov.l	@(32,r7),r3		! cz_origin
+	sub	r3,r0			! cz
+	muls.w	r4,r2
+	sts	macl,r3
+	muls.w	r5,r1
+	sts	macl,r1
+	sub	r1,r3
+	shll2	r3
+	shll2	r3
+	mov.l	@(36,r7),r1		! cx_origin
+	sub	r1,r3			! cx
+	mov.l	r3,@r6
+	mov.l	r0,@(4,r6)
+	mov.l	.Lup_nearz,r1
+	cmp/ge	r1,r0
+	bt	9f
+	mov	#0,r0
+	mov.l	r0,@(8,r6)
+	rts
+	mov.l	r0,@(12,r6)
+9:	shlr16	r0
+	mov.l	.Lup_2048,r1
+	cmp/hs	r1,r0
+	bf	10f
+	shlr2	r0
+	shlr	r0
+	mov.l	.Lup_1023,r2
+	cmp/hi	r2,r0
+	bf	11f
+	mov	r2,r0
+11:	add	r1,r0
+10:	shll2	r0
+	mov.l	@(12,r14),r1
+	mov.l	@(r0,r1),r1		! s
+	mov.l	r1,@(8,r6)
+	dmuls.l	r3,r1
+	sts	mach,r0
+	mov	#80,r1
+	add	r1,r0
+	add	r1,r0
+	rts
+	mov.l	r0,@(12,r6)		! px = 160 + hi(cx * s)
+
+	.align	2
+.Lup_ctx:	.long	_hw_asm_unbp_ctx
+.Lup_nearz:	.long	0x00040000
+.Lup_farz:	.long	0x40000000
+.Lup_320:	.long	320
+.Lup_2048:	.long	2048
+.Lup_1023:	.long	1023
