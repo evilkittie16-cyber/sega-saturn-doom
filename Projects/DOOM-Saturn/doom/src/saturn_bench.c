@@ -239,6 +239,13 @@ static void bench_place_camera(int view)
     players[0].cheats |= CF_GODMODE;
     players[0].health = 100;
     mo->health = 100;
+#if BENCH_HOLD && defined(BENCH_HOLD_DEAD)
+    /* dead-player eye (P_DeathThink settles viewheight at 6): reproduces a
+     * hardware photo taken after dying */
+    players[0].playerstate = PST_DEAD;
+    players[0].viewheight  = 6 * FRACUNIT;
+    players[0].viewz       = mo->z + 6 * FRACUNIT;
+#endif
     bench_rec[view].x    = bench_pos[p][0];
     bench_rec[view].y    = bench_pos[p][1];
     bench_rec[view].ang8 = (uint8_t)a;
