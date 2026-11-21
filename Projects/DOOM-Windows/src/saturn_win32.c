@@ -185,6 +185,13 @@ void I_WaitVBL(int count) {
 }
 int I_GetTime(void) { extern volatile unsigned int saturn_vbl_count; return (int)(saturn_vbl_count / 2); }
 void *I_PointStableLump(int lump) { return W_POINTLUMPNUM(lump); }
+/* 2026-11-21: Win32 versions of entry points the retail-IWAD work added to
+ * the Saturn platform layer (i_wad.c / i_system.c are not built here). The
+ * whole WAD is in RAM, so every lump is resident; there is no RAM cart, so
+ * no cart texture arena (saturn_tex.c falls back to the zone). */
+void *I_PointResidentLump(int lump) { return W_POINTLUMPNUM(lump); }
+unsigned char *I_AllocHigh(int length) { return (unsigned char *)calloc(1, (size_t)length); }
+unsigned char *Saturn_CartArena(unsigned int *size) { if (size) *size = 0; return NULL; }
 
 static int s_cd_pos = 0;
 int I_OpenCDFileByName(const char *name, int *poffset) {

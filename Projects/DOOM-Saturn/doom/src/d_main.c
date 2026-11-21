@@ -1598,6 +1598,12 @@ void D_DoomLoop(void)
                     saturn_tic_count++;  /* r56: census row T */
                     saturn_sim_site = 0x7;   /* r56: tic returned */
                     tic_frt_acc += Saturn_ProfSpan(tt, tt_v0);
+                    /* 2026-11-21: stop the catch-up burst once the level is
+                     * over (exit latched, quit, warp/restart/respawn
+                     * requested) — extra tics of the finished level used to
+                     * run after G_PlayerFinishLevel saved the loadout. */
+                    if (saturn_level_done || saturn_quit_to_title || saturn_warp_map > 0)
+                        break;
                 }
                 saturn_frt_tic = (int)(tic_frt_acc >> 8);
                 saturn_pf_acc[0] += Saturn_ProfSpan(pf_tf0, pf_tv0);

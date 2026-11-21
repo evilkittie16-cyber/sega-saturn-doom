@@ -651,11 +651,25 @@ static HW_NOINLINE HW_COLD_OS void HW_WallXYClamp_Slow(int *c)
         }                                                                                  \
     } while (0)
 
+/* Far entries cover dist 2048..8191 in steps of 8. 2026-11-21: beyond
+ * that the index used to WRAP (& 1023), so a point at 8192+ units got the
+ * scale of a point 4 units away (absurd projections; a BSP box corner
+ * there could be judged off-screen and cull a visible node). Clamp to
+ * the last entry instead (the far cull is 16384). The asm copies in
+ * saturn_hw_asm.s (.Lw_tlk, .Ls_dfar, .Lv_dfar, BFDIV) clamp the same. */
+HW_ALWAYS_INLINE unsigned int HW_FarLutIndex(unsigned int dist)
+{
+    unsigned int k = dist >> 3;
+    if (k > SATURN_OCLUT_FAR_ENTRIES - 1u)
+        k = SATURN_OCLUT_FAR_ENTRIES - 1u;
+    return SATURN_OCLUT_FAR_OFFSET + k;
+}
+
 HW_ALWAYS_INLINE int HW_FastDiv(fixed_t cz)
 {
     unsigned int dist = (unsigned int)cz >> FRACBITS;
     if (__builtin_expect(dist >= SATURN_OCLUT_ENTRIES, 0))
-        dist = SATURN_OCLUT_FAR_OFFSET + ((dist >> 3) & (SATURN_OCLUT_FAR_ENTRIES - 1u));
+        dist = HW_FarLutIndex(dist);
     return (int)saturn_master_oclut[dist];
 }
 
@@ -663,7 +677,7 @@ HW_ALWAYS_INLINE int HW_SlaveFastDiv(fixed_t cz)
 {
     unsigned int dist = (unsigned int)cz >> FRACBITS;
     if (__builtin_expect(dist >= SATURN_OCLUT_ENTRIES, 0))
-        dist = SATURN_OCLUT_FAR_OFFSET + ((dist >> 3) & (SATURN_OCLUT_FAR_ENTRIES - 1u));
+        dist = HW_FarLutIndex(dist);
     return (int)SATURN_OCLUT[dist];
 }
 

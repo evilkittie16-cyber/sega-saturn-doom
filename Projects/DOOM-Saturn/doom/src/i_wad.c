@@ -2250,8 +2250,15 @@ void saturn_iwad_fill_drain_all(void)
            (int)(saturn_vbl_count - v0) < 60 * 60)
         saturn_iwad_background_fill();
     saturn_fill_boot_mode = 0;
-    saturn_fill_remaining = 0;
-    saturn_fill_active = 0;
+    /* 2026-11-21: only switch the fill off when the queue really emptied;
+     * after a watchdog timeout the leftovers stay queued for the in-game
+     * async drain, as the comment above intends (it used to turn the fill
+     * off for good, so the rest streamed from CD on every access). */
+    if (!saturn_fill_active || saturn_fill_head >= saturn_fill_count)
+    {
+        saturn_fill_remaining = 0;
+        saturn_fill_active = 0;
+    }
 }
 
 /* Drain the background cart-fill queue. Called once per displayed frame
@@ -2737,7 +2744,9 @@ void *I_PointStableLump(int lump)
 	int		length;
 
 	raw = W_POINTLUMPNUM(lump);	/* cart bytes, or fresh bytes in scratch */
-	if (raw != saturn_cd_scratch)
+	/* saturn_cd_big (cold lumps > 64 KB) is freed by the next CD read just
+	 * like scratch is overwritten: neither is stable (2026-11-21). */
+	if (raw != saturn_cd_scratch && raw != saturn_cd_big)
 		return raw;			/* stable: cart DRAM or in-RAM wad */
 
 	length = W_LumpLength(lump);

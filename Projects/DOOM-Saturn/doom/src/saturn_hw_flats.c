@@ -3598,6 +3598,11 @@ static int HW_SplitFlatJob(int sub_idx, int subnum, int q_count, uint32_t v_firs
     int n = 1;
     while (!(ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST) && n < 64)
         n++;
+    /* More than 64 chunks (2026-11-21): the chunks past the 64th were never
+     * submitted (one-chunk jobs) = a missing floor region. Send the
+     * subsector as one whole job instead. */
+    if (!(ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST))
+        return 0;
     if (n < 2 || saturn_visit_count + n >= CMDBUF_MAX_VISIT - 32)
         return 0;
     uint32_t w3_base = (w3_pack & ~((0x7Fu << 25) | (0x7Fu << 17))) | HW_JOB_ONE_CHUNK;

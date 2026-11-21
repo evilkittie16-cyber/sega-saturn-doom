@@ -184,8 +184,20 @@ doom/src/saturn_hw_slave_walls.o: doom/src/saturn_hw_slave_walls.c $(SATURN_HW_D
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
 
+# Cold code (load time / 2D screens only) at -Os (2026-11-21): static BSS +
+# text must stay under 0x060C0000 (SGL work area); size beats speed here.
+CCFLAGS_COLD = $(filter-out -O2,$(CCFLAGS)) -Os
 doom/src/saturn_pak.o: doom/src/saturn_pak.c
-	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/src/saturn_menu.o: doom/src/saturn_menu.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/src/saturn_inter.o: doom/src/saturn_inter.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/d32xr/p_setup.o: doom/d32xr/p_setup.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
 
 doom/src/i_video.o: doom/src/i_video.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_PERF_ROWS $(DIVLUT_DEFS) -o $@

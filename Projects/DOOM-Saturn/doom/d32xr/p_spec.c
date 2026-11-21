@@ -760,9 +760,16 @@ void P_PlayerInSpecialSector (player_t *player)
 			S_StartSound(player->mo, sfx_secret);
 			break;
 			
-		default:
-			I_Error ("P_PlayerInSpecialSector: "
-					"unknown special %i",sector->special);
+		case 11:	/* EXIT SUPER DAMAGE (E1M8 end room) — was missing: I_Error */
+			player->cheats &= ~CF_GODMODE;
+			if ((gametic != prevgametic) && !(gametic&0xf))
+				P_DamageMobj (player->mo, NULL, NULL, 20);
+			if (player->health <= 10)
+				G_ExitLevel();
+			break;
+
+		default:	/* unknown / non-damaging: ignore (was a fatal I_Error) */
+			break;
 	};
 }
 
@@ -1003,6 +1010,10 @@ void P_SpawnSpecials (void)
 			case 3:		/* STROBE SLOW */
 				Saturn_SpcMark("CASE-STROBE", JO_COLOR_MediumCyan);
 				P_SpawnStrobeFlash(sector,SLOWDARK,0);
+				break;
+			case 4:		/* STROBE FAST + 20% DAMAGE (vanilla) */
+				P_SpawnStrobeFlash(sector,FASTDARK,0);
+				sector->special = 4;	/* the strobe clears it; keep the damage */
 				break;
 			case 8:		/* GLOWING LIGHT */
 				Saturn_SpcMark("CASE-GLOW", JO_COLOR_SemiPurple);

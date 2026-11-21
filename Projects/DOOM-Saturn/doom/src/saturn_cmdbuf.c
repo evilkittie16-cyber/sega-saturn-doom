@@ -238,12 +238,19 @@ CMDBUF_INLINE uint32_t *deliver_range_32(uint32_t *dst, const uint32_t * const l
     return copy_quads_32(dst, src, (int)count);
 }
 
+/* ~65536/dx. 2026-11-21: this used to read a reciprocal table at
+ * SATURN_WRAM_L_DIVLUT_ADDR (Low WRAM 0x238000) that NOTHING fills — zero
+ * in emulators (trim silently a no-op) but leftover RAM on real hardware,
+ * where it could shrink or wipe near tall walls. Now `oclut` is the real
+ * table (saturn_master_oclut, 10485760/d; *26843546>>32 = 65536/d), and
+ * dx > 2047 divides instead of clamping (the clamp over-trimmed walls
+ * taller than 2047 px). */
 CMDBUF_INLINE uint32_t cmdbuf_inv_dx(int dx, const unsigned int *oclut)
 {
     if (dx <= 1)
         return 65536u;
-    if (dx > 2047)
-        dx = 2047;
+    if (__builtin_expect(dx > 2047, 0))
+        return 65536u / (uint32_t)dx;
 #ifndef SATURN_WIN32
     uint32_t res;
     uint32_t val = oclut[dx];
@@ -298,7 +305,8 @@ CMDBUF_NOINLINE void Saturn_CmdBuf_TrimWallY(uint32_t *c32)
     if (rows <= 4 || dya <= 6 || dyb <= 6)
         return;
 
-    const unsigned int *oclut = (const unsigned int *)SATURN_WRAM_L_DIVLUT_ADDR;
+    extern unsigned int saturn_master_oclut[];   /* HW_Divlut_Init (saturn_hw_math.h) */
+    const unsigned int *oclut = saturn_master_oclut;
     int modified = 0;
 
     if (yLt < -8 && yRt < -8)
@@ -507,6 +515,8 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_sw_count +
                          (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
     {
+        extern int saturn_v1w_slotdrop;
+        saturn_v1w_slotdrop = 0;
         for (int i = saturn_visit_count - 1; i >= 0; i--)
         {
             const sub_range_t *r = &ranges[i];
@@ -520,7 +530,28 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     }
     else
     {
-        for (int i = saturn_visit_count - 1; i >= 0; i--)
+        /* Over the table (2026-11-21): the list is delivered far-to-near,
+         * so filling until the limit used to silently drop the NEAREST
+         * subsectors and the weapon (a missing near half of the view).
+         * Keep the weapon, then keep visits from the near end (visit 0 =
+         * nearest) while they fit, and drop the FARTHEST ones instead.
+         * The dropped command count goes to saturn_v1w_slotdrop (HUD X). */
+        extern int saturn_v1w_slotdrop;
+        uint32_t avail = fit_slots;
+        uint32_t used = 0, dropped = 0;
+        int i, keep;
+        avail = (avail > (uint32_t)saturn_cmd_w_count) ? avail - (uint32_t)saturn_cmd_w_count : 0u;
+        for (keep = 0; keep < saturn_visit_count; keep++)
+        {
+            uint32_t n = (uint32_t)ranges[keep].s_count + (uint32_t)ranges[keep].m_count;
+            if (used + n > avail)
+                break;
+            used += n;
+        }
+        for (i = keep; i < saturn_visit_count; i++)
+            dropped += (uint32_t)ranges[i].s_count + (uint32_t)ranges[i].m_count;
+        saturn_v1w_slotdrop = (int)dropped;
+        for (i = keep - 1; i >= 0; i--)
         {
             const sub_range_t *r = &ranges[i];
             if (r->s_count > 0)

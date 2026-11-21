@@ -451,7 +451,11 @@ void Saturn_HW_AdaptiveDetail(unsigned int frame_ticks, unsigned int rate)
         down_need = 45;
         since_up = 0;
     }
+#ifndef SATURN_WIN32
     if (!*(const volatile int32_t *)((const char *)&hw_ad_mode + 0x20000000u))
+#else
+    if (!hw_ad_mode)    /* no SH-2 cache-through alias on the PC (crashed the harness) */
+#endif
     {
         if (level != 0)
             HW_AdaptiveApply(level = 0);
@@ -1239,7 +1243,12 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         int wait_guard = 1000000; /* x 64 cycles: same timeout as before */
         while (1)
         {
-            if ((int)(ipc->job_tail - ipc->job_head) <= 0)
+            /* job_head is the slave's 32-bit store; with the ring in Low
+             * WRAM (16-bit bus) a read can catch it half-written at a
+             * 0xFFFF->0x10000 carry and end the wait while jobs remain
+             * (2026-11-21). Only trust two equal reads. */
+            uint32_t h1 = ipc->job_head, h2 = ipc->job_head;
+            if (h1 == h2 && (int)(ipc->job_tail - h1) <= 0)
                 break;
             if (--wait_guard <= 0)
                 break;

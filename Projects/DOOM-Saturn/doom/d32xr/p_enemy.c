@@ -1419,7 +1419,7 @@ void A_BossDeath (mobj_t *mo)
 		mapspecials = gamemapinfo->specials;
 
 	/* Saturn standalone: ensure standard Doom 1 / Doom 2 boss specials are active */
-	if (gamemap == 8 || (gameepisode == 1 && gamemap == 8))
+	if (gameepisode == 1 && gamemap == 8)	/* vanilla: barons are bosses on E1M8 only */
 		mapspecials |= MI_BARON_SPECIAL;
 	if (gamemap == 7)
 		mapspecials |= (MI_FATSO_SPECIAL | MI_BABY_SPECIAL);

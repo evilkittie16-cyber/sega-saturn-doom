@@ -3850,8 +3850,8 @@ static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
             if (seg->back_sec_idx >= 0 || key == last_key)
                 continue;
             last_key = key;
-            int near = overflow;            /* endpoint list full: keep every wall */
-            for (int e = 0; e < 2 && !near; e++)
+            int is_near = overflow;            /* endpoint list full: keep every wall */
+            for (int e = 0; e < 2 && !is_near; e++)
             {
                 int x = pil[seg->pillar_idx[e]].x, y = pil[seg->pillar_idx[e]].z;
                 for (int k = 0; k < ne; k++)
@@ -3859,10 +3859,10 @@ static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
                     int dx = x - ex[k], dy = y - ey[k];
                     if (dx < 0) dx = -dx;
                     if (dy < 0) dy = -dy;
-                    if (dx <= HW_V2P_NEAR_U && dy <= HW_V2P_NEAR_U) { near = 1; break; }
+                    if (dx <= HW_V2P_NEAR_U && dy <= HW_V2P_NEAR_U) { is_near = 1; break; }
                 }
             }
-            if (near)
+            if (is_near)
             {
                 hw_v2p_segf[ss->seg_start + i] = 2;
                 HW_V2P_MARK_SUB(s);

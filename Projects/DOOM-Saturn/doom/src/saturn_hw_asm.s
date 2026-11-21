@@ -2127,7 +2127,10 @@ _hw_asm_walk:
 	shlr2	r0
 	shlr	r0
 	mov.w	.Lw_k1023,r3
-	and	r3,r0
+	cmp/hi	r3,r0			! clamp (was & 1023: wrapped at 8192)
+	bf	3f
+	mov	r3,r0
+3:
 	add	r2,r0
 .Lw_tlk:
 	shll2	r0
@@ -2672,7 +2675,10 @@ _hw_asm_subap:
 	shlr2	r0
 	shlr	r0
 	mov.w	.Ls_k1023,r1
-	and	r1,r0
+	cmp/hi	r1,r0			! clamp (was & 1023: wrapped at 8192)
+	bf	3f
+	mov	r1,r0
+3:
 	mov.w	.Ls_k2048,r1
 	bra	.Ls_dlk
 	add	r1,r0
@@ -5458,7 +5464,10 @@ _hw_asm_subsec:
 	shll8	r1
 	shll2	r1
 	add	#-1,r1			! 1023
-	and	r1,r0
+	cmp/hi	r1,r0			! clamp (was & 1023: wrapped at 8192)
+	bf	3f
+	mov	r1,r0
+3:
 	mov	#8,r1
 	shll8	r1
 	bra	.Lv_dlk
@@ -5512,10 +5521,13 @@ _hw_asm_subsec:
 	mov	#4,r5
 	shll8	r5
 	add	#-1,r5			! 1023
-	and	r5,r0
+	cmp/hi	r5,r0			! clamp (was & 1023: wrapped at 8192)
+	bf	3f
+	mov	r5,r0
+3:
 	mov	#8,r5
 	shll8	r5
-	add	r5,r0			! 2048 + ((dist >> 3) & 1023)
+	add	r5,r0			! 2048 + min(dist >> 3, 1023)
 1:
 	shll2	r0
 	mov.l	@(24,r7),r5

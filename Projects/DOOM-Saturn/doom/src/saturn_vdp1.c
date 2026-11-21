@@ -254,7 +254,12 @@ static int             v1_page_flush[2] = { 1, 1 };
 #ifndef V1_EVICT_TARGET
 #define V1_EVICT_TARGET   (128u * 1024u)  /* free space to reach when evicting */
 #endif
-#define V1_OPT_RESERVE    (32u * 1024u)   /* headroom kept when adding optional wall copies */
+/* headroom kept when adding optional wall copies. 2026-11-21: was 32 KB,
+ * BELOW the 64 KB low-water mark - the same mistake as the flat-variant,
+ * warp and late-copy reserves (each fixed to LOWWATER + x): copies could
+ * eat the space down to 32 KB, so the next required upload was refused and
+ * a low-water eviction ran. */
+#define V1_OPT_RESERVE    (V1_EVICT_LOWWATER + 8u * 1024u)
 #define V1_LOG_MAX        1024
 #if defined(__GNUC__) && !defined(__cplusplus)
 _Static_assert(V1_LOG_MAX * 2 <= SATURN_WRAM_L_EVICT_SIZE, "v1_evict candidate list must fit SATURN_WRAM_L_EVICT");
@@ -1472,9 +1477,30 @@ static int v1_evict(unsigned int target)
         n = k;
         v1_log_n = n;
     }
-    v1_want_bytes = 0;
-    Saturn_Vdp1_ClearTexCacheMRU();
-    saturn_v1_evictions++;
+    /* 2026-11-21: enough total free space is not enough when the live
+     * list's protected entries fragment the arena so that the refused
+     * upload still has no hole: then the same upload was refused (and the
+     * wall missing) every frame, forever (hardware E3M6: steady HUD X4,
+     * half the walls gone). Two evictions in a row that leave the refused
+     * size without a hole report failure -> the caller full-flushes. */
+    {
+        static int nohole_streak = 0;
+        const unsigned int need_b = (v1_want_bytes + 31u) & ~31u;
+        int pos_unused;
+        v1_want_bytes = 0;
+        Saturn_Vdp1_ClearTexCacheMRU();
+        saturn_v1_evictions++;
+        if (need_b > 0 && v1_find_gap(need_b, &pos_unused) == 0)
+        {
+            if (++nohole_streak >= 2)
+            {
+                nohole_streak = 0;
+                return 0;
+            }
+        }
+        else
+            nohole_streak = 0;
+    }
     return v1_free_total() >= (16u * 1024u);
 }
 
@@ -2242,6 +2268,9 @@ void Saturn_Vdp1Quad_PspDump(int *k, int *rows, int *xa)
 }
 #endif /* !SATURN_3A_BYPASS */
 
+static int s_mru_flat = -999;       /* Saturn_Vdp1_GetFlatSrca MRU */
+static int s_mru_flat_srca = 0;
+
 void Saturn_Vdp1Wall_Reset(void)
 {
     /* Arena double buffer (2026-10-05). VDP1 keeps re-rasterising the
@@ -2268,6 +2297,8 @@ void Saturn_Vdp1Wall_Reset(void)
         /* tick per frame too, so marks advance even without uploads */
         v1_age_mark_prev = v1_age_mark_cur;
         v1_age_mark_cur  = ++v1_age;
+        if (s_mru_flat_srca == 0)
+            s_mru_flat = -999;      /* retry a refused flat once per frame */
     }
     v1_page_off[0] = v1_arena_off;
     v1_page_off[1] = v1_arena_off;
@@ -2324,6 +2355,21 @@ void Saturn_Vdp1Wall_Reset(void)
                     __asm__ volatile("nop");
             }
         }
+#if SATURN_V1_MANUAL
+        /* Manual frame change (2026-11-21): the list committed last frame
+         * can still be PENDING (not yet started) while CEF reads 1 from the
+         * previous draw, and it references the textures about to be
+         * dropped. Wait (bounded, ~3 fields) until it has been drawn. */
+        if (saturn_v1_manual && v1m_double)
+        {
+            unsigned guard2 = 35000u;   /* x ~40 cycles = ~50 ms */
+            while ((v1m_pending || !v1m_draw_done()) && --guard2)
+            {
+                for (int w = 0; w < 32; w++)
+                    __asm__ volatile("nop");
+            }
+        }
+#endif
 #endif
         if (v1_tag[0])
         {
@@ -2565,19 +2611,22 @@ int Saturn_Vdp1FlatQuad_Add(int x0, int y0,
                                0, 0);
 }
 
-static int s_mru_flat = -999;
-static int s_mru_flat_srca = 0;
 
 int Saturn_Vdp1_GetFlatSrca(int flatnum)
 {
     if (flatnum < 0)
         return 0;
-    if (flatnum == s_mru_flat)
+    /* Keyed on the translated flat (2026-11-21): an animated flat's old
+     * frame used to be returned until some other flat replaced the MRU
+     * entry. A cached refusal (0) is dropped at every frame start
+     * (Saturn_Vdp1Wall_Reset) so the upload is retried next frame. */
+    int f = (flattranslation && flatnum < numflats) ? flattranslation[flatnum] : flatnum;
+    if (f == s_mru_flat)
         return s_mru_flat_srca;
 
     int tw, th;
     s_mru_flat_srca = v1_tex_get(-(flatnum + 1), &tw, &th);
-    s_mru_flat = flatnum;
+    s_mru_flat = f;
     return s_mru_flat_srca;
 }
 
@@ -2972,7 +3021,13 @@ int Saturn_Vdp1_GetTexSrca(int texnum, int *tw, int *th)
     if (texnum <= 0)
         return 0;
 
-    if (texnum == s_mru_texnum && s_mru_srca != 0)
+    /* MRU keyed on the TRANSLATED texture (2026-11-21): keyed on texnum it
+     * kept returning an animated wall's previous frame after
+     * texturetranslation moved on, and that frame was never uploaded. */
+    int t = texturetranslation ? texturetranslation[texnum] : texnum;
+    if ((unsigned)t >= (unsigned)numtextures)
+        t = texnum;
+    if (t == s_mru_texnum && s_mru_srca != 0)
     {
         *tw = s_mru_w;
         *th = s_mru_h;
@@ -2980,12 +3035,9 @@ int Saturn_Vdp1_GetTexSrca(int texnum, int *tw, int *th)
     }
 
     s_mru_srca = v1_tex_get(texnum, tw, th);
-    s_mru_texnum = texnum;
+    s_mru_texnum = t;
     s_mru_w = *tw;
     s_mru_h = *th;
-    int t = texturetranslation ? texturetranslation[texnum] : texnum;
-    if ((unsigned)t >= (unsigned)numtextures)
-        t = texnum;
     if (v1_tag[v1_tex_page] && v1_tag[v1_tex_page][t].srca_mono)
         s_mru_srca_mono = (int)v1_tag[v1_tex_page][t].srca_mono;
     else
@@ -2997,8 +3049,13 @@ int Saturn_Vdp1_GetTexSrcaMono(int texnum)
 {
     if (texnum <= 0)
         return 0;
-    if (texnum == s_mru_texnum && s_mru_srca_mono != 0)
-        return s_mru_srca_mono;
+    {
+        int t = texturetranslation ? texturetranslation[texnum] : texnum;
+        if ((unsigned)t >= (unsigned)numtextures)
+            t = texnum;
+        if (t == s_mru_texnum && s_mru_srca_mono != 0)
+            return s_mru_srca_mono;
+    }
     int tw, th;
     Saturn_Vdp1_GetTexSrca(texnum, &tw, &th);
     return s_mru_srca_mono;

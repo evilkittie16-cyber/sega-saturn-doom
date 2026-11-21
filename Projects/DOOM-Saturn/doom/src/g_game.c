@@ -123,6 +123,12 @@ void Saturn_G_InitNew(int skill, int episode, int map)
     {
         players[i].playerstate = PST_REBORN;
         players[i].mo = (mobj_t *)&emptymobj;   /* net consistency checks */
+        /* Per-level stats (2026-11-21): d32xr zeroes these in its (unlinked)
+         * G_DoLoadLevel; G_PlayerReborn carries them over, so without this
+         * the intermission showed the running total of all levels. */
+        players[i].killcount   = 0;
+        players[i].itemcount   = 0;
+        players[i].secretcount = 0;
         if (saturn_new_game)
             P_ResetResp(&players[i]);   /* fresh game: 100 hp, pistol, 50 */
     }

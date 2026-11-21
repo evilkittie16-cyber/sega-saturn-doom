@@ -350,8 +350,26 @@ void Saturn_VDP2_Plane_Frame(fixed_t camx, fixed_t camy, fixed_t camz, angle_t c
      * still refers to; it goes on screen with this frame's VDP1 list. */
     {
         int w = 0;
-        while (w < SATURN_V2P_SLOTS - 1 &&
-               (w == saturn_v2p_shown || w == saturn_v2p_drawing || w == saturn_v2p_pending))
+        int sh, dr, pe;
+        /* Snapshot the three slots atomically (2026-11-21): the vblank
+         * callback rotates them (shown <- drawing <- pending); reading them
+         * one by one across a rotation could pick the slot now on screen
+         * and overwrite its tables (plane swims for a field). After a
+         * consistent snapshot a later rotation only moves slots within
+         * that set, so the chosen one stays free. */
+#ifndef SATURN_WIN32
+        {
+            unsigned int sr, sr_off;
+            __asm__ volatile("stc sr,%0" : "=r"(sr));
+            sr_off = sr | 0xF0u;
+            __asm__ volatile("ldc %0,sr" : : "r"(sr_off) : "memory");
+            sh = saturn_v2p_shown; dr = saturn_v2p_drawing; pe = saturn_v2p_pending;
+            __asm__ volatile("ldc %0,sr" : : "r"(sr) : "memory");
+        }
+#else
+        sh = saturn_v2p_shown; dr = saturn_v2p_drawing; pe = saturn_v2p_pending;
+#endif
+        while (w < SATURN_V2P_SLOTS - 1 && (w == sh || w == dr || w == pe))
             w++;
         v2_kt = v2_kts[w];
         v2_rtable = v2_rtables[w];
