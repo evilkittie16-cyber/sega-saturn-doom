@@ -7797,3 +7797,483 @@ _hw_asm_things:
 .Lt_ctx:	.long	_hw_asm_things_ctx
 .Lt_minz:	.long	0x000C0000
 .Lt_c128:	.long	0x00800000
+
+! ===================================================================
+! Stage I2: int hw_asm_sprq(sector_t *sec, int subnum, hw_sec_spr_t *q)
+! = HW_SprQueue_C (saturn_hw_sprites.c): project a subsector's bucketed
+! things and queue the visible ones; returns the count. Calls
+! R_PointToAngle, Saturn_SpritePatch and the span-occlusion test.
+! Table hw_asm_sprq_ctx (see the C side for the slot list).
+! Frame (88 B): [0] 5th call arg [4] w [8] h [12] lofs [16] tofs [20] sec
+! [24] q [28] count [32] flip [36] scache [40] st [48] frame
+! [56..87] thing list.
+! Regs: r8 ctx, r9 ti, r10 sl / queue entry, r11 s, r12 mo, r13 cz, r14 cx
+! queue entry 20 B: cz 0, scache 4, xA 6, xB 8, yt 10, yb 12, h 14, shade 16
+! ===================================================================
+	.align	2
+	.global	_hw_asm_sprq
+_hw_asm_sprq:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-88,r15
+	mov.l	.Lsq_ctx,r8
+	mov.l	r4,@(20,r15)		! sec
+	mov.l	r6,@(24,r15)		! queue
+	mov	#0,r0
+	mov.l	r0,@(28,r15)		! count = 0
+	! thing list: first_thing[subnum], then pool[].next, up to 32
+	mov.l	@(4,r8),r1
+	mov	r5,r0
+	mov.b	@(r0,r1),r2
+	extu.b	r2,r2			! tidx
+	mov.l	@r8,r3			! pool
+	mov	r15,r7
+	add	#56,r7			! thing list
+	mov	#-1,r10
+	extu.b	r10,r10			! 0xFF
+	mov	#0,r9			! n
+.Lsq_col:
+	cmp/eq	r10,r2
+	bt	.Lsq_coldone
+	mov	#32,r0
+	cmp/ge	r0,r9
+	bt	.Lsq_coldone
+	mov	r9,r0
+	mov.b	r2,@(r0,r7)
+	add	#1,r9
+	mov	r2,r0
+	shll2	r0
+	shll2	r0
+	add	#12,r0
+	mov.b	@(r0,r3),r2
+	bra	.Lsq_col
+	extu.b	r2,r2
+.Lsq_coldone:
+	tst	r9,r9
+	bt	.Lsq_out
+	add	#-1,r9			! ti = n - 1
+.Lsq_thing:
+	mov	r15,r7
+	add	#56,r7
+	mov	r9,r0
+	mov.b	@(r0,r7),r0
+	extu.b	r0,r0
+	shll2	r0
+	shll2	r0
+	mov.l	@r8,r1
+	add	r0,r1			! te
+	mov.l	@r1,r12			! mo
+	mov.l	@(4,r1),r13		! cz
+	mov.l	@(8,r1),r14		! cx
+	mov.w	@(22,r12),r0		! mo->state
+	mov	r0,r1
+	add	r0,r0
+	add	r1,r0
+	shll2	r0			! state * 12
+	mov.l	@(8,r8),r1
+	add	r0,r1			! st
+	mov.l	r1,@(40,r15)
+	mov.w	@r1,r3
+	extu.w	r3,r3			! st->sprite
+	mov	#64,r0
+	mov.l	@(r0,r8),r2		! NUMSPRITES
+	cmp/hs	r2,r3
+	bt	.Lsq_skip
+	mov.l	@(12,r8),r0
+	mov.l	@r0,r0			! sprites
+	shll2	r3
+	add	r3,r0			! sprdef
+	mov.w	@r0,r2			! numframes
+	cmp/pl	r2
+	bf	.Lsq_skip
+	mov.w	@(2,r0),r0		! firstframe
+	mov	r0,r3
+	mov.w	@(2,r1),r0		! st->frame
+	extu.w	r0,r0
+	mov.l	r0,@(48,r15)
+	mov.w	.Lsq_7fff,r1
+	and	r1,r0			! frame & FF_FRAMEMASK
+	cmp/ge	r2,r0
+	bt	.Lsq_skip
+	add	r3,r0
+	add	r0,r0			! spriteframe index * 2
+	mov.l	@(16,r8),r1
+	mov.l	@r1,r1			! spriteframes
+	mov.w	@(r0,r1),r0		! sf->lump
+	add	r0,r0
+	mov.l	@(20,r8),r1
+	mov.l	@r1,r1			! spritelumps
+	add	r0,r1			! sl
+	mov.w	@r1,r2			! sl[0] (sign-extended)
+	cmp/pz	r2			! SL_SINGLESIDED clear -> rotate
+	bf	.Lsq_lump
+	mov	r1,r10			! sl
+	mov.l	@(32,r8),r4
+	mov.l	@r4,r4			! vx
+	mov.l	@(36,r8),r5
+	mov.l	@r5,r5			! vy
+	mov.l	@r12,r6			! mo->x
+	mov.l	@(4,r12),r7		! mo->y
+	mov.l	@(44,r8),r0
+	jsr	@r0			! R_PointToAngle
+	nop
+	mov	r0,r2
+	mov	#68,r0
+	mov.l	@(r0,r12),r1		! mo->angle
+	sub	r1,r2
+	mov.l	.Lsq_rotb,r1		! (ANG45 / 2) * 9
+	add	r1,r2
+	shlr16	r2
+	shlr8	r2
+	shlr2	r2
+	shlr2	r2
+	shlr	r2			! >> 29
+	mov	r2,r0
+	and	#7,r0
+	add	r0,r0
+	mov.w	@(r0,r10),r2		! sl[rot]
+.Lsq_lump:
+	extu.w	r2,r2			! lumpv
+	mov.w	.Lsq_4000,r1
+	mov	r2,r3
+	and	r1,r3
+	mov.l	r3,@(32,r15)		! flip (0x4000 or 0)
+	mov.w	.Lsq_3fff,r1
+	and	r1,r2			! lump
+	mov.l	@(24,r8),r1
+	mov.w	@r1,r1			! firstsprite
+	sub	r1,r2			! scache
+	cmp/pz	r2
+	bf	.Lsq_skip
+	mov.l	@(28,r8),r1
+	mov.w	@r1,r1			! numsprites
+	cmp/ge	r1,r2
+	bt	.Lsq_skip
+	mov.l	r2,@(36,r15)
+	mov	r2,r4
+	mov	r15,r5
+	add	#4,r5			! &w
+	mov	r15,r6
+	add	#8,r6			! &h
+	mov	r15,r7
+	add	#12,r7			! &lofs
+	mov	r15,r0
+	add	#16,r0
+	mov.l	r0,@r15			! &tofs (5th argument)
+	mov.l	@(48,r8),r0
+	jsr	@r0			! Saturn_SpritePatch
+	nop
+	tst	r0,r0
+	bt	.Lsq_skip
+	mov.l	@(4,r15),r1		! w
+	cmp/pl	r1
+	bf	.Lsq_skip
+	mov.l	@(8,r15),r0		! h
+	cmp/pl	r0
+	bf	.Lsq_skip
+	! s = HW_FastDiv(cz)
+	mov	r13,r0
+	shlr16	r0			! dist
+	mov.w	.Lsq_2048,r2
+	cmp/hs	r2,r0
+	bf	.Lsq_near
+	shlr2	r0
+	shlr	r0			! k = dist >> 3
+	mov.w	.Lsq_1023,r3
+	cmp/hi	r3,r0
+	bf	.Lsq_kok
+	mov	r3,r0
+.Lsq_kok:
+	add	r2,r0			! far entry
+.Lsq_near:
+	shll2	r0
+	mov.l	@(52,r8),r2
+	mov.l	@(r0,r2),r11		! s
+	! cx_screen = 160 + hi(cx * s)
+	dmuls.l	r14,r11
+	sts	mach,r3
+	mov.w	.Lsq_160,r0
+	add	r0,r3			! cx_screen
+	! pw = (w + 7) & ~7, wpx = (pw * s) >> 16
+	mov	r1,r2
+	add	#7,r2
+	mov	#-8,r0
+	and	r0,r2
+	dmuls.l	r2,r11
+	sts	mach,r6
+	sts	macl,r2
+	xtrct	r6,r2			! wpx
+	! xl = cx_screen - ((lofs * s) >> 16)
+	mov.l	@(12,r15),r0
+	dmuls.l	r0,r11
+	sts	mach,r6
+	sts	macl,r0
+	xtrct	r6,r0
+	mov	r3,r5
+	sub	r0,r5			! xl
+	! x2t = xl + ((w * s) >> 16) - 1
+	dmuls.l	r1,r11
+	sts	mach,r6
+	sts	macl,r0
+	xtrct	r6,r0
+	add	r5,r0
+	add	#-1,r0			! x2t
+	mov.l	@(32,r15),r1
+	tst	r1,r1
+	bt	.Lsq_nf
+	mov	r0,r6			! xA = x2t
+	mov	r0,r7
+	sub	r2,r7
+	bra	.Lsq_xd
+	add	#1,r7			! xB = xA - wpx + 1
+	! mid-function literal pool (mov.w reaches only 510 bytes forward)
+	.align	2
+.Lsq_7fff:	.word	0x7FFF
+.Lsq_4000:	.word	0x4000
+.Lsq_3fff:	.word	0x3FFF
+.Lsq_2048:	.word	2048
+.Lsq_1023:	.word	1023
+.Lsq_160:	.word	160
+.Lsq_nf:
+	mov	r5,r6			! xA = xl
+	mov	r5,r7
+	add	r2,r7
+	add	#-1,r7			! xB = xl + wpx - 1
+.Lsq_xd:
+	! yt = view_cy - hi((mo->z + (tofs << 16) - vz) * s)
+	mov.l	@(8,r12),r1
+	mov.l	@(16,r15),r0
+	shll16	r0
+	add	r0,r1
+	mov.l	@(40,r8),r0
+	mov.l	@r0,r0			! vz
+	sub	r0,r1
+	dmuls.l	r1,r11
+	sts	mach,r1
+	mov	#72,r0
+	mov.l	@(r0,r8),r0
+	mov.l	@r0,r4			! view_cy
+	sub	r1,r4			! yt
+	mov.l	@(8,r15),r0		! h
+	dmuls.l	r0,r11
+	sts	mach,r1
+	sts	macl,r5
+	xtrct	r1,r5
+	add	r4,r5			! yb = yt + ((h * s) >> 16)
+	! spans over 1023 (C order)
+	mov.w	.Lsq_1023b,r1
+	mov.w	.Lsq_m703,r2		! -(1023 - 320)
+	mov	r7,r0
+	sub	r6,r0
+	cmp/gt	r1,r0
+	bf	.Lsq_c2
+	cmp/ge	r2,r6
+	bt	.Lsq_c1b
+	mov	r7,r6
+	bra	.Lsq_c3
+	sub	r1,r6			! xA = xB - 1023
+.Lsq_c1b:
+	mov	r6,r7
+	bra	.Lsq_c3
+	add	r1,r7			! xB = xA + 1023
+.Lsq_c2:
+	mov	r6,r0
+	sub	r7,r0
+	cmp/gt	r1,r0
+	bf	.Lsq_c3
+	cmp/ge	r2,r7
+	bt	.Lsq_c2b
+	mov	r6,r7
+	bra	.Lsq_c3
+	sub	r1,r7			! xB = xA - 1023
+.Lsq_c2b:
+	mov	r7,r6
+	add	r1,r6			! xA = xB + 1023
+.Lsq_c3:
+	mov	r5,r0
+	sub	r4,r0
+	cmp/gt	r1,r0
+	bf	.Lsq_c4
+	mov	#76,r0
+	mov.l	@(r0,r8),r0
+	mov.l	@r0,r2			! view_h
+	sub	r1,r2			! view_h - 1023
+	cmp/ge	r2,r4
+	bt	.Lsq_c3b
+	mov	r5,r4
+	bra	.Lsq_c4
+	sub	r1,r4			! yt = yb - 1023
+.Lsq_c3b:
+	mov	r4,r5
+	add	r1,r5			! yb = yt + 1023
+.Lsq_c4:
+	mov.w	.Lsq_m1024,r2
+	cmp/ge	r2,r6
+	bt	1f
+	mov	r2,r6
+1:	cmp/gt	r1,r6
+	bf	2f
+	mov	r1,r6
+2:	cmp/ge	r2,r7
+	bt	3f
+	mov	r2,r7
+3:	cmp/gt	r1,r7
+	bf	4f
+	mov	r1,r7
+4:	cmp/ge	r2,r4
+	bt	5f
+	mov	r2,r4
+5:	cmp/gt	r1,r4
+	bf	6f
+	mov	r1,r4
+6:	cmp/ge	r2,r5
+	bt	7f
+	mov	r2,r5
+7:	cmp/gt	r1,r5
+	bf	8f
+	mov	r1,r5
+8:	! x_min / x_max
+	mov	r6,r2
+	mov	r7,r3
+	cmp/gt	r3,r2
+	bf	.Lsq_mm
+	mov	r7,r2
+	mov	r6,r3
+.Lsq_mm:
+	cmp/pl	r3			! x_max > 0
+	bf	.Lsq_skip
+	mov.w	.Lsq_320,r0
+	cmp/ge	r0,r2			! x_min >= 320
+	bt	.Lsq_skip
+	cmp/eq	r2,r3
+	bt	.Lsq_skip
+	cmp/pl	r5			! yb > 0
+	bf	.Lsq_skip
+	mov	#76,r0
+	mov.l	@(r0,r8),r0
+	mov.l	@r0,r0			! view_h
+	cmp/ge	r0,r4			! yt >= view_h
+	bt	.Lsq_skip
+	cmp/ge	r5,r4			! yt >= yb
+	bt	.Lsq_skip
+	! queue slot (count < 32), written now; kept only if visible
+	mov.l	@(28,r15),r0
+	mov	#32,r1
+	cmp/ge	r1,r0
+	bt	.Lsq_skip
+	mov	r0,r1
+	shll2	r0
+	add	r1,r0
+	shll2	r0			! count * 20
+	mov.l	@(24,r15),r10
+	add	r0,r10			! entry
+	mov.l	r13,@r10		! cz
+	mov.l	@(36,r15),r0
+	mov.w	r0,@(4,r10)		! scache
+	mov	r6,r0
+	mov.w	r0,@(6,r10)		! xA
+	mov	r7,r0
+	mov.w	r0,@(8,r10)		! xB
+	mov	r4,r0
+	mov.w	r0,@(10,r10)		! yt
+	mov	r5,r0
+	mov.w	r0,@(12,r10)		! yb
+	mov.l	@(8,r15),r0
+	mov.w	r0,@(14,r10)		! h
+	mov.l	@(56,r8),r0
+	mov.l	@r0,r0			! hw_solid_count
+	tst	r0,r0
+	bt	.Lsq_vis
+	cmp/pz	r2
+	bt	9f
+	mov	#0,r2			! cull_x0
+9:	mov.w	.Lsq_320,r0
+	cmp/gt	r0,r3
+	bf	10f
+	mov	r0,r3			! cull_x1
+10:	mov	r2,r4
+	mov	r3,r5
+	mov.l	@(60,r8),r0
+	jsr	@r0			! span occlusion
+	nop
+	cmp/eq	#2,r0
+	bt	.Lsq_skip
+.Lsq_vis:
+	mov	#0,r2			! shade (fullbright)
+	mov.l	@(48,r15),r0		! frame
+	mov.w	.Lsq_8000,r1
+	tst	r1,r0
+	bf	.Lsq_shade
+	mov	#80,r0
+	mov.l	@(r0,r8),r0		! offsetof(sector_t, lightlevel)
+	mov.l	@(20,r15),r1
+	mov.b	@(r0,r1),r1		! lightlevel (uint8_t)
+	extu.b	r1,r1
+	mov.w	.Lsq_255,r0
+	cmp/hi	r0,r1			! (unsigned)light > 255
+	bf	.Lsq_lok
+	cmp/pz	r1
+	bt	.Lsq_l255
+	bra	.Lsq_lok
+	mov	#0,r1
+.Lsq_l255:
+	mov	r0,r1
+.Lsq_lok:
+	shlr2	r1
+	shlr2	r1			! light >> 4
+	shll8	r1
+	shlr	r1			! * 128
+	mov	r13,r0
+	shlr16	r0
+	shlr2	r0
+	shlr2	r0			! zb = (cz >> 16) >> 4
+	mov	#127,r3
+	cmp/hi	r3,r0
+	bf	.Lsq_zok
+	mov	r3,r0
+.Lsq_zok:
+	add	r1,r0
+	mov	r0,r3			! LUT index
+	mov	#68,r0
+	mov.l	@(r0,r8),r1		! wall_zlight_level_LUT
+	mov	r3,r0
+	mov.b	@(r0,r1),r2
+	extu.b	r2,r2			! shade
+.Lsq_shade:
+	mov	r2,r0
+	mov.w	r0,@(16,r10)		! shade
+	mov.l	@(28,r15),r0
+	add	#1,r0
+	mov.l	r0,@(28,r15)		! count++
+.Lsq_skip:
+	add	#-1,r9
+	cmp/pz	r9
+	bt	.Lsq_thing
+.Lsq_out:
+	mov.l	@(28,r15),r0
+	add	#88,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+	.align	2
+.Lsq_ctx:	.long	_hw_asm_sprq_ctx
+.Lsq_rotb:	.long	0x90000000
+.Lsq_1023b:	.word	1023
+.Lsq_m703:	.word	-703
+.Lsq_m1024:	.word	-1024
+.Lsq_320:	.word	320
+.Lsq_8000:	.word	0x8000
+.Lsq_255:	.word	255

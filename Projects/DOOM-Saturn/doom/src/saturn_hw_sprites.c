@@ -266,30 +266,28 @@ static HW_NOINLINE HW_HOT_O2 int HW_SubsectorHasThings(sector_t *sec, uint32_t s
     return (hw_sub_has_things[(unsigned int)subnum >> 5] & hw_bit_lut[subnum & 31]) != 0;
 }
 
-/* Render pre-bucketed visible mobjs (monsters, items, pickups) in subsector */
-static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorSprites(sector_t *sec, int subnum)
+typedef struct {
+    fixed_t cz;
+    int16_t scache;
+    int16_t xA, xB, yt, yb;
+    int16_t h;
+    int16_t shade;
+    int16_t pad;
+} hw_sec_spr_t;     /* 20 bytes; asm stage I2 (hw_asm_sprq) writes these */
+
+/* Project a subsector's bucketed things and queue the visible ones, in the
+ * order the depth sort below expects (C reference of hw_asm_sprq). */
+static HW_NOINLINE HW_HOT_O2 int HW_SprQueue_C(sector_t *sec, int subnum, hw_sec_spr_t *spr_queue)
 {
-    static uint8_t thing_list[32];
-    static uint8_t spr_order[32];
-    static int     spr_dims[4];
+    uint8_t thing_list[32];
+    int     spr_dims[4];
     int n_things = 0;
     for (uint8_t tidx = hw_sub_first_thing[subnum]; tidx != 0xFFu && n_things < 32; tidx = hw_thing_pool[tidx].next)
         thing_list[n_things++] = tidx;
     if (n_things <= 0)
-        return;
+        return 0;
 
-    typedef struct {
-        fixed_t cz;
-        int16_t scache;
-        int16_t xA, xB, yt, yb;
-        int16_t h;
-        int16_t shade;
-        int16_t pad;
-    } hw_sec_spr_t;
-
-    static hw_sec_spr_t spr_queue[32];
     int          spr_count = 0;
-    int          i;
     const fixed_t vx = hw_viewx;
     const fixed_t vy = hw_viewy;
     const fixed_t vz = hw_viewz;
@@ -405,6 +403,86 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorSprites(sector_t *sec, int s
             }
         }
     }
+    return spr_count;
+}
+
+/* Asm stage I2 (saturn_hw_asm.s hw_asm_sprq): the queue builder above. */
+#ifndef HW_ASM_SPRQ
+#define HW_ASM_SPRQ HW_ASM
+#endif
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+#if HW_ASM_SPRQ
+extern int hw_asm_sprq(sector_t *sec, int subnum, hw_sec_spr_t *queue);
+_Static_assert(sizeof(hw_sec_spr_t) == 20 && offsetof(hw_sec_spr_t, scache) == 4 &&
+               offsetof(hw_sec_spr_t, xA) == 6 && offsetof(hw_sec_spr_t, xB) == 8 &&
+               offsetof(hw_sec_spr_t, yt) == 10 && offsetof(hw_sec_spr_t, yb) == 12 &&
+               offsetof(hw_sec_spr_t, h) == 14 && offsetof(hw_sec_spr_t, shade) == 16, "sprq: queue");
+_Static_assert(sizeof(state_t) == 12 && offsetof(state_t, frame) == 2, "sprq: state_t");
+_Static_assert(sizeof(spritedef_t) == 4 && offsetof(spritedef_t, firstframe) == 2 &&
+               sizeof(spriteframe_t) == 2, "sprq: spritedef");
+_Static_assert(sizeof(*spritelumps) == 2 && sizeof(firstsprite) == 2 && sizeof(numsprites) == 2, "sprq: lumps");
+_Static_assert(offsetof(mobj_t, z) == 8, "sprq: mobj z");
+_Static_assert(offsetof(mobj_t, angle) == 68, "sprq: mobj angle");
+_Static_assert(sizeof(((sector_t *)0)->lightlevel) == 1, "sprq: lightlevel (uint8_t)");
+_Static_assert(sizeof(saturn_view_cy) == 4 && sizeof(saturn_view_h) == 4, "sprq: view globals");
+_Static_assert(HW_VIEW_CX == 160 && HW_VIEW_W == 320, "sprq: view consts");
+_Static_assert(SATURN_OCLUT_ENTRIES == 2048 && SATURN_OCLUT_FAR_OFFSET == 2048 &&
+               SATURN_OCLUT_FAR_ENTRIES == 1024 && sizeof(wall_zlight_level_LUT[0]) == 128, "sprq: tables");
+/* [0] hw_thing_pool [4] hw_sub_first_thing [8] states [12] &sprites
+ * [16] &spriteframes [20] &spritelumps [24] &firstsprite [28] &numsprites
+ * [32] &hw_viewx [36] &hw_viewy [40] &hw_viewz [44] R_PointToAngle
+ * [48] Saturn_SpritePatch [52] saturn_master_oclut [56] &hw_solid_count
+ * [60] span occlusion (2 = fully occluded) [64] NUMSPRITES
+ * [68] wall_zlight_level_LUT [72] &saturn_view_cy [76] &saturn_view_h
+ * [80] offsetof(sector_t, lightlevel) */
+const void *const hw_asm_sprq_ctx[21] = {
+    hw_thing_pool, hw_sub_first_thing, states, &sprites, &spriteframes, &spritelumps,
+    &firstsprite, &numsprites, &hw_viewx, &hw_viewy, &hw_viewz, (const void *)R_PointToAngle,
+    (const void *)Saturn_SpritePatch, saturn_master_oclut, &hw_solid_count,
+    (const void *)HW_CheckSpanOcclusion, (const void *)(uintptr_t)NUMSPRITES, wall_zlight_level_LUT,
+    &saturn_view_cy, &saturn_view_h, (const void *)(uintptr_t)offsetof(sector_t, lightlevel)
+};
+#else
+const void *const hw_asm_sprq_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+#endif
+#if HW_ASM_SPRQ && HW_ASM_CHECK && !defined(SATURN_WIN32)
+/* [0] calls [1] mismatches [2] asm count [3] C count [4] first differing byte */
+static volatile uint32_t hw_asm_chk_sprq[8];
+static HW_NOINLINE int HW_SprQueueSel(sector_t *sec, int subnum, hw_sec_spr_t *q)
+{
+    static hw_sec_spr_t qc[32];
+    int na = hw_asm_sprq(sec, subnum, q);
+    int nc = HW_SprQueue_C(sec, subnum, qc);
+    hw_asm_chk_sprq[0]++;
+    if ((na != nc || memcmp(q, qc, (size_t)nc * sizeof(*q)) != 0) && hw_asm_chk_sprq[1]++ == 0)
+    {
+        hw_asm_chk_sprq[2] = (uint32_t)na;
+        hw_asm_chk_sprq[3] = (uint32_t)nc;
+        for (uint32_t i = 0; i < (uint32_t)nc * sizeof(*q); i++)
+            if (((const uint8_t *)q)[i] != ((const uint8_t *)qc)[i])
+            {
+                hw_asm_chk_sprq[4] = i;
+                break;
+            }
+    }
+    return na;
+}
+#elif HW_ASM_SPRQ && !defined(SATURN_WIN32)
+#define HW_SprQueueSel(sec, subnum, q) hw_asm_sprq((sec), (subnum), (q))
+#else
+#define HW_SprQueueSel(sec, subnum, q) HW_SprQueue_C((sec), (subnum), (q))
+#endif
+
+/* Render pre-bucketed visible mobjs (monsters, items, pickups) in subsector */
+static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorSprites(sector_t *sec, int subnum)
+{
+    static uint8_t      spr_order[32];
+    static hw_sec_spr_t spr_queue[32];
+    int i;
+    int spr_count = HW_SprQueueSel(sec, subnum, spr_queue);
+    if (spr_count <= 0)
+        return;
 
     /* Depth sort buffered sector sprites descending by cz (far first, near last).
      * NOTE ON TOPOLOGICAL DELIVERY: While Saturn_CmdBuf_Deliver() reverses the order
