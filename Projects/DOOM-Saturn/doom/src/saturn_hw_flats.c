@@ -65,6 +65,32 @@ static_assert(sizeof(hw_flat_job_t) == 96, "hw_flat_job_t must be 96 bytes ((rin
 
 #define HW_JOB_RING      256            /* power of two ring buffer */
 
+/* Deferred walls shared by both CPUs (HW_SLAVE_WALLS, saturn_hw_walls.c).
+ * The slave takes queued subsectors from the front (s_claim counts up),
+ * the master from the back after the walk (m_claim counts down). Each side
+ * publishes its claim, reads it back, then reads the other's: whoever sees
+ * the other at or past its index gives up the item; any item both gave up
+ * lies in [s_done, master's lowest) and the master emits it at the end. */
+typedef struct {
+    /* Protocol words are 16-bit: Low WRAM is a 16-bit bus, so a 32-bit
+     * store is two bus writes the other CPU could read half-done. */
+    volatile int16_t gen;        /* master: bumped at frame start, after the reset below */
+    volatile int16_t ready;      /* master: closed subsectors published (hw_defer_sub[0..ready)) */
+    volatile int16_t walk_done;  /* master: 1 once ready is final */
+    volatile int16_t m_claim;    /* master: item it is about to take; 0x7FFF before pass 2 */
+    volatile int16_t s_claim;    /* slave: item it is about to take; -1 before */
+    volatile int16_t s_done;     /* slave: it emitted [0, s_done) */
+    volatile int16_t s_stopped;  /* slave: finished for this gen */
+    volatile int16_t pad16;
+    volatile int s_cmds;     /* slave: quads used in its cmd_m region (read once stopped) */
+    volatile int s_quads;    /* slave stats: wall quads, strips, texture misses */
+    volatile int s_strips;
+    volatile int s_miss;
+    volatile int s_subs;
+    uint32_t subs, recs, snaps, ranges, cmd_m;   /* master addresses */
+    uint32_t pad[3];
+} hw_wall_ipc_t;
+
 typedef struct {
     /* Camera parameters latched per-frame (32 bytes) */
     fixed_t viewx;
@@ -93,7 +119,29 @@ typedef struct {
 
     /* Job queue (ring) */
     hw_flat_job_t jobs[HW_JOB_RING];
+
+    hw_wall_ipc_t walls;    /* HW_SLAVE_WALLS */
+
+    /* HW_FLAT_STEAL (2026-11-17): after its walk the master takes flat jobs
+     * from the back of the ring instead of spinning. 16-bit words (Low WRAM
+     * is a 16-bit bus: one store, never torn), low 16 bits of the free-
+     * running job counters, compared with int16 differences. */
+    volatile uint16_t m_limit16;  /* master: jobs >= this are the master's ("far" = none) */
+    volatile uint16_t s_claim16;  /* slave: job it is about to take */
+    volatile uint16_t s_stop16;   /* slave: first job it left (it saw m_limit16 <= it) */
+    volatile uint16_t steal_pad;
 } hw_slave_ipc_t;
+
+#ifndef HW_FLAT_STEAL
+#define HW_FLAT_STEAL 1
+#endif
+/* With HW_SLAVE_WALLS the slave may not have emitted a deferred visit's
+ * walls yet when the master steals: HW_DeferCloseSub marks such m ranges
+ * with this (2026-11-18; before, SLAVE_WALLS forced HW_FLAT_STEAL off,
+ * which cost E1M8 its steal/split balance). */
+#define HW_RANGE_PENDING 0xFFFFu
+#define HW_STEAL_FAR   0x4000u   /* "no limit": far beyond any frame's job count */
+#define HW_STEAL_SNAPS 64        /* master keeps solid-mask snapshots of the last N jobs */
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(hw_slave_ipc_t) <= 0x8000u, "hw_slave_ipc_t must fit below SATURN_WRAM_L_SLAVE_STACK_OFF");
@@ -110,6 +158,18 @@ static hw_slave_ipc_t hw_slave_ipc_hwram __attribute__((aligned(16)));
 /* HW_Slave_IsSpanOccluded defined below hw_flat_emit_ctx_t */
 
 static int saturn_master_flat_q = HW_SLAVE_FLAT_Q_CAP;
+#if HW_FLAT_STEAL
+typedef struct {
+    uint32_t summary;      /* hw_solid_summary */
+    uint32_t count_any;    /* hw_solid_count << 16 | hw_solid_any */
+    uint32_t solid[HW_SOLID_WORDS];
+} hw_steal_snap_t;
+static hw_steal_snap_t hw_steal_snap[HW_STEAL_SNAPS];
+static unsigned int hw_steal_first;   /* this frame's first job index (never stolen) */
+static int hw_steal_to_m = 0;         /* the master job running now writes into cmd_m */
+static unsigned int hw_steal_k;       /* master owns [hw_steal_k, tail) */
+unsigned int saturn_hw_steal_jobs = 0; /* stats: jobs the master took this frame */
+#endif
 #define HW_MAX_DEF_FLAT_JOBS 4
 static HW_ALIGN16 hw_flat_job_t hw_def_flat_jobs[HW_MAX_DEF_FLAT_JOBS];
 static int hw_def_flat_count = 0;
@@ -164,11 +224,23 @@ HW_ALWAYS_INLINE int HW_FlatTriDy(int y0, int y1, int y2)
     return dy;
 }
 
+/* quad_size bits 15-8: 0x08 (64-wide flat pyramid) or HW_WARP_SIZE_FLAG |
+ * (w / 8) for a warped per-piece texture (fctx->size_wbits). */
+#define HW_WARP_SIZE_FLAG 0x4000u
+#define HW_FLAT_SIZE_W64  0x0800u
+
 /* Takes 3 register arguments (r4=base_srca, r5=quad_size, r6=dy), 0 stack arguments, 0 callee-saved reg pushes */
 static HW_NOINLINE uint32_t HW_FlatSizeLOD(uint16_t base_srca, uint32_t quad_size, int dy)
 {
     int v0   = (int)(quad_size >> 16);
     int rows = (int)(quad_size & 0xFFu);
+    if (__builtin_expect(quad_size & HW_WARP_SIZE_FLAG, 0))
+    {
+        /* warped per-piece texture: w/8 in bits 13-8, one level, no mips */
+        uint32_t w8 = (quad_size >> 8) & 0x3Fu;
+        uint32_t srca = (uint32_t)base_srca + (uint32_t)v0 * w8;
+        return (srca << 16) | (w8 << 8) | (uint32_t)rows;
+    }
     if (__builtin_expect(rows <= 32, 0))
         dy <<= (rows <= 16) ? 2 : 1;
 
@@ -620,6 +692,17 @@ typedef struct {
     uint8_t                 avg_floor;      /* raster-hole backing colours (palette idx) */
     uint8_t                 avg_ceil;
     uint8_t                 hole_on;        /* per job: backing enabled && ceiling emitted */
+    /* Warped per-piece textures (SATURN_QUV_WARP quads, HW_WarpApply):
+     * the job's translated floor / ceiling flats (0xFF = none), its first
+     * quad / vertex index, the frame stamp. size_wbits = the SIZE width bits
+     * of the quad being emitted (HW_FLAT_SIZE_W64 or warp). */
+    uint32_t                warp_gq0;
+    uint32_t                warp_v0;
+    uint16_t                warp_frame;
+    uint8_t                 warp_ff;
+    uint8_t                 warp_cf;
+    uint8_t                 warp_room;      /* saturn_warp_room: placeholders allowed */
+    uint32_t                size_wbits;
 } hw_flat_emit_ctx_t;
 
 /* Inline gate (2026-11-15): HW_FlatHoleBacking ran 182x per heavy frame at
@@ -639,7 +722,74 @@ typedef struct {
  * (bits 7-0) flat, the raster-hole backing colour (HW_FlatHoleBacking). */
 #define HW_JOB_AVG_WORD      (HW_JOB_WORDS_BEFORE_PAD + 1)
 
+/* Job word 3 = emit_floor << 24 | emit_ceil << 16 | flags << 8 | sky; the
+ * emit bytes use bit 0 only, so bits 31-25 / 23-17 carry the 14-bit CHK1
+ * chunk index of a LOD0 job (0 = whole subsector, see saturn_flat_chunk_t). */
+#ifndef HW_FLAT_CHUNKS
+#define HW_FLAT_CHUNKS 1
+#endif
+/* HW_FLAT_SPLIT (2026-11-17): big chunked subsectors become one job per
+ * chunk (job word 3 bit 2 = HW_JOB_ONE_CHUNK: process only that chunk). */
+#ifndef HW_FLAT_SPLIT
+#define HW_FLAT_SPLIT 1
+#endif
+#ifndef HW_SPLIT_MIN_Q
+#define HW_SPLIT_MIN_Q 96
+#endif
+#define HW_JOB_ONE_CHUNK 4u
+unsigned int saturn_hw_split_jobs = 0;
+#define HW_JOB_CHUNK_PACK(c)  ((((uint32_t)(c) & 0x7Fu) << 25) | ((((uint32_t)(c) >> 7) & 0x7Fu) << 17))
+#define HW_JOB_CHUNK_OF(w3)   ((((w3) >> 25) & 0x7Fu) | ((((w3) >> 17) & 0x7Fu) << 7))
+
+/* Warped per-piece textures (SATURN_QUV_WARP quads). The flat worker that
+ * draws a piece looks its texture up in saturn_warp_tab (HW_WarpFind) and,
+ * if it is missing, queues a request; the master makes the requested
+ * textures at the start of the next frame (HW_WarpService), within the
+ * per-frame budget. One queue per CPU (master jobs: deferred / no slave).
+ * A job carries its translated floor / ceiling flat numbers in bits 31-24 /
+ * 23-16 of HW_JOB_AVG_WORD (0xFF = no warp for that surface). */
+typedef struct {
+    uint32_t gq;        /* global baked quad index */
+    uint32_t v_first;   /* the job's first vertex (quad indices are relative) */
+    uint16_t flat;      /* translated flat number */
+    uint8_t  is_ceil;
+    uint8_t  lv;
+} hw_warp_req_t;
+#define HW_WARP_REQ_MAX 128
+#ifdef SATURN_WIN32
+unsigned int saturn_warp_hits = 0, saturn_warp_fallbacks = 0;   /* emulator diagnostics */
+#endif
+static HW_ALIGN16 hw_warp_req_t hw_warp_req[2][HW_WARP_REQ_MAX];   /* [0] slave, [1] master */
+static volatile int hw_warp_req_n[2];
+
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_master;
+static uint32_t HW_WarpApply(hw_flat_emit_ctx_t *fctx, int q_local, fixed_t cz_min, int emit_floor, int emit_ceil, int prefetch);
+
+/* Nearest corner's distance from the camera (max + min/2 of |cx|, |cz|),
+ * the warp texture level input: unlike depth it doesn't change when the
+ * player turns on the spot (changing level re-made textures mid-turn). */
+/* Warp pieces farther than this (map units, nearest corner) skip their own
+ * texture and use the baked row mapping: the mapping error there is a pixel
+ * or two on screen, and it keeps texture builds / VRAM to the few near
+ * pieces (turning made textures for every warp piece in view). */
+#ifndef HW_WARP_FAR_DIST
+#define HW_WARP_FAR_DIST 256
+#endif
+
+HW_ALWAYS_INLINE fixed_t HW_WarpDist(const saturn_proj_v_t *a, const saturn_proj_v_t *b,
+                                     const saturn_proj_v_t *c, const saturn_proj_v_t *d)
+{
+    const saturn_proj_v_t *pvs[4] = { a, b, c, d };
+    fixed_t m = 0x7FFFFFFF;
+    for (int k = 0; k < 4; k++)
+    {
+        fixed_t ax = pvs[k]->cx < 0 ? -pvs[k]->cx : pvs[k]->cx;
+        fixed_t az = pvs[k]->cz < 0 ? -pvs[k]->cz : pvs[k]->cz;
+        fixed_t dk = (ax > az) ? ax + (az >> 1) : az + (ax >> 1);
+        if (dk < m) m = dk;
+    }
+    return m;
+}
 #ifndef SATURN_WIN32
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_slave;
 #endif
@@ -714,8 +864,14 @@ static HW_NOINLINE HW_HOT_O2 int HW_Slave_IsSpanOccluded(const hw_flat_emit_ctx_
 #ifndef HW_FLAT_HOLE_BACKING
 #define HW_FLAT_HOLE_BACKING 1
 #endif
+#ifndef HW_HOLE_ALWAYS
+#define HW_HOLE_ALWAYS 0        /* 1: back every ceiling quad, no per-quad hole walk */
+#endif
 #define HW_HOLE_DMIN   8        /* smaller quads: holes too rare/small to matter */
 #define HW_HOLE_DMAX   400      /* bigger: not worth the walk (off-screen giants) */
+#ifndef HW_HOLE_DMIN_LOD1
+#define HW_HOLE_DMIN_LOD1 4     /* LOD1 ceilings are backed unconditionally from this size */
+#endif
 unsigned int saturn_hw_flat_backings = 0;   /* backing polygons this frame (stats) */
 /* Only needed when the sky is visible: without sky the clear polygon is
  * opaque black (saturn_cmdbuf.c) and holes are dark dots. Set by the master
@@ -861,9 +1017,38 @@ static HW_NOINLINE HW_HOT_O2 int HW_FlatHoleBacking(hw_flat_emit_ctx_t *fctx, in
     if ((uint32_t)((c[2] >> 16) - fctx->ceil_srca) >= 680u)
         return local_q;
     uint32_t pa = c[3], pb = c[4], pc = c[5], pd = c[6];
-    if (!HW_V1QuadHoleRisk((int16_t)(pa >> 16), (int16_t)pa, (int16_t)(pb >> 16), (int16_t)pb,
-                           (int16_t)(pc >> 16), (int16_t)pc, (int16_t)(pd >> 16), (int16_t)pd))
+#if HW_HOLE_ALWAYS
+    /* Back every ceiling quad big enough to hole (HW_HOLE_DMIN..DMAX) instead
+     * of replaying VDP1's edge stepping per quad: trades the slave walk
+     * (5-9 ms/frame in the E1M1 courtyard) for VDP1 fill. */
+    {
+        int t, dmax = (int16_t)(pd >> 16) - (int16_t)(pa >> 16);
+        if (dmax < 0) dmax = -dmax;
+        t = (int16_t)pd - (int16_t)pa;                 if (t < 0) t = -t; if (t > dmax) dmax = t;
+        t = (int16_t)(pc >> 16) - (int16_t)(pb >> 16); if (t < 0) t = -t; if (t > dmax) dmax = t;
+        t = (int16_t)pc - (int16_t)pb;                 if (t < 0) t = -t; if (t > dmax) dmax = t;
+        if (dmax < HW_HOLE_DMIN || dmax > HW_HOLE_DMAX)
+            return local_q;
+    }
+#else
+    if (fctx->fully_inside & HW_FLAT_USE_LOD1)
+    {
+        /* LOD1 (coarse, distant) ceilings: back every quad big enough to
+         * hole instead of running the predictor, which misses more of these
+         * shapes (the 2026-11-17 LOD sweep showed extra sky dots); they are
+         * small on screen, so the backing fill is cheap. */
+        int t, dmax = (int16_t)(pd >> 16) - (int16_t)(pa >> 16);
+        if (dmax < 0) dmax = -dmax;
+        t = (int16_t)pd - (int16_t)pa;                 if (t < 0) t = -t; if (t > dmax) dmax = t;
+        t = (int16_t)(pc >> 16) - (int16_t)(pb >> 16); if (t < 0) t = -t; if (t > dmax) dmax = t;
+        t = (int16_t)pc - (int16_t)pb;                 if (t < 0) t = -t; if (t > dmax) dmax = t;
+        if (dmax < HW_HOLE_DMIN_LOD1 || dmax > HW_HOLE_DMAX)
+            return local_q;
+    }
+    else if (!HW_V1QuadHoleRisk((int16_t)(pa >> 16), (int16_t)pa, (int16_t)(pb >> 16), (int16_t)pb,
+                                (int16_t)(pc >> 16), (int16_t)pc, (int16_t)(pd >> 16), (int16_t)pd))
         return local_q;
+#endif
     aliased_uint32_t *n = (aliased_uint32_t *)&fctx->cmd_s_out[local_q];
     for (int k = 0; k < 8; k++)
         n[k] = c[k];
@@ -1084,7 +1269,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
         int s_rows  = r_end - r_start;
         if (s_rows < 1) s_rows = 1;
         int v0 = base_v0 + (quad_rows - r_end);
-        uint32_t strip_size = ((uint32_t)v0 << 16) | 0x0800u | (uint32_t)s_rows;
+        uint32_t strip_size = ((uint32_t)v0 << 16) | fctx->size_wbits | (uint32_t)s_rows;
 
         unsigned int cz_s_avg = ((unsigned int)cz_L[s] >> 2) + ((unsigned int)cz_R[s] >> 2) +
                                 ((unsigned int)cz_L[s+1] >> 2) + ((unsigned int)cz_R[s+1] >> 2);
@@ -1120,7 +1305,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands_Multi(
 
             vdp1_cmd_t *cmd = &cmd_s_out[local_q++];
             aliased_uint32_t *c32 = (aliased_uint32_t *)cmd;
-            uint32_t w2 = (((uint32_t)base_srca + (uint32_t)(v0 << 3)) << 16) | 0x0800u | (uint32_t)s_rows;
+            uint32_t w2 = __builtin_expect(fctx->size_wbits == HW_FLAT_SIZE_W64, 1)
+                ? ((((uint32_t)base_srca + (uint32_t)(v0 << 3)) << 16) | 0x0800u | (uint32_t)s_rows)
+                : HW_FlatSizeLOD(base_srca, strip_size, 32);
             c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
             c32[1] = w1;
             c32[2] = w2;
@@ -1199,7 +1386,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_EmitFlatBands(
         if (__builtin_expect(zb > 127u, 0)) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
 
-        uint32_t quad_size = ((qpack >> 8) & 0x007F0000u) | 0x0800u | ((qpack >> 16) & 0xFFu);
+        uint32_t quad_size = ((qpack >> 8) & 0x007F0000u) | fctx->size_wbits | ((qpack >> 16) & 0xFFu);
         int x0 = pv0->px, y0 = py0;
         int x1 = pv1->px, y1 = py1;
         int x2 = pv2->px, y2 = py2;
@@ -1735,7 +1922,7 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
         unsigned int zb = (((unsigned int)cz_min >> 1) + ((unsigned int)cz_max >> 1)) >> 20;
         if (zb > 127u) zb = 127u;
         uint32_t w1 = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
-        uint32_t quad_size = ((uint32_t)r0 << 16) | 0x0800u | (uint32_t)(r1 - r0);
+        uint32_t quad_size = ((uint32_t)r0 << 16) | fctx->size_wbits | (uint32_t)(r1 - r0);
 
         /* The triangle the one-corner slide dropped (see tri_on): a small
          * piece at the clip line, i.e. the screen's top / bottom edge. Drawn
@@ -1808,6 +1995,152 @@ static HW_NOINLINE HW_COLD_OS int HW_EmitFlatQuadBanded(
     return local_q;
 }
 
+/* A warped per-piece texture (Saturn_Vdp1_GetWarpSrca) is stored as
+ * column strips (saturn_warp_strip_w: 32, 16 or 8 texels wide), each a
+ * texture of its own, so a piece can be cut along its columns as well as its
+ * rows: one sub-quad per strip, its corners interpolated in camera space
+ * along p0-p1 / p3-p2, each drawn by the banded emitter (which slices rows
+ * for perspective and clips the near plane). With rows only, a piece whose
+ * depth changes across its columns skewed as the player turned (hardware
+ * 2026-11-16: "ceiling textures distort as the player rotates"). */
+static HW_NOINLINE HW_HOT_O2 int HW_EmitWarpStrips(hw_flat_emit_ctx_t *fctx,
+                                                   const saturn_flat_quad_idx_t *qp,
+                                                   uint32_t wh, int is_ceil, uint16_t srca,
+                                                   int local_q)
+{
+    saturn_proj_v_t sub[4];
+    static const saturn_flat_quad_idx_t sub_q = { { 0, 1, 2, 3 } };
+    saturn_proj_v_t *const saved_pv = fctx->proj_v;
+    const saturn_proj_v_t *p0 = &saved_pv[qp->v[0]], *p1 = &saved_pv[qp->v[1]];
+    const saturn_proj_v_t *p2 = &saved_pv[qp->v[2]], *p3 = &saved_pv[qp->v[3]];
+    const int w = (int)(wh >> 8), h = (int)(wh & 0xFFu);
+    const int sw = saturn_warp_strip_w(w);      /* strip width */
+    const int ns = w / sw;
+    const uint32_t saved_wbits = fctx->size_wbits;
+    int s;
+
+    const fixed_t z_eff = is_ceil ? fctx->z_eff_ceil : fctx->z_eff_floor;
+    const fixed_t y_w   = is_ceil ? fctx->y_ceil_w : fctx->y_floor_w;
+    const uint32_t pmod = (PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu;
+    const fixed_t du = (fixed_t)(FRACUNIT / ns);
+
+    if (ns <= 0 || h <= 0 || !srca)
+        return local_q;
+    fctx->size_wbits = HW_WARP_SIZE_FLAG | ((uint32_t)(sw >> 3) << 8);
+    fctx->proj_v = sub;
+    for (s = 0; s < ns; s++)
+    {
+        /* strip s covers columns [s*sw, (s+1)*sw): u from s/ns to (s+1)/ns */
+        fixed_t u0 = du * s, u1 = (s + 1 == ns) ? FRACUNIT : du * (s + 1);
+        const uint16_t ssrca = (uint16_t)(srca + (uint32_t)((s * sw * h) >> 3));
+        sub[0].cx = p0->cx + FixedMul(p1->cx - p0->cx, u0); sub[0].cz = p0->cz + FixedMul(p1->cz - p0->cz, u0);
+        sub[1].cx = p0->cx + FixedMul(p1->cx - p0->cx, u1); sub[1].cz = p0->cz + FixedMul(p1->cz - p0->cz, u1);
+        sub[2].cx = p3->cx + FixedMul(p2->cx - p3->cx, u1); sub[2].cz = p3->cz + FixedMul(p2->cz - p3->cz, u1);
+        sub[3].cx = p3->cx + FixedMul(p2->cx - p3->cx, u0); sub[3].cz = p3->cz + FixedMul(p2->cz - p3->cz, u0);
+        {
+            /* Fast path: in front of the clip depth and shallow along the rows
+             * (the banded emitter would draw one band): project and write one
+             * command. Anything else goes through the banded emitter. */
+            fixed_t zmin = sub[0].cz, zmax = sub[0].cz;
+            int i, px[4], py[4], fits = 1;
+            for (i = 1; i < 4; i++)
+            {
+                if (sub[i].cz < zmin) zmin = sub[i].cz;
+                if (sub[i].cz > zmax) zmax = sub[i].cz;
+            }
+            if (zmin >= z_eff && zmax - zmin < (zmin >> 1))
+            {
+                for (i = 0; i < 4; i++)
+                {
+                    int sd = HW_SlaveFastDiv(sub[i].cz);
+                    px[i] = HW_ProjX(sub[i].cx, sd, fctx->vcx);
+                    py[i] = HW_ProjY(y_w, sd, fctx->vcy);
+                    if ((unsigned int)(px[i] + 1000) > 2000u || (unsigned int)(py[i] + 1000) > 2000u)
+                        fits = 0;
+                }
+                if (fits)
+                {
+                    int cw;
+                    if ((px[0] < 0 && px[1] < 0 && px[2] < 0 && px[3] < 0) ||
+                        (px[0] > fctx->vw && px[1] > fctx->vw && px[2] > fctx->vw && px[3] > fctx->vw) ||
+                        (py[0] < 0 && py[1] < 0 && py[2] < 0 && py[3] < 0) ||
+                        (py[0] > fctx->vh && py[1] > fctx->vh && py[2] > fctx->vh && py[3] > fctx->vh))
+                        continue;
+                    cw = HW_MulsW_PairAdd(px[2] - px[0], py[3] - py[1], px[1] - px[3], py[2] - py[0], 0);
+                    if (cw == 0)
+                        continue;
+                    if (local_q >= fctx->qcap)
+                        break;
+                    {
+                        unsigned int zb = (((unsigned int)zmin >> 1) + ((unsigned int)zmax >> 1)) >> 20;
+                        uint32_t p0w = ((uint32_t)px[0] << 16) | (uint16_t)py[0];
+                        uint32_t p1w = ((uint32_t)px[1] << 16) | (uint16_t)py[1];
+                        uint32_t p2w = ((uint32_t)px[2] << 16) | (uint16_t)py[2];
+                        uint32_t p3w = ((uint32_t)px[3] << 16) | (uint16_t)py[3];
+                        aliased_uint32_t *c32 = (aliased_uint32_t *)&fctx->cmd_s_out[local_q++];
+                        if (zb > 127u) zb = 127u;
+                        c32[0] = (cw < 0) ? 0x00320000u : 0x00220000u;
+                        c32[1] = (pmod << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u);
+                        c32[2] = ((uint32_t)ssrca << 16) | ((uint32_t)(sw >> 3) << 8) | (uint32_t)h;
+                        if (cw < 0) { c32[3] = p1w; c32[4] = p0w; c32[5] = p3w; c32[6] = p2w; }
+                        else        { c32[3] = p0w; c32[4] = p1w; c32[5] = p2w; c32[6] = p3w; }
+                        c32[7] = 0;
+                        HW_FLAT_HOLE_BACKING_GATE(fctx, local_q);
+                    }
+                    continue;
+                }
+            }
+        }
+        local_q = HW_EmitFlatQuadBanded(fctx, &sub_q, 0, h, is_ceil, ssrca, 0, local_q);
+        if (local_q >= fctx->qcap)
+            break;
+    }
+    fctx->proj_v = saved_pv;
+    fctx->size_wbits = saved_wbits;
+    return local_q;
+}
+
+/* A warp piece seen for the first time has no texture until the next frame
+ * (HW_WarpService). The row mapping shows a squashed, high-contrast wrong
+ * pattern for that frame (flicker while turning); draw an untextured
+ * polygon in the flat's most common colour and the sector's light instead.
+ * Returns -1 if the quad is outside VDP1's coordinate range (caller keeps
+ * the row mapping). */
+static HW_NOINLINE HW_COLD_OS int HW_EmitWarpPlaceholder(hw_flat_emit_ctx_t *fctx,
+                                                        const saturn_proj_v_t *pv0, const saturn_proj_v_t *pv1,
+                                                        const saturn_proj_v_t *pv2, const saturn_proj_v_t *pv3,
+                                                        int is_ceil, int local_q)
+{
+    const saturn_proj_v_t *pv[4] = { pv0, pv1, pv2, pv3 };
+    const uint32_t pmod = (PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu;
+    int x[4], y[4], i;
+    unsigned int cz = 0, zb;
+    aliased_uint32_t *t32;
+    for (i = 0; i < 4; i++)
+    {
+        x[i] = pv[i]->px;
+        y[i] = is_ceil ? pv[i]->py_c : pv[i]->py_f;
+        if ((unsigned int)(x[i] + 1000) > 2000u || (unsigned int)(y[i] + 1000) > 2000u)
+            return -1;
+        cz += (unsigned int)pv[i]->cz >> 2;
+    }
+    if (local_q >= fctx->qcap)
+        return local_q;
+    zb = cz >> 20;
+    if (zb > 127u) zb = 127u;
+    t32 = (aliased_uint32_t *)&fctx->cmd_s_out[local_q++];
+    t32[0] = 0x00040000u;                                   /* polygon */
+    t32[1] = ((0x00C0u | (pmod & 0x0600u)) << 16) | ((uint32_t)fctx->flat_cmdcolr_lut[zb] & 0xFF00u)
+           | (uint32_t)(is_ceil ? fctx->avg_ceil : fctx->avg_floor);
+    t32[2] = 0;
+    t32[3] = ((uint32_t)x[0] << 16) | (uint16_t)y[0];
+    t32[4] = ((uint32_t)x[1] << 16) | (uint16_t)y[1];
+    t32[5] = ((uint32_t)x[2] << 16) | (uint16_t)y[2];
+    t32[6] = ((uint32_t)x[3] << 16) | (uint16_t)y[3];
+    t32[7] = 0;
+    return local_q;
+}
+
 /* Cold helper for extreme-distance (>16384 map units) flat vertex transform.
  * Takes 4 register arguments (r4=dx, r5=dy, r6=fctx, r7=p_ptr), 0 stack arguments! */
 static HW_NOINLINE HW_COLD_OS void HW_TransformFlatVert_Shifted(
@@ -1818,6 +2151,56 @@ static HW_NOINLINE HW_COLD_OS void HW_TransformFlatVert_Shifted(
     p_ptr->cx = cx;
     p_ptr->cz = cz;
 }
+
+/* HW_FQ_STATS (measurement only): flat-quad fate counters, read with sdbg `m`.
+ * [0] frames [1] jobs [2] verts [3] quads [4] near-clip [5] off-screen x
+ * [6] span occluded [7] aperture/backface [8] reached emit
+ * [9] verts in jobs where no quad reached emit */
+#ifndef HW_FQ_STATS
+#define HW_FQ_STATS 0
+#endif
+#if HW_FQ_STATS && !defined(HW_SLAVE_TU)
+volatile uint32_t hw_fq_stats[12];
+#define HW_FQ(i) (hw_fq_stats[i]++)
+#elif HW_FQ_STATS
+extern volatile uint32_t hw_fq_stats[12];
+#define HW_FQ(i) (hw_fq_stats[i]++)
+#else
+#define HW_FQ(i) ((void)0)
+#endif
+
+#if HW_FLAT_CHUNKS && !defined(SATURN_WIN32)
+#ifndef HW_CHUNK_MARGIN_PX
+#define HW_CHUNK_MARGIN_PX 8
+#endif
+/* Chunk bbox vs the view frustum (2D: near plane, left / right edge planes
+ * through the eye). Screen x = vcx + f * cx / cz (f = ch_f per 256 units), so
+ * a point is inside the left plane iff cx * f + (vcx + margin) * cz >= 0.
+ * Culled only when all four corners are outside the same plane. Coordinates
+ * are taken in 1/256 units so the products stay in 32 bits. */
+static HW_NOINLINE HW_HOT_O2 int HW_ChunkVisible(const saturn_flat_chunk_t *c,
+    int cam_x16, int cam_y16, fixed_t vcos, fixed_t vsin, fixed_t cz_origin, fixed_t cx_origin,
+    int ch_f, int ch_ml, int ch_mr)
+{
+    int x0 = ((int)c->min_x << 4) - cam_x16, x1 = ((int)c->max_x << 4) - cam_x16;
+    int y0 = ((int)c->min_y << 4) - cam_y16, y1 = ((int)c->max_y << 4) - cam_y16;
+    if ((unsigned)(x0 + 131072) > 262144u || (unsigned)(x1 + 131072) > 262144u ||
+        (unsigned)(y0 + 131072) > 262144u || (unsigned)(y1 + 131072) > 262144u)
+        return 1;   /* > 8192 units away on an axis: don't bother */
+    int out_near = 0, out_l = 0, out_r = 0;
+    for (int k = 0; k < 4; k++)
+    {
+        fixed_t cz, cx;
+        ProjectPillar_2D((k & 1) ? x1 : x0, (k & 2) ? y1 : y0, vcos, vsin, cz_origin, cx_origin, &cz, &cx);
+        int a = (cx >> 8) * ch_f;
+        int z = cz >> 8;
+        out_near += (cz < HW_NEAR_Z);
+        out_l += (a + ch_ml * z < 0);
+        out_r += (ch_mr * z - a < 0);
+    }
+    return out_near < 4 && out_l < 4 && out_r < 4;
+}
+#endif
 
 /* Takes 4 register arguments (r4=is_master, r5=ipc, r6=job, r7=fctx), 0 stack arguments! */
 static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
@@ -1832,8 +2215,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     int v_count = (int)(w2 >> 16);
     int q_count = (int)(w2 & 0xFFFFu);
     uint32_t w3 = jw[3];
-    int emit_floor   = (int)(w3 >> 24);
-    int emit_ceil    = (int)((w3 >> 16) & 0xFFu);
+    int emit_floor   = (int)((w3 >> 24) & 1u);
+    int emit_ceil    = (int)((w3 >> 16) & 1u);
     int fully_inside = (int)((w3 >> 8) & 0xFFu);
     uint32_t sky_flags = w3 & 0xFFu;
     uint32_t w4 = jw[4];
@@ -1867,6 +2250,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
         /* Latch frame-constant camera & viewport state ONCE per frame on the first job (bit 1 of sky_flags) */
         if (__builtin_expect((sky_flags & 2u) != 0, 0))
         {
+            HW_FQ(0);
             int gen = ipc->job_done;
             if (__builtin_expect(gen != fctx->cache_gen, 0))
             {
@@ -1910,6 +2294,17 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
         fctx->proj_v    = hw_proj_verts_master;
         fctx->qcap      = CMDBUF_S_CAP;
         fctx->local_q   = hw_frame_slave_enabled ? saturn_master_flat_q : saturn_cmd_s_count;
+#if HW_FLAT_STEAL
+        if (hw_steal_to_m)
+        {
+            /* A stolen job whose visit has no walls/sprites: after the walk
+             * the wall buffer is free past saturn_cmd_m_count, so the job's
+             * quads become that visit's m range (see HW_StealFlatJobs). */
+            fctx->cmd_s_out = saturn_cmd_m;
+            fctx->qcap      = CMDBUF_M_CAP;
+            fctx->local_q   = saturn_cmd_m_count;
+        }
+#endif
     }
 
     int start_q = fctx->local_q;
@@ -1934,6 +2329,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             sub_range_t *ranges = (is_master && !hw_frame_slave_enabled)
                 ? actual_ranges
                 : (sub_range_t *)((uint32_t)actual_ranges | SATURN_WRAM_H_UNCACHED);
+#if HW_FLAT_STEAL
+            if (is_master && hw_steal_to_m)
+            {
+                ranges[sub_idx].m_start = (uint16_t)start_q;
+                ranges[sub_idx].m_count = 0;
+                ranges[sub_idx].s_count = 0;
+                return;
+            }
+#endif
             ranges[sub_idx].s_start = (uint16_t)start_q;
             ranges[sub_idx].s_count = 0;
         }
@@ -1960,6 +2364,23 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
 #endif
     fctx->avg_floor = (uint8_t)(avg_pack >> 8);
     fctx->avg_ceil  = (uint8_t)avg_pack;
+    fctx->size_wbits = HW_FLAT_SIZE_W64;
+    fctx->warp_ff = (uint8_t)(avg_pack >> 24);
+    fctx->warp_cf = (uint8_t)(avg_pack >> 16);
+    if ((avg_pack >> 16) != 0xFFFFu && quads && verts)
+    {
+        fctx->warp_gq0 = (uint32_t)(quads - saturn_baked_flat_quads);
+        fctx->warp_v0  = (uint32_t)(verts - saturn_baked_flat_verts);
+#ifndef SATURN_WIN32
+        fctx->warp_frame = *(volatile uint16_t *)((uintptr_t)&saturn_warp_frame | SATURN_WRAM_H_UNCACHED);
+        fctx->warp_room  = *(volatile uint8_t *)((uintptr_t)&saturn_warp_room | SATURN_WRAM_H_UNCACHED);
+#else
+        fctx->warp_frame = saturn_warp_frame;
+        fctx->warp_room  = saturn_warp_room;
+#endif
+    }
+    else
+        fctx->warp_ff = fctx->warp_cf = 0xFF;
 #if HW_FLAT_HOLE_BACKING
 #ifndef SATURN_WIN32
     fctx->hole_on = (uint8_t)(emit_ceil &&
@@ -2059,20 +2480,71 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     const int vcy          = fctx->vcy;
 #ifndef SATURN_WIN32
     extern uint32_t hw_wram_h_proj_verts_slave[960 * 4];
+#if HW_FLAT_CHUNKS
+    /* a chunked job projects one chunk (<= 960 verts, chunk-local) at a time */
+    const uint32_t job_chunk = saturn_baked_flat_chunks ? HW_JOB_CHUNK_OF(w3) : 0u;
+#else
+    const uint32_t job_chunk = 0u;
+#endif
     saturn_proj_v_t * __restrict proj_v = is_master
         ? hw_proj_verts_master
-        : (__builtin_expect(v_count <= 960, 1) ? (saturn_proj_v_t *)hw_wram_h_proj_verts_slave : hw_proj_verts_slave);
+        : (__builtin_expect(v_count <= 960 || job_chunk != 0, 1) ? (saturn_proj_v_t *)hw_wram_h_proj_verts_slave : hw_proj_verts_slave);
     fctx->proj_v = proj_v;
 #else
     saturn_proj_v_t * __restrict proj_v = fctx->proj_v;
 #endif
 
-    const saturn_flat_vert_t * __restrict v_ptr = verts;
-    const uint8_t * __restrict fr_ptr = vfrac;
+#if HW_FQ_STATS
+    HW_FQ(1);
+    int fq_any = 0;
+    if (HW_JOB_CHUNK_OF(w3) == 0)
+        hw_fq_stats[(fully_inside & HW_FLAT_USE_LOD1) ? 10 : 11] += (uint32_t)q_count;
+#endif
+
+    /* CHK1 chunks: project + loop only the chunks whose bbox meets the view
+     * frustum (near plane, left / right screen edges with a margin). Without
+     * chunks the single pass covers the whole subsector. */
+    int v_lo = 0, v_hi = v_count, q_lo = 0, q_hi = q_count;
+    int v_n = v_count;          /* vertices addressable by this pass's quad indices */
+#if HW_FLAT_CHUNKS && !defined(SATURN_WIN32)
+    const saturn_flat_chunk_t *chk = NULL;
+    const uint32_t warp_v0_sub = fctx->warp_v0;
+    int ch_f = 0, ch_ml = 0, ch_mr = 0;
+    {
+        if (job_chunk != 0)
+        {
+            chk = &saturn_baked_flat_chunks[job_chunk];
+            /* focal scale: screen offset of cx = cz = 256 units */
+            ch_f  = HW_MulHigh(256 << FRACBITS, HW_SlaveFastDiv(256 << FRACBITS));
+            ch_ml = vcx + HW_CHUNK_MARGIN_PX;
+            ch_mr = vw - vcx + HW_CHUNK_MARGIN_PX;
+        }
+    }
+chunk_next:
+    if (chk)
+    {
+        if (!HW_ChunkVisible(chk, cam_x16, cam_y16, vcos, vsin, cz_origin, cx_origin, ch_f, ch_ml, ch_mr))
+            goto chunk_done;
+        v_lo = chk->v_off;
+        v_hi = v_lo + (chk->v_cnt & 0x7FFFu);
+        q_lo = chk->q_off;
+        q_hi = q_lo + chk->q_cnt;
+        if (v_hi > v_count) v_hi = v_count;
+        if (q_hi > q_count) q_hi = q_count;
+        v_n = v_hi - v_lo;      /* chunk-local indices: proj_v[0 .. v_n) */
+        fctx->warp_v0 = warp_v0_sub + (uint32_t)v_lo;
+    }
+#endif
+#if HW_FQ_STATS
+    hw_fq_stats[2] += (uint32_t)(v_hi - v_lo);
+#endif
+
+    const saturn_flat_vert_t * __restrict v_ptr = verts + v_lo;
+    const uint8_t * __restrict fr_ptr = vfrac + v_lo * fr_step;
     saturn_proj_v_t * __restrict p_ptr = proj_v;
 
     /* Phase 1: Transform & perspective project unique subsector vertices ONCE */
-    for (int i = 0; i < v_count; i++, v_ptr++, fr_ptr += fr_step, p_ptr++)
+    for (int i = 0; i < v_n; i++, v_ptr++, fr_ptr += fr_step, p_ptr++)
     {
         int qx = (int)v_ptr->x;
         int qy = (int)v_ptr->y;
@@ -2211,7 +2683,7 @@ vert_behind:
         }
     }
 
-    const saturn_flat_quad_idx_t * __restrict q_ptr = quads;
+    const saturn_flat_quad_idx_t * __restrict q_ptr = quads + q_lo;
     const uint16_t *quv_ptr = fctx->quv;
     const uint16_t base_floor_srca = fctx->base_floor_srca;
     const uint16_t base_ceil_srca  = fctx->base_ceil_srca;
@@ -2220,17 +2692,19 @@ vert_behind:
     const int alt_ok = (!emit_floor || alt_floor_srca != 0) && (!emit_ceil || alt_ceil_srca != 0);
 
     /* Phase 2: Assemble & emit quads using cached projected vertices */
-    for (int q = 0; q < q_count; q++, q_ptr++)
+    const int warp_on = (fctx->warp_ff != 0xFF || fctx->warp_cf != 0xFF) && quv_ptr != NULL;
+    for (int q = q_lo; q < q_hi; q++, q_ptr++)
     {
         int qv0 = q_ptr->v[0];
         int qv1 = q_ptr->v[1];
         int qv2 = q_ptr->v[2];
         int qv3 = q_ptr->v[3];
-        if (__builtin_expect((unsigned)qv0 >= (unsigned)v_count ||
-                             (unsigned)qv1 >= (unsigned)v_count ||
-                             (unsigned)qv2 >= (unsigned)v_count ||
-                             (unsigned)qv3 >= (unsigned)v_count, 0))
+        if (__builtin_expect((unsigned)qv0 >= (unsigned)v_n ||
+                             (unsigned)qv1 >= (unsigned)v_n ||
+                             (unsigned)qv2 >= (unsigned)v_n ||
+                             (unsigned)qv3 >= (unsigned)v_n, 0))
             continue;
+        HW_FQ(3);
 
         /* Baked texture mapping: pick the pyramid and the texture rows. */
         const saturn_flat_quad_idx_t *qp = q_ptr;
@@ -2272,6 +2746,8 @@ vert_behind:
                 }
             }
         }
+        fctx->size_wbits = HW_FLAT_SIZE_W64;
+        const int q_is_warp = warp_on && (quv_ptr[q] & SATURN_QUV_WARP);
         const saturn_proj_v_t *pv0 = &proj_v[qv0];
         const saturn_proj_v_t *pv1 = &proj_v[qv1];
         const saturn_proj_v_t *pv2 = &proj_v[qv2];
@@ -2285,13 +2761,30 @@ vert_behind:
         /* Transposed pyramid a full NORMAL cell may switch to in the banded
          * emitter (LOD0 jobs carry the transposed pack as their alt SRCAs). */
         const int can_flip = (q_mode == SATURN_QUV_NORMAL) && !(fully_inside & HW_FLAT_USE_LOD1);
-        const uint16_t flip_c = can_flip ? alt_ceil_srca : 0;
-        const uint16_t flip_f = can_flip ? alt_floor_srca : 0;
+        uint16_t flip_c = can_flip ? alt_ceil_srca : 0;
+        uint16_t flip_f = can_flip ? alt_floor_srca : 0;
 
         if (__builtin_expect(min_x == -32768, 0))
         {
+            HW_FQ(4);
+#if HW_FQ_STATS
+            if (max_x > -32768) fq_any = 1;
+#endif
             if (max_x > -32768)
             {
+                if (__builtin_expect(q_is_warp, 0))
+                {
+                    /* own texture, drawn in column strips */
+                    uint32_t wq = HW_WarpApply(fctx, q, HW_NEAR_Z, emit_floor, emit_ceil, 0);
+                    if (wq)
+                    {
+                        if (emit_ceil)
+                            local_q = HW_EmitWarpStrips(fctx, qp, wq, 1, fctx->ceil_srca, local_q);
+                        if (emit_floor)
+                            local_q = HW_EmitWarpStrips(fctx, qp, wq, 0, fctx->floor_srca, local_q);
+                        continue;
+                    }
+                }
                 if (qpack_quv)
                 {
                     int st = (int)(qpack_quv >> 24), cnt = (int)((qpack_quv >> 16) & 0xFFu);
@@ -2310,13 +2803,28 @@ vert_behind:
         }
 
         if (max_x <= 0 || min_x >= vw || min_x >= max_x)
+        {
+            HW_FQ(5);
+            /* Warp quad just off the side (half a screen): ask for its
+             * texture now, so turning brings it in already made. */
+            if (__builtin_expect(q_is_warp, 0) && min_x < max_x &&
+                max_x > -(vw >> 1) && min_x < vw + (vw >> 1))
+            {
+                const fixed_t wd = HW_WarpDist(pv0, pv1, pv2, pv3);
+                if (wd < (HW_WARP_FAR_DIST << FRACBITS))
+                    HW_WarpApply(fctx, q, wd, emit_floor, emit_ceil, 1);
+            }
             continue;
+        }
 
         int cl_min_x = (min_x < 0) ? 0 : min_x;
         int cl_max_x = (max_x > vw) ? vw : max_x;
         if ((fctx->solid_any & hw_bit_lut[cl_min_x >> 5]) &&
             HW_Slave_IsSpanOccluded(fctx, cl_min_x, cl_max_x, vw))
+        {
+            HW_FQ(6);
             continue;
+        }
 
         int dx20 = px2 - px0;
         int dx13 = px1 - px3;
@@ -2345,7 +2853,43 @@ vert_behind:
         }
 
         if ((cw_c | cw_f) == 0)
+        {
+            HW_FQ(7);
             continue;
+        }
+        HW_FQ(8);
+#if HW_FQ_STATS
+        fq_any = 1;
+#endif
+
+        fixed_t wdist = 0;
+        if (__builtin_expect(q_is_warp, 0) &&
+            (wdist = HW_WarpDist(pv0, pv1, pv2, pv3)) < (HW_WARP_FAR_DIST << FRACBITS))
+        {
+            uint32_t wq = HW_WarpApply(fctx, q, wdist, emit_floor, emit_ceil, 0);
+            if (wq)
+            {
+                if (cw_c != 0)
+                    local_q = HW_EmitWarpStrips(fctx, qp, wq, 1, fctx->ceil_srca, local_q);
+                if (cw_f != 0)
+                    local_q = HW_EmitWarpStrips(fctx, qp, wq, 0, fctx->floor_srca, local_q);
+                continue;
+            }
+            else if (fctx->warp_room)
+            {
+                /* texture arrives next frame: flat-colour placeholder */
+                int lc = local_q, ph_ok = 1;
+                if (cw_c != 0) { lc = HW_EmitWarpPlaceholder(fctx, pv0, pv1, pv2, pv3, 1, lc); ph_ok = lc >= 0; }
+                if (ph_ok && cw_f != 0) { lc = HW_EmitWarpPlaceholder(fctx, pv0, pv1, pv2, pv3, 0, lc); ph_ok = lc >= 0; }
+                if (ph_ok)
+                {
+                    local_q = lc;
+                    continue;
+                }
+                /* (a ceiling placeholder already written is overwritten
+                 * by the row-mapped quads below: local_q unchanged) */
+            }
+        }
 
         uint32_t qpack_base = 64u << 16;
         if (qpack_quv)
@@ -2391,8 +2935,34 @@ vert_behind:
                 local_q = HW_EmitFlatBands(fctx, qp, cw_f, qpack_base | (uint32_t)local_q);
         }
     }
+#if HW_FLAT_CHUNKS && !defined(SATURN_WIN32)
+chunk_done:
+    if (chk && !(sky_flags & HW_JOB_ONE_CHUNK) && !(chk->v_cnt & SATURN_FLAT_CHUNK_LAST))
+    {
+        chk++;
+        goto chunk_next;
+    }
+#endif
+#if HW_FQ_STATS
+    if (!fq_any)
+        hw_fq_stats[9] += (uint32_t)v_count;
+#endif
 
     fctx->local_q = local_q;
+#if HW_FLAT_STEAL
+    if (is_master && hw_steal_to_m)
+    {
+        saturn_cmd_m_count = (uint16_t)local_q;
+        if ((unsigned)sub_idx < CMDBUF_MAX_VISIT)
+        {
+            sub_range_t *ranges = (sub_range_t *)((uint32_t)saturn_sub_ranges | SATURN_WRAM_H_UNCACHED);
+            ranges[sub_idx].m_start = (uint16_t)start_q;
+            ranges[sub_idx].m_count = (uint16_t)(local_q - start_q);
+            ranges[sub_idx].s_count = 0;
+        }
+        return;
+    }
+#endif
     if (is_master)
     {
         if (hw_frame_slave_enabled)
@@ -2427,10 +2997,21 @@ HW_ALWAYS_INLINE void HW_Master_ProcessJob(volatile hw_slave_ipc_t *ipc, const h
 }
 
 #ifndef SATURN_WIN32
+#if defined(SATURN_BENCH) && !defined(HW_SLAVE_TU)
+/* Bench only: slave FRT ticks (phi/32, its own on-chip FRT) spent in jobs.
+ * Written by the slave through the cache-through alias, read by the master. */
+volatile uint32_t saturn_slave_busy_ticks = 0;
+#endif
 static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
 {
     extern volatile unsigned int saturn_slave_execs;
     saturn_slave_execs++;
+#ifdef SATURN_BENCH
+    extern volatile uint32_t saturn_slave_busy_ticks;
+    volatile uint32_t *busy_u = (volatile uint32_t *)((uint32_t)&saturn_slave_busy_ticks | 0x20000000u);
+    uint32_t busy_acc = 0;
+    (*(volatile unsigned char *)0xFFFFFE16u) = 0x01u;   /* slave TCR: phi/32, same rate as master */
+#endif
 
     /* Ensure Slave SH-2 L1 Cache is purged & enabled via uncached Area 1 trampoline (0x11 = 0x10 CP | 0x01 CE) */
     HW_PURGE_L1_CACHE();
@@ -2446,12 +3027,41 @@ static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
         /* Pure lockless SPSC spin-wait with 64-cycle in-register bus yield */
         while ((int)(head - ipc->job_tail) >= 0)
         {
+#if HW_SLAVE_WALLS
+            /* no flat job: emit a deferred wall subsector if one is queued */
+            extern int HW_SlaveWallsService(void);
+            if (HW_SlaveWallsService())
+                continue;
+#endif
             HW_BUS_YIELD();
         }
         __asm__ volatile("" ::: "memory");
 
+#if HW_FLAT_STEAL
+        /* Claim the job, then check the master hasn't taken it (it takes jobs
+         * from the back once its walk is done). If it has, this frame's
+         * remaining jobs are all the master's: publish where we stopped and
+         * skip to the (final) tail. */
+        ipc->s_claim16 = (uint16_t)head;
+        if ((int16_t)((uint16_t)head - ipc->m_limit16) >= 0)
+        {
+            ipc->s_stop16 = (uint16_t)head;
+            ipc->quad_count = hw_fctx_slave.local_q;
+            head = ipc->job_tail;
+            __asm__ volatile("" ::: "memory");
+            ipc->job_head = head;
+            continue;
+        }
+#endif
         const volatile hw_flat_job_t *uncached_job = &ipc->jobs[head & (HW_JOB_RING - 1)];
+#ifdef SATURN_BENCH
+        unsigned short bt0 = SAT_FRT();
+#endif
         HW_Worker_ProcessJob(0, ipc, uncached_job, &hw_fctx_slave);
+#ifdef SATURN_BENCH
+        busy_acc += (unsigned short)(SAT_FRT() - bt0);
+        *busy_u = busy_acc;
+#endif
         head++;
         __asm__ volatile("" ::: "memory");
         if ((int)(head - ipc->job_tail) >= 0)
@@ -2464,10 +3074,16 @@ static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
 }
 #endif
 
+#ifndef HW_SLAVE_TU     /* the slave-wall object needs only the types above */
 void HW_Slave_FlatWorker(void)
 {
 #ifndef SATURN_WIN32
-    extern uint32_t hw_wram_h_slave_stack[224];
+#if HW_SLAVE_WALLS
+#define HW_SLAVE_STACK_WORDS 640
+#else
+#define HW_SLAVE_STACK_WORDS 224
+#endif
+    extern uint32_t hw_wram_h_slave_stack[HW_SLAVE_STACK_WORDS];
     /* Switch Slave SH-2 stack pointer (r15) from SGL's tiny default 0x06000FF0 stack
      * to our dedicated 896-byte Slave Stack in 32-bit High Work RAM before creating
      * any C stack frame, eliminating 16-bit WRAM-L write-through bus stalls! */
@@ -2476,12 +3092,13 @@ void HW_Slave_FlatWorker(void)
         "jmp   @%1     \n\t"
         "nop           \n\t"
         :
-        : "r"((uintptr_t)&hw_wram_h_slave_stack[224]), "r"(HW_Slave_FlatWorker_Loop)
+        : "r"((uintptr_t)&hw_wram_h_slave_stack[HW_SLAVE_STACK_WORDS]), "r"(HW_Slave_FlatWorker_Loop)
         : "memory"
     );
     __builtin_unreachable();
 #endif
 }
+#endif /* !HW_SLAVE_TU */
 
 typedef struct
 {
@@ -2536,19 +3153,260 @@ HW_ALWAYS_INLINE int HW_FlatAltVariant(int use_lod1, int subnum)
 #ifndef SATURN_WIN32
 static uint32_t hw_def_alt_pack = 0;    /* alt pack for HW_DeferMasterFlatJob */
 #endif
+static uint32_t hw_def_warp_bits = 0xFFFF0000u;   /* warp bits for HW_DeferMasterFlatJob */
+#ifndef HW_WARP_LOD0_DIST
+#define HW_WARP_LOD0_DIST 64    /* map units: full-res warp textures nearer than this */
+#endif
 
-static hw_flat_sec_cache_t hw_flat_sec_cache = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+HW_ALWAYS_INLINE int HW_WarpLen16(int dx, int dy)
+{
+    /* edge length in 1/16 units, max + min/2 (over-estimates <= 12%) */
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return (dx > dy) ? dx + (dy >> 1) : dy + (dx >> 1);
+}
+
+/* Master, start of each 3D frame (slave idle): make the textures the flat
+ * workers asked for last frame (HW_WarpApply), budgeted. */
+static HW_NOINLINE HW_COLD_OS void HW_WarpService(void)
+{
+    /* Pass 0: pieces with no texture at all get a coarse one first (level 3,
+     * at most 8 x 8 texels): cheap, so every newly visible piece is drawn
+     * with a world-aligned texture next frame instead of the row mapping
+     * (that flickered while turning: the budget couldn't make them all
+     * full size at once). Pass 1: the requested levels, with what budget
+     * remains; until then the coarse texture is drawn. */
+    int pass, r;
+    for (pass = 0; pass < 2; pass++)
+    for (r = 0; r < 2; r++)
+    {
+#ifndef SATURN_WIN32
+        volatile int *np = (volatile int *)((uintptr_t)&hw_warp_req_n[r] | SATURN_WRAM_H_UNCACHED);
+        const hw_warp_req_t *rq = (const hw_warp_req_t *)((uintptr_t)hw_warp_req[r] | SATURN_WRAM_H_UNCACHED);
+#else
+        volatile int *np = &hw_warp_req_n[r];
+        const hw_warp_req_t *rq = hw_warp_req[r];
+#endif
+        int n = *np, k;
+        if (n > HW_WARP_REQ_MAX) n = HW_WARP_REQ_MAX;
+        for (k = 0; k < n; k++)
+        {
+            const uint32_t gq = rq[k].gq, v_first = rq[k].v_first;
+            int lv = rq[k].lv;
+            const saturn_flat_quad_idx_t *qi;
+            int32_t wx[4], wy[4];
+            int i, w, h, l01, l32, l03, l12;
+            if (!saturn_baked_flat_quads || !saturn_baked_flat_verts)
+                continue;
+            if (!Saturn_Vdp1_WarpRoom(pass == 0 ? 64 : 256))
+                break;                              /* no VRAM / budget left */
+            if (pass == 0)
+            {
+                const uint32_t k1 = (gq << 1) | rq[k].is_ceil;
+                const saturn_warp_slot_t *e0 = &saturn_warp_tab[saturn_warp_slot(k1, 0)];
+                const saturn_warp_slot_t *e1 = &saturn_warp_tab[saturn_warp_slot(k1, 1)];
+                if ((e0->srca && e0->key == k1 + 1u) || (e1->srca && e1->key == k1 + 1u))
+                    continue;                       /* has a texture: refine in pass 1 */
+                lv = 3;
+            }
+            qi = &saturn_baked_flat_quads[gq];
+            for (i = 0; i < 4; i++)
+            {
+                uint32_t vi = v_first + qi->v[i];
+                const saturn_flat_vert_t *v = &saturn_baked_flat_verts[vi];
+                int fr = saturn_baked_flat_vfrac ? saturn_baked_flat_vfrac[vi] : 0;
+                wx[i] = (int32_t)v->x * 16 + (fr >> 4);
+                wy[i] = (int32_t)v->y * 16 + (fr & 15);
+            }
+            l01 = HW_WarpLen16(wx[1] - wx[0], wy[1] - wy[0]) >> lv;
+            l32 = HW_WarpLen16(wx[2] - wx[3], wy[2] - wy[3]) >> lv;
+            l03 = HW_WarpLen16(wx[3] - wx[0], wy[3] - wy[0]) >> lv;
+            l12 = HW_WarpLen16(wx[2] - wx[1], wy[2] - wy[1]) >> lv;
+            w = (((l01 > l32 ? l01 : l32) + 15) >> 4);
+            h = (((l03 > l12 ? l03 : l12) + 15) >> 4);
+            w = (w <= 8) ? 8 : (w + 15) & ~15;      /* 8, or 16-wide strips */
+            if (w > 64) w = 64;
+            if (h < 1) h = 1; else if (h > 64) h = 64;
+            Saturn_Vdp1_GetWarpSrca((int)gq, rq[k].is_ceil, rq[k].flat, lv, wx, wy, w, h);
+        }
+        if (pass == 1)
+            *np = 0;
+    }
+}
+
+/* Flat worker: the warped texture of visible warp quad `gq` (local quad
+ * index q_local) for the surfaces it draws. All found: switch the quad to
+ * them (fctx floor/ceil SRCA, size_wbits) and return its rows (qpack, h
+ * rows from 0). Any missing: queue a request, return 0 (row mapping this
+ * frame). Resolution level from the nearest corner depth. */
+static HW_NOINLINE HW_HOT_O2 uint32_t HW_WarpApply(hw_flat_emit_ctx_t *fctx, int q_local,
+                                                   fixed_t cz_min, int emit_floor, int emit_ceil,
+                                                   int prefetch)
+{
+    const uint32_t gq = fctx->warp_gq0 + (uint32_t)q_local;
+    const int d = cz_min >> FRACBITS;
+    const int lv = (d < HW_WARP_LOD0_DIST) ? 0 : (d < HW_WARP_LOD0_DIST * 2) ? 1
+                 : (d < HW_WARP_LOD0_DIST * 4) ? 2 : 3;
+    uint16_t srca[2] = { 0, 0 };
+    uint32_t wh = 0;
+    int c, missing = 0;
+    for (c = 0; c < 2; c++)
+    {
+        const int flat = c ? fctx->warp_cf : fctx->warp_ff;
+        const uint32_t k1 = (gq << 1) | (uint32_t)c;
+        volatile saturn_warp_slot_t *e;
+        if (!(c ? emit_ceil : emit_floor))
+            continue;
+        if (flat == 0xFF)
+            return 0;
+#ifndef SATURN_WIN32
+        e = (volatile saturn_warp_slot_t *)((uintptr_t)&saturn_warp_tab[saturn_warp_slot(k1, 0)] | SATURN_WRAM_H_UNCACHED);
+        if (e->key != k1 + 1u)
+            e = (volatile saturn_warp_slot_t *)((uintptr_t)&saturn_warp_tab[saturn_warp_slot(k1, 1)] | SATURN_WRAM_H_UNCACHED);
+#else
+        e = &saturn_warp_tab[saturn_warp_slot(k1, 0)];
+        if (e->key != k1 + 1u)
+            e = &saturn_warp_tab[saturn_warp_slot(k1, 1)];
+#endif
+        if (e->srca && e->key == k1 + 1u)
+        {
+            /* This piece's texture is resident: always draw with it (other
+             * level or previous animation frame included; falling back to
+             * the row mapping for a frame flickered on hardware while
+             * turning) and ask for the right one if it differs. Both
+             * surfaces must share one size, else the row mapping. */
+            uint32_t ewh = e->wh;
+            srca[c] = e->srca;
+            if (wh && wh != ewh)
+                missing = 1;
+            wh = ewh;
+            e->used = fctx->warp_frame;
+            if (e->lv == (uint8_t)lv && e->flat == (uint16_t)flat)
+                continue;
+        }
+        else
+            missing = 1;
+        {
+            const int r = (fctx == &hw_fctx_master) ? 1 : 0;
+#ifndef SATURN_WIN32
+            volatile int *np = (volatile int *)((uintptr_t)&hw_warp_req_n[r] | (r ? 0u : SATURN_WRAM_H_UNCACHED));
+            hw_warp_req_t *rq = (hw_warp_req_t *)((uintptr_t)hw_warp_req[r] | (r ? 0u : SATURN_WRAM_H_UNCACHED));
+#else
+            volatile int *np = &hw_warp_req_n[r];
+            hw_warp_req_t *rq = hw_warp_req[r];
+#endif
+            int n = *np;
+            if (n < HW_WARP_REQ_MAX && fctx->warp_room)
+            {
+                rq[n].gq      = gq;
+                rq[n].v_first = fctx->warp_v0;
+                rq[n].flat    = (uint16_t)flat;
+                rq[n].is_ceil = (uint8_t)c;
+                rq[n].lv      = (uint8_t)lv;
+                *np = n + 1;
+            }
+        }
+    }
+    if (prefetch)
+        return 0;           /* just off screen: requests only, nothing drawn */
+#ifdef SATURN_WIN32
+    if (missing || !wh || (emit_floor && !srca[0]) || (emit_ceil && !srca[1]))
+    {
+        static int log_on = -1;
+        if (log_on < 0) log_on = getenv("WARP_LOG") != NULL;
+        if (log_on)
+        {
+            printf("[WFB] q%u lv%d f%d c%d srca%u/%u wh%x req:%d/%d\n", gq, lv,
+                   emit_floor, emit_ceil, srca[0], srca[1], wh, hw_warp_req_n[0], hw_warp_req_n[1]);
+        }
+        saturn_warp_fallbacks++;
+    }
+    else
+        saturn_warp_hits++;
+#endif
+    if (missing || !wh || (emit_floor && !srca[0]) || (emit_ceil && !srca[1]))
+        return 0;
+    if (emit_floor) fctx->floor_srca = srca[0];
+    if (emit_ceil)  fctx->ceil_srca  = srca[1];
+    return wh;              /* w << 8 | h: draw with HW_EmitWarpStrips */
+}
+
+/* Master, at job submit: the job's HW_JOB_AVG_WORD warp bits (translated
+ * floor / ceiling flat in bits 31-24 / 23-16, 0xFF = none). */
+HW_ALWAYS_INLINE uint32_t HW_WarpJobBits(int subnum, int use_lod1, const sector_t *sec,
+                                         int emit_floor, int emit_ceil)
+{
+    uint32_t ff = 0xFF, cf = 0xFF;
+    if (saturn_baked_flat_subflags &&
+        (saturn_baked_flat_subflags[subnum] & (use_lod1 ? SATURN_SUBFLAG_WARP_LOD1 : SATURN_SUBFLAG_WARP)))
+    {
+        if (emit_floor)
+        {
+            int f = flattranslation ? flattranslation[sec->floorpic] : sec->floorpic;
+            if ((unsigned)f < 0xFFu && f < numflats) ff = (uint32_t)f;
+        }
+        if (emit_ceil)
+        {
+            int f = flattranslation ? flattranslation[sec->ceilingpic] : sec->ceilingpic;
+            if ((unsigned)f < 0xFFu && f < numflats) cf = (uint32_t)f;
+        }
+    }
+    return (ff << 24) | (cf << 16);
+}
 
 static void HW_RenderSubsectorBakedFlats(int sub_idx, int subnum, sector_t *sec, int fully_inside);
 
+/* Per-frame sector cache (2026-11-20). Walk order alternates sectors (p2:
+ * 37 flat jobs, 25 refills per frame with a one-entry cache), so a refill
+ * used to recompute a sector already seen this frame - including its
+ * alternate-pyramid packs (HW_FlatAltPack). Now a 32-way direct-mapped
+ * store; hw_fc points at the active entry (the asm reads it through
+ * hw_asm_flatsub_ctx[2] = &hw_fc). A miss repoints hw_fc at a slot this
+ * frame already built, else fills the slot. Frame start points hw_fc at an
+ * empty entry and bumps hw_fsc_gen, which invalidates every slot. */
+#define HW_FSC_WAYS 32
+/* The store comes from the Jo heap on first use (High WRAM BSS is at its
+ * 0x060C0000 ceiling); if that fails, one built-in entry (= the old
+ * one-entry cache). */
+typedef struct { hw_flat_sec_cache_t e[HW_FSC_WAYS]; uint32_t frame[HW_FSC_WAYS]; } hw_fsc_store_t;
+static hw_fsc_store_t     *hw_fsc = NULL;
+static hw_flat_sec_cache_t hw_fsc_one;
+static uint32_t            hw_fsc_one_frame;
+static unsigned int        hw_fsc_mask = 0;
+static uint32_t            hw_fsc_gen = 1;   /* ++ at each frame start (saturn_hw_render.c); never 0 */
+static hw_flat_sec_cache_t hw_fsc_none;      /* sec NULL: matches nothing */
+static hw_flat_sec_cache_t *hw_fc = &hw_fsc_none;
+#define hw_flat_sec_cache (*hw_fc)
+
 static HW_NOINLINE HW_HOT_O2 void HW_CacheFlatSectorInfo(const sector_t *sec)
 {
+    {
+        static int tried = 0;
+        if (__builtin_expect(!tried, 0))
+        {
+            extern byte *I_AllocHigh(int length);
+            tried = 1;
+            hw_fsc = (hw_fsc_store_t *)I_AllocHigh((int)sizeof(hw_fsc_store_t));
+            if (hw_fsc)
+            {
+                for (int i = 0; i < HW_FSC_WAYS; i++)
+                    hw_fsc->frame[i] = 0;
+                hw_fsc_mask = HW_FSC_WAYS - 1;
+            }
+        }
+        unsigned k = (unsigned)(sec - sectors) & hw_fsc_mask;
+        uint32_t *fr = hw_fsc ? &hw_fsc->frame[k] : &hw_fsc_one_frame;
+        hw_fc = hw_fsc ? &hw_fsc->e[k] : &hw_fsc_one;
+        if (*fr == hw_fsc_gen && hw_fc->sec == sec)
+            return;                 /* built earlier this frame */
+        *fr = hw_fsc_gen;
+    }
     const fixed_t vz = hw_viewz;
     int is_sky     = ((int16_t)sec->ceilingpic == -1);
     int emit_ceil  = (vz < sec->ceilingheight && !is_sky);
     int emit_floor = (vz > sec->floorheight && ((int16_t)sec->floorpic != -1));
-    if (saturn_vdp2_plane_active && sec == &sectors[saturn_vdp2_plane_sec])
-        emit_floor = 0;
+    if (SATURN_V2P_SKIP_FLOOR(sec))
+        emit_floor = 0;             /* the RBG0 plane draws this floor */
 
     int floor_srca = 0;
     int ceil_srca  = 0;
@@ -2600,7 +3458,7 @@ static HW_NOINLINE HW_COLD_OS void HW_DeferMasterFlatJob(
     mw[9]  = hw_solid_summary;
     mw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)s_any;
     mw[HW_JOB_ALT_SRCA_WORD] = hw_def_alt_pack;
-    mw[HW_JOB_AVG_WORD] = fc->avg_pack;
+    mw[HW_JOB_AVG_WORD] = fc->avg_pack | hw_def_warp_bits;
     if (s_any != 0)
     {
         const uint32_t *sm = hw_solid_mask;
@@ -2611,6 +3469,188 @@ static HW_NOINLINE HW_COLD_OS void HW_DeferMasterFlatJob(
                 ms[w] = sm[w];
         }
     }
+}
+#endif
+
+/* Stage G: HW_SubmitSlaveFlatJob + HW_RingFlatJob in assembly
+ * (saturn_hw_asm.s hw_asm_flatsub). The asm takes the common path and
+ * hands the rare ones (sector-cache refill, first alt-pyramid pack, a job
+ * deferred to the master, a split candidate) to the C function whole,
+ * deciding before any side effect. */
+#ifndef HW_ASM_FLATSUB
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU) && HW_FLAT_STEAL && HW_FLAT_SPLIT && HW_FLAT_CHUNKS
+#define HW_ASM_FLATSUB 1
+#else
+#define HW_ASM_FLATSUB 0
+#endif
+#endif
+#if HW_ASM_FLATSUB && HW_ASM_CHECK
+/* check builds: the C reference writes its ring job into a scratch ring */
+static volatile hw_slave_ipc_t *hw_ring_ipc_c = NULL;      /* header (job_head/job_tail) */
+static volatile aliased_uint32_t *hw_ring_job_c = NULL;    /* the one job slot */
+#define HW_RING_IPC() (hw_ring_ipc_c ? hw_ring_ipc_c : (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED)
+#define HW_RING_JOB(ipc, idx) (hw_ring_job_c ? hw_ring_job_c : \
+    (volatile aliased_uint32_t *)((uintptr_t)(ipc)->jobs + ((idx) << 6) + ((idx) << 5)))
+#else
+#define HW_RING_IPC() ((volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED)
+#define HW_RING_JOB(ipc, idx) ((volatile aliased_uint32_t *)((uintptr_t)(ipc)->jobs + ((idx) << 6) + ((idx) << 5)))
+#endif
+
+#ifndef SATURN_WIN32
+/* Write one flat job into the slave ring (waits if the ring is full).
+ * Factored out of HW_SubmitSlaveFlatJob so a big subsector can be
+ * submitted as one job per chunk (HW_FLAT_SPLIT). */
+static HW_NOINLINE void HW_RingFlatJob(uint32_t v_first, uint32_t q_first, uint32_t vq_pack,
+                                      uint32_t w3_pack, int sub_idx, uint32_t alt_pack, uint32_t warp_bits)
+{
+    const hw_flat_sec_cache_t *fc = &hw_flat_sec_cache;
+    unsigned int tail = hw_master_job_tail;
+    hw_master_job_tail = tail + 1;
+    unsigned int ring_idx = tail & (HW_JOB_RING - 1);
+    volatile hw_slave_ipc_t *ipc = HW_RING_IPC();
+
+    /* Ring-full guard: the slave reads each job IN PLACE while it draws it
+     * and only advances job_head when done, so a master more than
+     * HW_JOB_RING jobs ahead would overwrite a job mid-draw (garbage flat
+     * geometry / texture addresses). Wait for a free slot instead. */
+    {
+        unsigned int depth = tail - ipc->job_head;
+        if (depth > saturn_hw_ring_maxdepth)
+            saturn_hw_ring_maxdepth = depth;
+        if (__builtin_expect(depth >= HW_JOB_RING - 1u, 0))
+        {
+            saturn_hw_ring_waits++;
+            while ((unsigned int)(tail - ipc->job_head) >= HW_JOB_RING - 1u)
+                HW_BUS_YIELD();
+        }
+    }
+
+    /* Write directly to uncached IPC ring so Master L1 cache is never polluted by write-only IPC jobs */
+    volatile aliased_uint32_t *jw = HW_RING_JOB(ipc, ring_idx);
+    jw[0] = (uint32_t)&saturn_baked_flat_verts[v_first];
+    jw[1] = (uint32_t)&saturn_baked_flat_quads[q_first];
+    jw[2] = vq_pack;
+    uint32_t dirty = hw_slave_dirty_words;
+    if (__builtin_expect(hw_first_flat_job, 0))
+    {
+        hw_first_flat_job = 0;
+        w3_pack |= 2u;
+        dirty = hw_solid_any;
+    }
+    hw_slave_dirty_words = 0;
+    jw[3] = w3_pack;
+    jw[4] = fc->srca_pack;
+    jw[5] = (uint32_t)fc->y_floor_w;
+    jw[6] = (uint32_t)(saturn_baked_flat_vfrac ? (saturn_baked_flat_vfrac + v_first) : NULL);
+    jw[7] = (uint32_t)fc->y_ceil_w;
+    jw[8] = ((uint32_t)(*(const uint16_t *)&HW_APERTURE->cur_sub_ytop) << 16) |
+            (uint32_t)fc->light_bits | ((uint32_t)sub_idx & 0x0FFFu);
+    jw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)dirty;
+    jw[HW_JOB_ALT_SRCA_WORD] = alt_pack;
+    jw[HW_JOB_AVG_WORD] = fc->avg_pack | warp_bits;
+
+    if (__builtin_expect(dirty != 0, 0))
+    {
+        jw[9] = hw_solid_summary;
+        const uint32_t *sm = hw_solid_mask;
+        volatile aliased_uint32_t *js = &jw[11];
+        for (uint32_t d = dirty; d != 0; d >>= 1, js++, sm++)
+        {
+            if (d & 1u)
+                *js = *sm;
+        }
+    }
+
+#if HW_FLAT_STEAL
+    {
+        /* Full solid-mask state at submit (the ring job only carries the
+         * words that changed since the previous job, which suits the slave
+         * working in order, not the master taking jobs from the back). */
+        hw_steal_snap_t *sn = &hw_steal_snap[tail & (HW_STEAL_SNAPS - 1)];
+        sn->summary = hw_solid_summary;
+        sn->count_any = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)hw_solid_any;
+        for (int w = 0; w < HW_SOLID_WORDS; w++)
+            sn->solid[w] = hw_solid_mask[w];
+    }
+#endif
+    /* Uncached stores issue strictly in FIFO program order on the SH-2 external bus controller */
+    __asm__ volatile("" ::: "memory");
+    ipc->job_tail = tail + 1;
+}
+
+#endif
+#if HW_FLAT_SPLIT && HW_FLAT_CHUNKS && !defined(SATURN_WIN32)
+/* HW_BATCH (saturn_hw_render.c): floor jobs are submitted after the batch's
+ * walls, so the chunk visit slots must be reserved right after their
+ * subsector's slot when the slot is assigned; these name the reserved run
+ * for the job being submitted (left = 0: allocate at the end as before). */
+static int hw_split_res_next = 0, hw_split_res_left = 0;
+/* chunk count HW_SplitFlatJob would use for this subsector, 0 = no split */
+static inline int HW_SplitChunkCount(int subnum)
+{
+    if (!saturn_baked_flat_chunks || !saturn_baked_flat_sub_chunk ||
+        (int)HW_SUB_FLAT_INFO[subnum].q_count < HW_SPLIT_MIN_Q)
+        return 0;
+    uint32_t c0 = saturn_baked_flat_sub_chunk[subnum];
+    if (c0 == 0)
+        return 0;
+    const saturn_flat_chunk_t *ck = &saturn_baked_flat_chunks[c0];
+    int n = 1;
+    while (!(ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST) && n < 64)
+        n++;
+    return ((ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST) && n >= 2) ? n : 0;
+}
+/* A big chunked subsector goes out as one job per chunk, so the slave and
+ * the stealing master (HW_FLAT_STEAL) can share it. Each extra chunk job
+ * gets its own visit slot right after the subsector's (floor range only):
+ * chunks of one subsector are coplanar and disjoint, so their order among
+ * themselves is free, and slots after the subsector's are delivered before
+ * it in the back-to-front loop, so its walls still land on top. */
+static int HW_SplitFlatJob(int sub_idx, int subnum, int q_count, uint32_t v_first, uint32_t q_first,
+                           uint32_t vq_pack, uint32_t w3_pack, uint32_t alt_pack, uint32_t warp_bits)
+{
+    if (q_count < HW_SPLIT_MIN_Q || !saturn_baked_flat_chunks || !saturn_baked_flat_sub_chunk)
+        return 0;
+    uint32_t c0 = saturn_baked_flat_sub_chunk[subnum];
+    if (c0 == 0)
+        return 0;
+    const saturn_flat_chunk_t *ck = &saturn_baked_flat_chunks[c0];
+    int n = 1;
+    while (!(ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST) && n < 64)
+        n++;
+    /* More than 64 chunks (2026-11-21): the chunks past the 64th were never
+     * submitted (one-chunk jobs) = a missing floor region. Send the
+     * subsector as one whole job instead. */
+    if (!(ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST))
+        return 0;
+    if (n < 2 || saturn_visit_count + n >= CMDBUF_MAX_VISIT - 32)
+        return 0;
+    if (hw_split_res_left < 0 || (hw_split_res_left > 0 && hw_split_res_left < n - 1))
+        return 0;               /* no / too small a reservation: one whole job */
+    uint32_t w3_base = (w3_pack & ~((0x7Fu << 25) | (0x7Fu << 17))) | HW_JOB_ONE_CHUNK;
+    for (int k = 0; k < n; k++)
+    {
+        int vis = sub_idx;
+        if (k > 0)
+        {
+            if (hw_split_res_left > 0)
+            {
+                vis = hw_split_res_next++;
+                hw_split_res_left--;
+            }
+            else
+                vis = saturn_visit_count++;
+            sub_range_t *ranges = hw_cur_sub_ranges;
+            aliased_uint32_t *r32 = (aliased_uint32_t *)&ranges[vis];
+            r32[0] = (uint32_t)saturn_cmd_m_count << 16;   /* no walls/sprites */
+            r32[1] = 0;
+            ranges[vis].subnum = (uint16_t)subnum;
+        }
+        HW_RingFlatJob(v_first, q_first, vq_pack, w3_base | HW_JOB_CHUNK_PACK(c0 + (uint32_t)k),
+                       vis, alt_pack, warp_bits);
+    }
+    saturn_hw_split_jobs += (unsigned int)n;
+    return 1;
 }
 #endif
 
@@ -2626,9 +3666,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
     if (q_count <= 0 || v_count <= 0)
         return;
 
-    hw_flat_sec_cache_t *fc = &hw_flat_sec_cache;
-    if (__builtin_expect(sec != fc->sec, 0))
-        HW_CacheFlatSectorInfo(sec);
+    if (__builtin_expect(sec != hw_fc->sec, 0))
+        HW_CacheFlatSectorInfo(sec);        /* repoints hw_fc */
+    hw_flat_sec_cache_t *fc = hw_fc;
 
     uint32_t u_flags = (uint32_t)fully_inside;
     uint32_t allow_sky  = (u_flags >> 3) & 1u;
@@ -2675,9 +3715,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
         }
     }
     hw_def_alt_pack = alt_pack;
+    uint32_t warp_bits = HW_WarpJobBits(subnum, use_lod1, sec, (int)emit_floor, (int)emit_ceil);
+    hw_def_warp_bits = warp_bits;
 
     uint32_t sky_flags = (uint32_t)fc->is_sky & allow_sky;
     uint32_t w3_pack = (emit_floor << 24) | (emit_ceil << 16) | ((u_flags & 19u) << 8) | sky_flags;
+#if HW_FLAT_CHUNKS
+    if (!use_lod1 && saturn_baked_flat_sub_chunk)
+        w3_pack |= HW_JOB_CHUNK_PACK(saturn_baked_flat_sub_chunk[subnum]);
+#endif
     uint32_t vq_pack = ((uint32_t)(uint16_t)v_count << 16) | (uint16_t)q_count;
     int fjob_idx = ++hw_frame_flat_jobs;
 
@@ -2690,70 +3736,311 @@ static HW_NOINLINE HW_HOT_O2 void HW_SubmitSlaveFlatJob(int sub_idx, int subnum,
         return;
     }
 
-    unsigned int tail = hw_master_job_tail;
-    hw_master_job_tail = tail + 1;
-    unsigned int ring_idx = tail & (HW_JOB_RING - 1);
-    volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
-
-    /* Ring-full guard: the slave reads each job IN PLACE while it draws it
-     * and only advances job_head when done, so a master more than
-     * HW_JOB_RING jobs ahead would overwrite a job mid-draw (garbage flat
-     * geometry / texture addresses). Wait for a free slot instead. */
-    {
-        unsigned int depth = tail - ipc->job_head;
-        if (depth > saturn_hw_ring_maxdepth)
-            saturn_hw_ring_maxdepth = depth;
-        if (__builtin_expect(depth >= HW_JOB_RING - 1u, 0))
-        {
-            saturn_hw_ring_waits++;
-            while ((unsigned int)(tail - ipc->job_head) >= HW_JOB_RING - 1u)
-                HW_BUS_YIELD();
-        }
-    }
-
-    /* Write directly to uncached IPC ring so Master L1 cache is never polluted by write-only IPC jobs */
-    volatile aliased_uint32_t *jw = (volatile aliased_uint32_t *)((uintptr_t)ipc->jobs + (ring_idx << 6) + (ring_idx << 5));
-    jw[0] = (uint32_t)&saturn_baked_flat_verts[v_first];
-    jw[1] = (uint32_t)&saturn_baked_flat_quads[q_first];
-    jw[2] = vq_pack;
-    uint32_t dirty = hw_slave_dirty_words;
-    if (__builtin_expect(hw_first_flat_job, 0))
-    {
-        hw_first_flat_job = 0;
-        w3_pack |= 2u;
-        dirty = hw_solid_any;
-    }
-    hw_slave_dirty_words = 0;
-    jw[3] = w3_pack;
-    jw[4] = fc->srca_pack;
-    jw[5] = (uint32_t)fc->y_floor_w;
-    jw[6] = (uint32_t)(saturn_baked_flat_vfrac ? (saturn_baked_flat_vfrac + v_first) : NULL);
-    jw[7] = (uint32_t)fc->y_ceil_w;
-    jw[8] = ((uint32_t)(*(const uint16_t *)&HW_APERTURE->cur_sub_ytop) << 16) |
-            (uint32_t)fc->light_bits | ((uint32_t)sub_idx & 0x0FFFu);
-    jw[10] = ((uint32_t)(uint16_t)(int16_t)hw_solid_count << 16) | (uint16_t)dirty;
-    jw[HW_JOB_ALT_SRCA_WORD] = alt_pack;
-    jw[HW_JOB_AVG_WORD] = fc->avg_pack;
-
-    if (__builtin_expect(dirty != 0, 0))
-    {
-        jw[9] = hw_solid_summary;
-        const uint32_t *sm = hw_solid_mask;
-        volatile aliased_uint32_t *js = &jw[11];
-        for (uint32_t d = dirty; d != 0; d >>= 1, js++, sm++)
-        {
-            if (d & 1u)
-                *js = *sm;
-        }
-    }
-
-    /* Uncached stores issue strictly in FIFO program order on the SH-2 external bus controller */
-    __asm__ volatile("" ::: "memory");
-    ipc->job_tail = tail + 1;
+#if HW_FLAT_SPLIT
+    if (!use_lod1 && HW_SplitFlatJob(sub_idx, subnum, q_count, v_first, q_first, vq_pack, w3_pack, alt_pack, warp_bits))
+        return;
+#endif
+    HW_RingFlatJob(v_first, q_first, vq_pack, w3_pack, sub_idx, alt_pack, warp_bits);
 #else
     (void)sub_idx; (void)subnum; (void)sec; (void)fully_inside;
 #endif
 }
+
+#if HW_ASM_FLATSUB
+extern void hw_asm_flatsub(int sub_idx, int subnum, sector_t *sec, int flags);
+_Static_assert(offsetof(hw_flat_sec_cache_t, srca_pack) == 4 && offsetof(hw_flat_sec_cache_t, light_bits) == 12 &&
+               offsetof(hw_flat_sec_cache_t, emit_floor) == 14 && offsetof(hw_flat_sec_cache_t, emit_ceil) == 15 &&
+               offsetof(hw_flat_sec_cache_t, is_sky) == 16 && offsetof(hw_flat_sec_cache_t, y_floor_w) == 20 &&
+               offsetof(hw_flat_sec_cache_t, y_ceil_w) == 24 && offsetof(hw_flat_sec_cache_t, trans_pack) == 28 &&
+               offsetof(hw_flat_sec_cache_t, tile_pack) == 32 && offsetof(hw_flat_sec_cache_t, alt_have) == 36 &&
+               offsetof(hw_flat_sec_cache_t, avg_pack) == 40, "hw_asm_flatsub: sec cache layout");
+_Static_assert(offsetof(hw_slave_ipc_t, job_tail) == 32 && offsetof(hw_slave_ipc_t, job_head) == 48 &&
+               offsetof(hw_slave_ipc_t, jobs) == 64 && sizeof(hw_flat_job_t) == 96 && HW_JOB_RING == 256 &&
+               HW_SOLID_WORDS == 11 && HW_JOB_ALT_SRCA_WORD == 22 && HW_JOB_AVG_WORD == 23 &&
+               sizeof(hw_steal_snap_t) == 52 && HW_STEAL_SNAPS == 64 && HW_SPLIT_MIN_Q == 96 &&
+               HW_MAX_DEF_FLAT_JOBS == 4 && CMDBUF_S_CAP == 1024, "hw_asm_flatsub: ring layout");
+_Static_assert(offsetof(hw_sub_flat_info_t, q_count) == 4 && offsetof(hw_sub_flat_info_t, lod1_q_first) == 8 &&
+               offsetof(hw_sub_flat_info_t, lod1_v_count) == 14 && sizeof(saturn_flat_vert_t) == 4 &&
+               sizeof(saturn_flat_quad_idx_t) == 8 && sizeof(saturn_flat_bbox_t) == 8 &&
+               offsetof(sector_t, floorpic) == 8 && offsetof(sector_t, ceilingpic) == 10 &&
+               sizeof(numflats) == 2 && sizeof(*flattranslation) == 1, "hw_asm_flatsub: data layout");
+static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, int flags);
+/* [0] baked q_count ptr [1] sub flat info [2] sec cache [3] C fallback
+ * [4] quv ptr [5] subflags ptr [6] bboxes ptr [7] cam_x [8] cam_y
+ * [9] flattranslation ptr [10] numflats [11] sub_chunk ptr [12] frame jobs
+ * [13] sky visible [14] def count [15] master flat q [16] chunks ptr
+ * [17] def alt pack [18] def warp bits [19] lod saved [20] lod1 subs
+ * [21] lod0 subs [22] job tail [23] ring base (asm ORs 0x20000000)
+ * [24] ring maxdepth [25] ring waits [26] verts ptr [27] quads ptr
+ * [28] vfrac ptr [29] slave dirty [30] first job [31] aperture
+ * [32] solid count [33] solid summary [34] solid mask [35] solid any
+ * [36] steal snaps [37] HW_CacheFlatSectorInfo [38] HW_FlatAltPack */
+const void *const hw_asm_flatsub_ctx[39] = {
+    &saturn_baked_flat_q_count, hw_wram_h_sub_flat_info, (const void *)&hw_fc, (const void *)HW_SubmitFlatJob_Fallback,
+    &saturn_baked_flat_quv, &saturn_baked_flat_subflags, &saturn_baked_flat_bboxes, &hw_cam_x,
+    &hw_cam_y, &flattranslation, &numflats, &saturn_baked_flat_sub_chunk,
+    &hw_frame_flat_jobs, &saturn_hw_sky_visible, &hw_def_flat_count, &saturn_master_flat_q,
+    &saturn_baked_flat_chunks, &hw_def_alt_pack, &hw_def_warp_bits, &saturn_hw_flat_lod_saved_quads,
+    &saturn_hw_flat_lod1_subs, &saturn_hw_flat_lod0_subs, &hw_master_job_tail,
+#if HW_IPC_IN_WRAM_L
+    (const void *)SATURN_WRAM_L_IPC_UNCACHED,
+#else
+    &hw_slave_ipc_hwram,
+#endif
+    &saturn_hw_ring_maxdepth, &saturn_hw_ring_waits, &saturn_baked_flat_verts, &saturn_baked_flat_quads,
+    &saturn_baked_flat_vfrac, &hw_slave_dirty_words, &hw_first_flat_job, &hw_aperture_state,
+    &hw_solid_count, &hw_solid_summary, hw_solid_mask, &hw_solid_any,
+    hw_steal_snap, (const void *)HW_CacheFlatSectorInfo, (const void *)HW_FlatAltPack
+};
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] first differing byte [3] subnum
+ * [4] asm byte [5] C byte [6] fallbacks (C both times, not compared) */
+static volatile uint32_t hw_asm_chk_flatsub[8];
+static int hw_flatsub_fell_back;
+static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    hw_flatsub_fell_back = 1;
+    HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+}
+typedef struct {
+    hw_flat_sec_cache_t fc;
+    hw_flat_sec_cache_t *fcp;
+    hw_steal_snap_t snap;
+    uint32_t job[24];
+    uint32_t lod_saved, lod1, lod0, def_alt, def_warp, tail, dirty, jtail;
+    int frame_jobs, first;
+} hw_flatsub_snap_t;
+static void HW_FlatSubSave(hw_flatsub_snap_t *s, volatile hw_slave_ipc_t *ipc,
+                           volatile aliased_uint32_t *job, unsigned int tail)
+{
+    memset(s, 0, sizeof(*s));
+    s->fcp = hw_fc;
+    s->fc = *hw_fc;
+    s->snap = hw_steal_snap[tail & (HW_STEAL_SNAPS - 1)];
+    for (int i = 0; i < 24; i++)
+        s->job[i] = job[i];
+    s->lod_saved = saturn_hw_flat_lod_saved_quads; s->lod1 = saturn_hw_flat_lod1_subs;
+    s->lod0 = saturn_hw_flat_lod0_subs; s->def_alt = hw_def_alt_pack; s->def_warp = hw_def_warp_bits;
+    s->tail = hw_master_job_tail; s->dirty = hw_slave_dirty_words; s->jtail = ipc->job_tail;
+    s->frame_jobs = hw_frame_flat_jobs; s->first = hw_first_flat_job;
+}
+static void HW_FlatSubLoad(const hw_flatsub_snap_t *s)
+{
+    hw_fc = s->fcp;
+    *hw_fc = s->fc;
+    saturn_hw_flat_lod_saved_quads = s->lod_saved; saturn_hw_flat_lod1_subs = s->lod1;
+    saturn_hw_flat_lod0_subs = s->lod0; hw_def_alt_pack = s->def_alt; hw_def_warp_bits = s->def_warp;
+    hw_master_job_tail = s->tail; hw_slave_dirty_words = s->dirty;
+    hw_frame_flat_jobs = s->frame_jobs; hw_first_flat_job = s->first;
+}
+static HW_NOINLINE void HW_FlatSubCheck(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    static hw_flatsub_snap_t s0, s1, s2;
+    static uint32_t scratch_hdr[16] __attribute__((aligned(16)));   /* ring header (job_head @48) */
+    static uint32_t scratch_job[24] __attribute__((aligned(16)));
+    volatile hw_slave_ipc_t *real = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
+    volatile hw_slave_ipc_t *scratch = (volatile hw_slave_ipc_t *)scratch_hdr;
+    unsigned int tail0 = hw_master_job_tail;
+    volatile aliased_uint32_t *real_job = HW_RING_JOB(real, tail0 & (HW_JOB_RING - 1));
+    unsigned int md = saturn_hw_ring_maxdepth, rw = saturn_hw_ring_waits;
+    if (hw_sub_flat_big)
+    {
+        HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);   /* see HW_SubmitFlatJobSel */
+        return;
+    }
+    HW_FlatSubSave(&s0, real, real_job, tail0);
+    hw_flatsub_fell_back = 0;
+    hw_asm_flatsub(sub_idx, subnum, sec, flags);
+    hw_asm_chk_flatsub[0]++;
+    if (hw_flatsub_fell_back)
+    {
+        hw_asm_chk_flatsub[6]++;
+        return;
+    }
+    HW_FlatSubSave(&s1, real, real_job, tail0);
+    unsigned int md1 = saturn_hw_ring_maxdepth, rw1 = saturn_hw_ring_waits;
+    /* C reference into the scratch ring: same job_head the asm saw is not
+     * recoverable (the slave moves it), so give it an empty ring and leave
+     * the ring-depth statistics out of the comparison */
+    scratch->job_head = tail0;
+    scratch->job_tail = s0.jtail;
+    HW_FlatSubLoad(&s0);
+    saturn_hw_ring_maxdepth = md; saturn_hw_ring_waits = rw;
+    for (int i = 0; i < 24; i++)
+        scratch_job[i] = s0.job[i];   /* words a job leaves alone keep the slot's old value */
+    hw_ring_ipc_c = scratch;
+    hw_ring_job_c = (volatile aliased_uint32_t *)scratch_job;
+    HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+    hw_ring_ipc_c = NULL;
+    hw_ring_job_c = NULL;
+    HW_FlatSubSave(&s2, scratch, (volatile aliased_uint32_t *)scratch_job, tail0);
+    s1.jtail -= s0.jtail;       /* compare the job_tail step only */
+    s2.jtail -= s0.jtail;
+    saturn_hw_ring_maxdepth = md1; saturn_hw_ring_waits = rw1;
+    if (s1.tail == tail0)
+        return;                 /* no job written (nothing to emit) */
+    const uint8_t *a = (const uint8_t *)&s1, *c = (const uint8_t *)&s2;
+    for (uint32_t i = 0; i < sizeof(s1); i++)
+        if (a[i] != c[i])
+        {
+            if (hw_asm_chk_flatsub[1]++ == 0)
+            {
+                hw_asm_chk_flatsub[2] = i;
+                hw_asm_chk_flatsub[3] = (uint32_t)subnum;
+                hw_asm_chk_flatsub[4] = a[i];
+                hw_asm_chk_flatsub[5] = c[i];
+            }
+            break;
+        }
+}
+#define HW_SUBMIT_FLAT_JOB HW_FlatSubCheck
+#else
+static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+}
+/* hw_asm_flatsub indexes the static flat-info table; maps with more than
+ * HW_MAX_AP_SUBSECTORS subsectors (hw_sub_flat_big) use the C path, which
+ * reads HW_SUB_FLAT_INFO (their PU_LEVEL table). 2026-11-21. */
+static inline void HW_SubmitFlatJobSel(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    if (__builtin_expect(hw_sub_flat_big, 0))
+        HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+    else
+        hw_asm_flatsub(sub_idx, subnum, sec, flags);
+}
+#define HW_SUBMIT_FLAT_JOB HW_SubmitFlatJobSel
+#endif
+#else
+#define HW_SUBMIT_FLAT_JOB HW_SubmitSlaveFlatJob
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+const void *const hw_asm_flatsub_ctx[1] = { 0 };   /* saturn_hw_asm.s references it */
+#endif
+#endif
+
+#if HW_FLAT_STEAL && !defined(SATURN_WIN32)
+/* Frame start (before the first job is submitted): no limit yet. */
+static void HW_StealBegin(volatile hw_slave_ipc_t *ipc)
+{
+    unsigned int first = hw_master_job_tail;
+    hw_steal_first = first;
+    hw_steal_k = first;
+    saturn_hw_steal_jobs = 0;
+    ipc->s_stop16  = (uint16_t)(first + HW_STEAL_FAR);
+    ipc->m_limit16 = (uint16_t)(first + HW_STEAL_FAR);
+}
+
+/* Where the master can put ring job kk's quads: 1 = the wall buffer (its
+ * visit has no walls/sprites, so the quads can be the visit's m range),
+ * 0 = the master's share of cmd_s, -1 = no room anywhere. */
+static int HW_StealPick(volatile hw_slave_ipc_t *ipc, unsigned int kk)
+{
+    const volatile aliased_uint32_t *jw = (const volatile aliased_uint32_t *)&ipc->jobs[kk & (HW_JOB_RING - 1)];
+    int need = (int)((jw[2] & 0xFFFFu) << 1) + 8;
+    unsigned int vis = jw[8] & 0x0FFFu;
+    if (vis < CMDBUF_MAX_VISIT)
+    {
+        const volatile sub_range_t *r =
+            &((const volatile sub_range_t *)((uint32_t)saturn_sub_ranges | SATURN_WRAM_H_UNCACHED))[vis];
+        if (r->m_count == 0 && (int)saturn_cmd_m_count + need < CMDBUF_M_CAP)
+            return 1;
+    }
+    if (saturn_master_flat_q + need < CMDBUF_S_CAP)
+        return 0;
+    return -1;
+}
+
+/* Master runs ring job kk itself, with the full solid mask it had at submit. */
+static HW_NOINLINE void HW_StealRun(volatile hw_slave_ipc_t *ipc, unsigned int kk)
+{
+    int pick = HW_StealPick(ipc, kk);
+    if (pick < 0)
+        pick = 0;   /* an orphan from HW_StealFinish must still be drawn: the
+                     * job's own qcap checks bound it, as before */
+    hw_steal_to_m = pick;
+    hw_flat_job_t job __attribute__((aligned(16)));
+    const volatile aliased_uint32_t *src =
+        (const volatile aliased_uint32_t *)&ipc->jobs[kk & (HW_JOB_RING - 1)];
+    aliased_uint32_t *dst = (aliased_uint32_t *)&job;
+    for (int i = 0; i < (int)(sizeof(job) / 4); i++)
+        dst[i] = src[i];
+    const hw_steal_snap_t *sn = &hw_steal_snap[kk & (HW_STEAL_SNAPS - 1)];
+    dst[3] &= ~2u;                 /* never the slave's frame-latch flag */
+    dst[9]  = sn->summary;
+    dst[10] = sn->count_any;       /* master path: words in solid_any are complete */
+    for (int w = 0; w < HW_SOLID_WORDS; w++)
+        dst[11 + w] = sn->solid[w];
+    HW_Master_ProcessJob(ipc, &job);
+    hw_steal_to_m = 0;
+}
+
+/* After the walk: take jobs from the back until we meet the slave. Each
+ * side publishes its claim before reading the other's, so at most one of
+ * them takes a job; a job both gave up is run in HW_StealFinish. */
+/* stats, cumulative: why the steal loop stopped [first job, no snapshot,
+ * slave already done, master queue full, claim conflict], and jobs left
+ * to the slave when the master arrived (sum) / frames */
+volatile unsigned int saturn_hw_steal_why[8];
+volatile unsigned int saturn_hw_steal_refused, saturn_hw_steal_refused_mq;
+static HW_NOINLINE void HW_StealFlatJobs(volatile hw_slave_ipc_t *ipc)
+{
+    unsigned int tail = hw_master_job_tail;
+    unsigned int k = tail;
+    saturn_hw_steal_why[5] += tail - ipc->job_head;
+    saturn_hw_steal_why[6]++;
+    for (;;)
+    {
+        unsigned int kk = k - 1;
+        if ((int)(kk - hw_steal_first) <= 0)          /* never the frame's first job */
+        { saturn_hw_steal_why[0]++; break; }
+        if ((int)(tail - kk) > HW_STEAL_SNAPS)        /* no snapshot that far back */
+        { saturn_hw_steal_why[1]++; break; }
+        if ((int)(kk - ipc->job_head) < 0)            /* the slave already did it */
+        { saturn_hw_steal_why[2]++; break; }
+        uint32_t w2 = ((const volatile aliased_uint32_t *)&ipc->jobs[kk & (HW_JOB_RING - 1)])[2];
+        if (HW_StealPick(ipc, kk) < 0)
+        {
+            saturn_hw_steal_why[3]++;
+            /* the refused job: q_count | (chunk != 0) << 16 | one-chunk << 17 | lod1 << 18 */
+            uint32_t w3r = ((const volatile aliased_uint32_t *)&ipc->jobs[kk & (HW_JOB_RING - 1)])[3];
+            saturn_hw_steal_refused = (w2 & 0xFFFFu) | ((HW_JOB_CHUNK_OF(w3r) != 0) << 16) |
+                                      (((w3r & HW_JOB_ONE_CHUNK) != 0) << 17) |
+                                      ((((w3r >> 8) & HW_FLAT_USE_LOD1) != 0) << 18);
+            saturn_hw_steal_refused_mq = (unsigned int)saturn_master_flat_q;
+            break;
+        }
+        ipc->m_limit16 = (uint16_t)kk;
+        if ((int16_t)(ipc->s_claim16 - (uint16_t)kk) >= 0)
+        {
+            ipc->m_limit16 = (uint16_t)k;             /* slave has it: give it back */
+            saturn_hw_steal_why[4]++;
+            break;
+        }
+        saturn_hw_steal_why[7]++;
+        HW_StealRun(ipc, kk);
+        saturn_hw_steal_jobs++;
+        k = kk;
+    }
+    hw_steal_k = k;
+}
+
+/* After the slave has drained (job_head == tail): run any job both sides
+ * gave up ([s_stop16, hw_steal_k), at most a job or two). */
+static HW_NOINLINE void HW_StealFinish(volatile hw_slave_ipc_t *ipc)
+{
+    unsigned int k = hw_steal_k;
+    uint16_t st = ipc->s_stop16;
+    int16_t back = (int16_t)(st - (uint16_t)k);
+    if (back < 0 && back > -(int)HW_STEAL_SNAPS)
+    {
+        for (unsigned int j = k + (unsigned int)(int)back; j != k; j++)
+        {
+            HW_StealRun(ipc, j);
+            saturn_hw_steal_jobs++;
+        }
+    }
+}
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int subnum, sector_t *sec, int fully_inside)
 {
@@ -2770,7 +4057,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     int use_lod1   = (fully_inside >> 4) & 1;
     int emit_ceil  = (vz < sec->ceilingheight && ((int16_t)sec->ceilingpic != -1));
     int emit_floor = (vz > sec->floorheight && ((int16_t)sec->floorpic != -1));
-    if (saturn_vdp2_plane_active && sec == &sectors[saturn_vdp2_plane_sec]) emit_floor = 0;
+    if (SATURN_V2P_SKIP_FLOOR(sec)) emit_floor = 0;
     emit_floor &= (fully_inside >> 2) & 1;
     emit_ceil  &= allow_sky;
     fully_inside &= 19;
@@ -2781,6 +4068,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     int floor_srca = 0, ceil_srca = 0;
     if (emit_floor) { floor_srca = HW_FastFlatSrca(sec->floorpic); if (!floor_srca) emit_floor = 0; }
     if (emit_ceil)  { ceil_srca = HW_FastFlatSrca(sec->ceilingpic); if (!ceil_srca) emit_ceil = 0; }
+#ifdef SATURN_WIN32
+    {
+        extern int hw_dbg_trace;   /* harness -sweep SWEEP_DUMP */
+        if (hw_dbg_trace)
+            printf("[FLATDBG] ss %d sec %d fpic %d cpic %d floor_srca %d ceil_srca %d emit f%d c%d q %d\n",
+                   subnum, (int)(sec - sectors), sec->floorpic, sec->ceilingpic,
+                   floor_srca, ceil_srca, emit_floor, emit_ceil, q_count);
+    }
+#endif
     if (!emit_ceil && !emit_floor) return;
 
     int v_first, q_first;
@@ -2834,6 +4130,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     }
     job.align_pad[1] = ((emit_floor ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->floorpic) : 0u) << 8)
                      | (emit_ceil ? (uint32_t)Saturn_Vdp1_FlatAvgColor(sec->ceilingpic) : 0u);
+    job.align_pad[1] |= HW_WarpJobBits(subnum, use_lod1 && l_qcount > 0 && l_vcount > 0,
+                                       sec, emit_floor, emit_ceil);
 
     volatile hw_slave_ipc_t *ipc = (volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED;
     HW_Master_ProcessJob(ipc, &job);

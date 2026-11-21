@@ -15,6 +15,7 @@
 /* Stage 3a sprite sources (saturn_tex.c): the composited 8bpp pixels
  * (texel 0 = structural transparency) and the patch geometry. */
 extern byte *Saturn_SpriteData(int s);
+extern int   Saturn_SpriteTrimmed(int s);
 extern byte *Saturn_SpritePatch(int s, int *w, int *h, int *lofs,
                                 int *tofs);
 
@@ -202,6 +203,10 @@ v1_tag_t *saturn_v1_wall_tags = NULL;
 
 static v1_tag_t *v1_tag[2];     /* per page; NULL = not allocated yet */
 static int       v1_tag_n, v1_tag_flat0, v1_tag_spr0;
+/* [v1_tag_warp0 .. +V1_WARP_SLOTS): per-piece warped flat textures
+ * (Saturn_Vdp1_GetWarpSrca), direct-mapped by baked quad index. */
+#define V1_WARP_SLOTS SATURN_WARP_SLOTS
+static int       v1_tag_warp0;
 static void      v1_tags_try_alloc(void);
 void             Saturn_Vdp1_ClearTexCacheMRU(void);
 
@@ -249,8 +254,16 @@ static int             v1_page_flush[2] = { 1, 1 };
 #ifndef V1_EVICT_TARGET
 #define V1_EVICT_TARGET   (128u * 1024u)  /* free space to reach when evicting */
 #endif
-#define V1_OPT_RESERVE    (32u * 1024u)   /* headroom kept when adding optional wall copies */
+/* headroom kept when adding optional wall copies. 2026-11-21: was 32 KB,
+ * BELOW the 64 KB low-water mark - the same mistake as the flat-variant,
+ * warp and late-copy reserves (each fixed to LOWWATER + x): copies could
+ * eat the space down to 32 KB, so the next required upload was refused and
+ * a low-water eviction ran. */
+#define V1_OPT_RESERVE    (V1_EVICT_LOWWATER + 8u * 1024u)
 #define V1_LOG_MAX        1024
+#if defined(__GNUC__) && !defined(__cplusplus)
+_Static_assert(V1_LOG_MAX * 2 <= SATURN_WRAM_L_EVICT_SIZE, "v1_evict candidate list must fit SATURN_WRAM_L_EVICT");
+#endif
 typedef struct {
     unsigned short off32;   /* VRAM byte offset / 32 */
     unsigned short len32;   /* rounded length / 32 */
@@ -630,6 +643,7 @@ static void v1_patch_slot3_ex(int from_vblank)
  * still sometimes stayed over the pause menu. Set by Saturn_Vdp1_Enter2D,
  * cleared by the next 3D commit. */
 static volatile int v1_hide_sprites = 0;
+static volatile int v1_hide_pending = 0;   /* Enter2D ran; hide at the 2D page flip */
 
 static void v1_write_priority_regs(void)
 {
@@ -662,6 +676,18 @@ static void v1_write_priority_regs(void)
 }
 
 extern void Saturn_VDP2_Plane_VBlank(void);
+extern volatile int saturn_v2p_last, saturn_v2p_pending, saturn_v2p_drawing, saturn_v2p_shown;
+#if defined(HW_VDP2_PLANE_TEST) && HW_VDP2_PLANE_TEST
+extern volatile uint32_t saturn_v2p_list_ang[3], saturn_v2p_frame_ang;
+#define V2P_LIST_COMMIT()  (saturn_v2p_list_ang[0] = saturn_v2p_frame_ang)
+#define V2P_LIST_CHANGE(d) do { if (d) saturn_v2p_list_ang[2] = saturn_v2p_list_ang[1]; \
+                                saturn_v2p_list_ang[1] = saturn_v2p_list_ang[0]; } while (0)
+#define V2P_LIST_REDRAW()  (saturn_v2p_list_ang[0] = saturn_v2p_list_ang[1])
+#else
+#define V2P_LIST_COMMIT()  ((void)0)
+#define V2P_LIST_CHANGE(d) ((void)0)
+#define V2P_LIST_REDRAW()  ((void)0)
+#endif
 
 /* MANUAL FRAME-CHANGE MODE (SATURN_V1_MANUAL, 2026-11-15).
  *
@@ -720,6 +746,13 @@ static void v1m_request_change(void)
     V1_FBCR = 0x0003u;              /* FCM=1 FCT=1: change at the next field */
     v1m_draw_table = v1m_pending_table;   /* the callback re-points slot 3 next */
     v1m_pending = 0;
+    /* At this change the list drawn last goes on screen and the pending one
+     * starts drawing: the VDP2 ground plane follows (saturn_vdp2_plane.c). */
+    V2P_LIST_CHANGE(v1m_drawing);
+    if (v1m_drawing)
+        saturn_v2p_shown = saturn_v2p_drawing;
+    saturn_v2p_drawing = saturn_v2p_pending;
+    saturn_v2p_pending = -1;
     v1m_drawing = 1;
     v1m_trig_seq = v1m_seq;
 }
@@ -756,6 +789,8 @@ static void v1m_vblank(void)
         {
             v1m_pending_table = v1m_draw_table;   /* redraw the last list */
             v1m_pending = 1;
+            saturn_v2p_pending = saturn_v2p_drawing;
+            V2P_LIST_REDRAW();
         }
     }
     if (v1m_pending && !v1m_writing && v1m_draw_done())
@@ -790,6 +825,8 @@ static unsigned int v1m_begin_write(void)
 static void v1m_end_write(void)
 {
     v1m_pending_table = saturn_v1_write_table;
+    saturn_v2p_pending = saturn_v2p_last;   /* this list's VDP2 plane slot */
+    V2P_LIST_COMMIT();
     v1m_pending = 1;
     v1m_writing = 0;
 }
@@ -1003,7 +1040,7 @@ static void v1_tags_try_alloc(void)
 
     if (v1_tag[0] != NULL || numtextures <= 0 || numflats <= 0 || numsprites <= 0)
         return;
-    n     = (int)numtextures + (int)numflats + (int)numsprites;
+    n     = (int)numtextures + (int)numflats + (int)numsprites + V1_WARP_SLOTS;
     bytes = n * (int)sizeof(v1_tag_t);
 
     /* Allocate in fast 32-bit WRAM-H via Jo heap; fallback to WRAM-L scratch (14,232B < 16KB) */
@@ -1015,6 +1052,7 @@ static void v1_tags_try_alloc(void)
     v1_tag_n     = n;
     v1_tag_flat0 = (int)numtextures;
     v1_tag_spr0  = (int)numtextures + (int)numflats;
+    v1_tag_warp0 = v1_tag_spr0 + (int)numsprites;
     saturn_v1_flat_tags = &v1_tag[0][v1_tag_flat0];
     saturn_v1_wall_tags = &v1_tag[0][0];
     D_memset(v1_tag[0], 0, bytes);
@@ -1153,7 +1191,13 @@ static void v1_entry_drop(const v1_alloc_t *e)
 {
     v1_tag_t *t = e->tag;
     int flat = v1_tag_is_flat(t);
-    if (v1_field_in(t->srca, e))      t->srca = 0;
+    if (v1_field_in(t->srca, e))
+    {
+        int ws = v1_tag[0] ? (int)(t - (v1_tag[0] + v1_tag_warp0)) : -1;
+        if (ws >= 0 && ws < V1_WARP_SLOTS)
+            saturn_warp_tab[ws].srca = 0;           /* slave stops using it */
+        t->srca = 0;
+    }
     /* A wall's optional downsampled copy dropped while its main texture
      * stays resident must fall back to the alias (== srca), NOT 0: the wall
      * emitters test `srca_mono != srca` and would otherwise draw from
@@ -1170,6 +1214,19 @@ static unsigned int v1_cmd_field(unsigned int base, int idx)
 {
     uint32_t w = *(volatile uint32_t *)(V1_BASE + base + (unsigned int)((idx >> 1) << 2));
     return (idx & 1) ? (w & 0xFFFFu) : (w >> 16);
+}
+
+/* Warped per-piece textures are not v1_touch'ed on every lookup (that
+ * binary search cost ~1 ms/frame of master time); their last use lives in
+ * v1_warp_used instead. Used in the last two frames = recent. */
+static unsigned int v1_warp_used_of(int slot);
+static int v1_warp_recent(const v1_tag_t *t)
+{
+    int s;
+    if (!v1_tag[0])
+        return 0;
+    s = (int)(t - (v1_tag[0] + v1_tag_warp0));
+    return s >= 0 && s < V1_WARP_SLOTS && v1_warp_used_of(s) >= v1_age_mark_prev;
 }
 
 /* Free space by dropping the oldest log entries the live command list
@@ -1238,6 +1295,48 @@ static int v1_evict(unsigned int target)
         }
     }
 
+    /* 2a. ... and everything the master's command list being built THIS
+     *    frame references (walls, sprites; saturn_cmd_m, not yet in VRAM).
+     *    The wall fast path (HW_LoadWallTexCtx tag hit) touches nothing, so
+     *    a texture or optional copy first used this frame still looked old:
+     *    it could be evicted and overwritten by a later upload in the same
+     *    frame while already-built commands pointed at it (they would draw
+     *    another texture's data). Defensive (2026-11-19): found by reading
+     *    the code during strip-LOD tuning, not yet seen to fire - the
+     *    courtyard case first blamed on it was a harness artefact. Flats
+     *    need no scan: their lookups v1_touch every hit. */
+    {
+        extern vdp1_cmd_t *saturn_cmd_m;
+        extern volatile uint16_t saturn_cmd_m_count;
+        const uint32_t *c32 = (const uint32_t *)saturn_cmd_m;
+        unsigned int cnt = saturn_cmd_m ? saturn_cmd_m_count : 0u;
+        unsigned int k;
+        for (k = 0; k < cnt; k++, c32 += 8)
+        {
+            unsigned int a;
+            int lo, hi;
+            if (((c32[0] >> 16) & 0xFu) > 2u)
+                continue;                       /* untextured / clip / local */
+            a = (c32[2] >> 16) << 3;            /* CMDSRCA -> byte offset */
+            lo = 0; hi = n - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                unsigned int eo = (unsigned int)v1_log[mid].off32 << 5;
+                if (a < eo)
+                    hi = mid - 1;
+                else if (a >= eo + ((unsigned int)v1_log[mid].len32 << 5))
+                    lo = mid + 1;
+                else
+                {
+                    v1_log_prot[mid] = 1;
+                    v1_log[mid].age = v1_age;
+                    break;
+                }
+            }
+        }
+    }
+
     /* 2b. a texture's copies live or die together: protect every entry of
      *    a tag that has one protected entry. A distant wall draws only its
      *    half-width copy (srca_mono); evicting the unreferenced main copy
@@ -1282,58 +1381,141 @@ static int v1_evict(unsigned int target)
 
     /* 3. drop the oldest unprotected entries until enough is free and a
      *    hole fits the largest upload refused since the last eviction */
+    /* Textures uploaded in the last two frames but not (yet) in a command -
+     * e.g. flat variant pyramids the master requests for every nearby
+     * floor, which the slave only sometimes uses - are needed again next
+     * frame. Evicting them for the free-space target alone re-uploaded
+     * ~65 KB every frame at E1M2 (0,160): the uploads ate exactly the space
+     * the eviction freed, a self-sustaining thrash (56 ms/frame). Only a
+     * refused upload (need > 0) may take them (pass 1).
+     *
+     * One pass per class (2026-11-17): candidates are collected once,
+     * sorted oldest first and dropped in that order (marked 3), then the
+     * log is compacted once. The old loop rescanned the whole log (with an
+     * uncached warp-slot read per entry) and shifted it down for every
+     * victim - ~8 ms per eviction with ~700 entries (E1M1 courtyard walk). */
     {
+        unsigned short *cand = (unsigned short *)SATURN_WRAM_L_EVICT_ADDR;   /* V1_LOG_MAX entries */
         const unsigned int need = (v1_want_bytes + 31u) & ~31u;
-        for (;;)
+        int pass, k, nc, gap;
+        for (pass = 0; pass < 2; pass++)
         {
-            int pos, victim = -1;
-            unsigned int best = 0xFFFFFFFFu;
-            if (v1_free_total() >= target && (need == 0 || v1_find_gap(need, &pos)))
+            if (pass == 1 && need == 0)
                 break;
-            /* Textures uploaded in the last two frames but not (yet) in a
-             * command - e.g. flat variant pyramids the master requests for
-             * every nearby floor, which the slave only sometimes uses - are
-             * needed again next frame. Evicting them for the free-space
-             * target alone re-uploaded ~65 KB every frame at E1M2 (0,160):
-             * the uploads ate exactly the space the eviction freed, a
-             * self-sustaining thrash (56 ms/frame). Only a refused upload
-             * (need > 0) may take them. */
+            nc = 0;
             for (i = 0; i < n; i++)
             {
-                if (!v1_log_prot[i] && v1_log[i].age < v1_age_mark_prev && v1_log[i].age < best)
+                if (v1_log_prot[i])
+                    continue;
+                if (pass == 0 && (v1_log[i].age >= v1_age_mark_prev || v1_warp_recent(v1_log[i].tag)))
+                    continue;
+                cand[nc++] = (unsigned short)i;
+            }
+            /* shell sort by age, ties by index (= the old first-found order) */
+            for (gap = nc >> 1; gap > 0; gap >>= 1)
+            {
+                for (k = gap; k < nc; k++)
                 {
-                    best = v1_log[i].age;
-                    victim = i;
+                    unsigned short c = cand[k];
+                    unsigned int   ca = v1_log[c].age;
+                    int j = k;
+                    while (j >= gap && (v1_log[cand[j - gap]].age > ca ||
+                                        (v1_log[cand[j - gap]].age == ca && cand[j - gap] > c)))
+                    {
+                        cand[j] = cand[j - gap];
+                        j -= gap;
+                    }
+                    cand[j] = c;
                 }
             }
-            if (victim < 0 && need != 0)
+            for (k = 0; k < nc; k++)
             {
-                for (i = 0; i < n; i++)
+                int v = cand[k];
+                if (v1_free_total() >= target)
                 {
-                    if (!v1_log_prot[i] && v1_log[i].age < best)
+                    if (need == 0)
+                        break;
+                    /* first-fit hole for the refused upload, skipping
+                     * entries already dropped (marked 3) */
                     {
-                        best = v1_log[i].age;
-                        victim = i;
+                        unsigned int prev_end = v1_page_base[0];
+                        int fits = 0;
+                        for (i = 0; i < n && !fits; i++)
+                        {
+                            unsigned int eo, ee;
+                            if (v1_log_prot[i] == 3)
+                                continue;
+                            eo = (unsigned int)v1_log[i].off32 << 5;
+                            ee = eo + ((unsigned int)v1_log[i].len32 << 5);
+                            if (eo >= prev_end && eo - prev_end >= need)
+                                fits = 1;
+                            if (ee > prev_end)
+                                prev_end = ee;
+                        }
+                        if (fits || prev_end + need <= V1_PAGE0_END)
+                            break;
                     }
                 }
+                v1_entry_drop(&v1_log[v]);
+                saturn_v1_evicted_bytes += (unsigned int)v1_log[v].len32 << 5;
+                v1_used_bytes -= (unsigned int)v1_log[v].len32 << 5;
+                v1_log_prot[v] = 3;
             }
-            if (victim < 0)
-                break;
-            v1_entry_drop(&v1_log[victim]);
-            saturn_v1_evicted_bytes += (unsigned int)v1_log[victim].len32 << 5;
-            v1_used_bytes -= (unsigned int)v1_log[victim].len32 << 5;
-            for (i = victim; i + 1 < n; i++)
-            {
-                v1_log[i] = v1_log[i + 1];
-                v1_log_prot[i] = v1_log_prot[i + 1];
-            }
-            n--;
-            v1_log_n = n;
+            if (k < nc)
+                break;          /* target reached inside this pass */
         }
+        /* compact: drop the marked entries, keep offset order */
+        k = 0;
+        for (i = 0; i < n; i++)
+        {
+            if (v1_log_prot[i] == 3)
+                continue;
+            v1_log[k] = v1_log[i];
+            v1_log_prot[k] = v1_log_prot[i];
+            k++;
+        }
+        n = k;
+        v1_log_n = n;
     }
-    v1_want_bytes = 0;
-    Saturn_Vdp1_ClearTexCacheMRU();
-    saturn_v1_evictions++;
+    /* 2026-11-21: enough total free space is not enough when the live
+     * list's protected entries fragment the arena so that the refused
+     * upload still has no hole: then the same upload was refused (and the
+     * wall missing) every frame, forever (hardware E3M6: steady HUD X4,
+     * half the walls gone). Two evictions in a row that leave the refused
+     * size without a hole report failure -> the caller full-flushes. */
+    /* Exponential cooldown (2026-11-21 hardware, retail E3M6 2.4 FPS with
+     * HUD Y3 X5): when the textures in view simply do not fit, a flush
+     * cannot help and flushing every frame re-uploaded everything each
+     * frame (~380 ms). After a no-hole flush the next one waits 1 s, then
+     * 2, 4 ... 32 s; 10 s without a no-hole eviction resets it. In between,
+     * a refused texture is just skipped for that frame, as before. */
+    {
+        extern volatile unsigned int saturn_vbl_count;
+        static int nohole_streak = 0;
+        static unsigned int nohole_until = 0, nohole_wait = 60u, nohole_last = 0;
+        const unsigned int now = saturn_vbl_count;
+        const unsigned int need_b = (v1_want_bytes + 31u) & ~31u;
+        int pos_unused;
+        v1_want_bytes = 0;
+        Saturn_Vdp1_ClearTexCacheMRU();
+        saturn_v1_evictions++;
+        if (need_b > 0 && v1_find_gap(need_b, &pos_unused) == 0)
+        {
+            if (now - nohole_last > 600u)
+                nohole_wait = 60u;          /* calm for 10 s: back to 1 s */
+            nohole_last = now;
+            if (++nohole_streak >= 2 && (int)(now - nohole_until) >= 0)
+            {
+                nohole_streak = 0;
+                nohole_until = now + nohole_wait;
+                if (nohole_wait < 1920u)
+                    nohole_wait <<= 1;
+                return 0;
+            }
+        }
+        else
+            nohole_streak = 0;
+    }
     return v1_free_total() >= (16u * 1024u);
 }
 
@@ -1464,6 +1646,18 @@ static void v1_copy_32_blocks(unsigned int off, const byte *src, int w, int h)
  * to v1_evict even when no command references it yet. */
 static void v1_touch(unsigned int srca)
 {
+    /* A touch only sets the entry's age to v1_age, which advances on every
+     * upload and every frame: touching the same SRCA again at the same age
+     * changes nothing, so a tiny memo skips the binary search (2026-11-21:
+     * ~52 touches per frame at the E1M1 courtyard, mostly repeats of a few
+     * flats; 0.37 ms). */
+    static uint16_t memo_srca[16];
+    static unsigned int memo_age[16];
+    unsigned int k = (srca ^ (srca >> 4)) & 15u;
+    if (memo_srca[k] == (uint16_t)srca && memo_age[k] == v1_age)
+        return;
+    memo_srca[k] = (uint16_t)srca;
+    memo_age[k] = v1_age;
     unsigned int a = srca << 3;
     int lo = 0, hi = v1_log_n - 1;
     while (lo <= hi)
@@ -1480,6 +1674,133 @@ static void v1_touch(unsigned int srca)
             return;
         }
     }
+}
+
+/* Quarter-width blocks: block q covers texels [128q, 128q + 128) mod w,
+ * every 4th column (the half copy takes every 2nd), 32 px wide. */
+#define V1_WALL_QUARTER_BLOCKS(w) (((w) + 127) >> 7)
+static void v1_copy_q_blocks(unsigned int off, const byte *src, int w, int h)
+{
+    int num_blocks = V1_WALL_QUARTER_BLOCKS(w);
+    int b, y, x;
+    for (b = 0; b < num_blocks; b++)
+    {
+        unsigned int block_off = off + (unsigned int)(b * (32 * h));
+        int col[32];
+        for (x = 0; x < 32; x++)
+            col[x] = (b * 128 + x * 4) % w;
+#ifdef SATURN_WIN32
+        uint8_t *dst = (uint8_t *)(V1_BASE + block_off);
+        for (y = 0; y < h; y++)
+        {
+            const byte *sr = src + y * w;
+            uint8_t *dr = dst + y * 32;
+            for (x = 0; x < 32; x++)
+                dr[x] = sr[col[x]];
+        }
+#else
+        volatile unsigned short *dst = (volatile unsigned short *)(V1_BASE + block_off);
+        for (y = 0; y < h; y++)
+        {
+            const byte *sr = src + y * w;
+            for (x = 0; x < 32; x += 2)
+                *dst++ = (unsigned short)(((unsigned)sr[col[x]] << 8) | (unsigned)sr[col[x + 1]]);
+        }
+#endif
+    }
+}
+
+/* A strip-major wall's optional copies (half-width 32-blocks for distant
+ * walls, or a row-major copy plus a 64-wide doubled copy for 32-wide
+ * textures), made only while `reserve` bytes stay free. Walls point
+ * srca_mono / srca_64 at srca when they have none. */
+static void v1_wall_opt_copies(v1_tag_t *tag, const byte *src, int tw, int th, unsigned int reserve)
+{
+    /* Optional: a failed allocation (fragmented arena) must not request an
+     * eviction the way a required upload does (v1_arena_alloc): that one
+     * may drop textures in use, which were re-uploaded next frame - a
+     * thrash with late copies (hardware 2026-11-16, E9/396). */
+#define v1_arena_alloc(b, t) v1_alloc_fit((unsigned int)(b), (t), 0u)
+    if (tw >= 64 && (tw & 63) == 0)
+    {
+        /* half copy (tw/64 blocks of 64 texels -> 32 px) followed in the
+         * same allocation by the quarter copy (V1_WALL_QUARTER_BLOCKS
+         * blocks of 128 texels -> 32 px, wrapping mod tw), so the emitter
+         * finds quarter block q at srca_mono + (tw/64 + q) * th * 4 */
+        int bytes_32 = (tw >> 1) * th;
+        int bytes_q  = V1_WALL_QUARTER_BLOCKS(tw) * 32 * th;
+        if (v1_free_total() >= (unsigned int)(bytes_32 + bytes_q) + reserve)
+        {
+            unsigned int off_32 = v1_arena_alloc(bytes_32 + bytes_q, tag);
+            if (off_32 != 0)
+            {
+                v1_copy_32_blocks(off_32, src, tw, th);
+                v1_copy_q_blocks(off_32 + (unsigned int)bytes_32, src, tw, th);
+                tag->srca_mono = (unsigned short)(off_32 / 8u);
+            }
+        }
+    }
+    else if (v1_free_total() >= (unsigned int)(tw * th) + reserve)
+    {
+        unsigned int off_mono = v1_arena_alloc(tw * th, tag);
+        if (off_mono != 0)
+        {
+            v1_copy_block(off_mono, src, tw * th);
+            tag->srca_mono = (unsigned short)(off_mono / 8u);
+            if (tw == 32 && th <= 16 &&
+                v1_free_total() >= (unsigned int)(64 * th) + reserve)
+            {
+                unsigned int off_64 = v1_arena_alloc(64 * th, tag);
+                if (off_64 != 0)
+                {
+                    int y;
+                    for (y = 0; y < th; y++)
+                    {
+                        v1_copy_block(off_64 + (unsigned int)(y * 64), src + y * 32, 32);
+                        v1_copy_block(off_64 + (unsigned int)(y * 64 + 32), src + y * 32, 32);
+                    }
+                    tag->srca_64 = (unsigned short)(off_64 / 8u);
+                }
+            }
+        }
+    }
+#undef v1_arena_alloc
+}
+
+/* Late optional copies: a wall uploaded while VRAM was tight never got its
+ * copies, and drew as many more strips for as long as it stayed resident
+ * (E1M1 Zigzag: 166 -> 228 wall quads when the first frame there found
+ * the arena full; the eviction a frame later freed 77 KB). The wall
+ * emitter's tag hit (saturn_hw_walls.c HW_LoadWallTexCtx) retries one wall
+ * per frame while saturn_v1_late_copy_armed (set per frame with headroom). */
+#ifndef V1_LATE_COPY_RESERVE
+#define V1_LATE_COPY_RESERVE (V1_EVICT_LOWWATER + 16u * 1024u)   /* see V1_WARP_RESERVE */
+#endif
+int saturn_v1_late_copy_armed = 0;
+unsigned int saturn_v1_late_copies = 0;
+
+void Saturn_Vdp1_WallLateCopy(int texnum)
+{
+    extern int saturn_wall_subdivision;
+    stexinfo_t ti;
+    v1_tag_t  *tag;
+    int        t;
+    if (!v1_tag[0] || !saturn_wall_subdivision || texnum <= 0 || texnum >= (int)numtextures)
+        return;
+    t = texturetranslation ? (int)texturetranslation[texnum] : texnum;
+    if (t < 0 || t >= (int)numtextures)
+        return;
+    tag = &v1_tag[0][t];
+    /* narrow walls (<= 16 wide) never get copies: no attempt used up */
+    if (!tag->srca || tag->srca == V1_TAG_BAD || tag->srca_mono != tag->srca || tag->w8 <= 2)
+        return;
+    saturn_v1_late_copy_armed = 0;          /* one attempt per frame */
+    if (!Saturn_TexInfo(texnum, &ti) || !ti.data || ti.w != ((int)tag->w8 << 3) ||
+        ti.h != (int)tag->h)
+        return;
+    v1_wall_opt_copies(tag, ti.data, ti.w, ti.h, V1_LATE_COPY_RESERVE);
+    if (tag->srca_mono != tag->srca)
+        saturn_v1_late_copies++;
 }
 
 static int v1_tex_get(int texnum, int *w, int *h)
@@ -1561,43 +1882,7 @@ static int v1_tex_get(int texnum, int *w, int *h)
         tag->srca = (unsigned short)(off_strip / 8u);
         tag->srca_mono = tag->srca;
         tag->srca_64   = tag->srca;
-        if (tw >= 64 && (tw & 63) == 0)
-        {
-            int bytes_32 = (tw >> 1) * th;
-            if (v1_free_total() >= (unsigned int)bytes_32 + V1_OPT_RESERVE)
-            {
-                unsigned int off_32 = v1_arena_alloc(bytes_32, tag);
-                if (off_32 != 0)
-                {
-                    v1_copy_32_blocks(off_32, src, tw, th);
-                    tag->srca_mono = (unsigned short)(off_32 / 8u);
-                }
-            }
-        }
-        else if (v1_free_total() >= (unsigned int)(tw * th) + V1_OPT_RESERVE)
-        {
-            unsigned int off_mono = v1_arena_alloc(tw * th, tag);
-            if (off_mono != 0)
-            {
-                v1_copy_block(off_mono, src, tw * th);
-                tag->srca_mono = (unsigned short)(off_mono / 8u);
-                if (tw == 32 && th <= 16 &&
-                    v1_free_total() >= (unsigned int)(64 * th) + V1_OPT_RESERVE)
-                {
-                    unsigned int off_64 = v1_arena_alloc(64 * th, tag);
-                    if (off_64 != 0)
-                    {
-                        int y;
-                        for (y = 0; y < th; y++)
-                        {
-                            v1_copy_block(off_64 + (unsigned int)(y * 64), src + y * 32, 32);
-                            v1_copy_block(off_64 + (unsigned int)(y * 64 + 32), src + y * 32, 32);
-                        }
-                        tag->srca_64 = (unsigned short)(off_64 / 8u);
-                    }
-                }
-            }
-        }
+        v1_wall_opt_copies(tag, src, tw, th, V1_OPT_RESERVE);
     }
     else if (texnum < 0 && tw == 64 && th == 64)
     {
@@ -1755,7 +2040,40 @@ static int v1_spr_get(int scache, int *pw_out, int *h_out)
     if (off == 0)
         return 0;
 
-    if (pw == w)
+    if (Saturn_SpriteTrimmed(scache))
+    {
+        /* row-trimmed MSPR: per row u8 left, u8 len, len pixels; expand
+         * to the same padded pw*h VRAM image as the rectangle path */
+        const byte *src = pix;
+        int y;
+#ifdef SATURN_WIN32
+        uint8_t *dst = (uint8_t *)(V1_BASE + off);
+        for (y = 0; y < h; y++)
+        {
+            int l = src[0], n = src[1], x;
+            src += 2;
+            for (x = 0; x < pw; x++)
+                dst[y * pw + x] = (x >= l && x < l + n) ? src[x - l] : 0;
+            src += n;
+        }
+#else
+        volatile unsigned short *dst = (volatile unsigned short *)(V1_BASE + off);
+        for (y = 0; y < h; y++)
+        {
+            int l = src[0], n = src[1], xw;
+            const byte *sr = src + 2 - l;           /* sr[x] valid for l <= x < l + n */
+            src += 2 + n;
+            for (xw = 0; xw < pw / 2; xw++)
+            {
+                int      xl = xw * 2, xr = xl + 1;
+                unsigned b_l = ((unsigned)(xl - l) < (unsigned)n) ? (unsigned)sr[xl] : 0u;
+                unsigned b_r = ((unsigned)(xr - l) < (unsigned)n) ? (unsigned)sr[xr] : 0u;
+                *dst++ = (unsigned short)((b_l << 8) | b_r);
+            }
+        }
+#endif
+    }
+    else if (pw == w)
     {
         v1_copy_block(off, pix, bytes); /* no pad columns: straight copy */
     }
@@ -1977,6 +2295,9 @@ void Saturn_Vdp1Quad_PspDump(int *k, int *rows, int *xa)
 }
 #endif /* !SATURN_3A_BYPASS */
 
+static int s_mru_flat = -999;       /* Saturn_Vdp1_GetFlatSrca MRU */
+static int s_mru_flat_srca = 0;
+
 void Saturn_Vdp1Wall_Reset(void)
 {
     /* Arena double buffer (2026-10-05). VDP1 keeps re-rasterising the
@@ -2003,6 +2324,8 @@ void Saturn_Vdp1Wall_Reset(void)
         /* tick per frame too, so marks advance even without uploads */
         v1_age_mark_prev = v1_age_mark_cur;
         v1_age_mark_cur  = ++v1_age;
+        if (s_mru_flat_srca == 0)
+            s_mru_flat = -999;      /* retry a refused flat once per frame */
     }
     v1_page_off[0] = v1_arena_off;
     v1_page_off[1] = v1_arena_off;
@@ -2017,15 +2340,32 @@ void Saturn_Vdp1Wall_Reset(void)
      * B-bus reads) every frame for nothing - ~5 ms/frame at E1M2 start.
      * A refused upload (v1_want_evict) still always evicts. */
     static unsigned int evict_idle_alloc = 0xFFFFFFFFu;
+    /* An unproductive low-water eviction (freed < V1_EVICT_MIN_GAIN) also
+     * waits V1_EVICT_BACKOFF frames (2026-11-17): walking through the E1M1
+     * courtyard kept the arena below low water with everything used in the
+     * last two frames, so it re-scanned both command tables in VDP1 VRAM
+     * (~1200 B-bus reads + a search each) almost every frame to free a few
+     * KB - ~2.7 ms/frame of master time while moving. */
+#ifndef V1_EVICT_BACKOFF
+#define V1_EVICT_BACKOFF  8u
+#endif
+#define V1_EVICT_MIN_GAIN (8u * 1024u)
+    static unsigned int evict_backoff = 0;
+    if (v1_frame_boundary && evict_backoff)
+        evict_backoff--;
     if (!v1_do_flush && v1_frame_boundary
         && (v1_want_evict
-            || (v1_free_total() < V1_EVICT_LOWWATER && saturn_v1_alloc_bytes != evict_idle_alloc)))
+            || (v1_free_total() < V1_EVICT_LOWWATER && saturn_v1_alloc_bytes != evict_idle_alloc
+                && !evict_backoff)))
     {
         unsigned int free_before = v1_free_total();
+        int refused = v1_want_evict;
         v1_want_evict = 0;
         if (!v1_evict(V1_EVICT_TARGET))
             v1_do_flush = 1;    /* live list fragments the whole ring */
         evict_idle_alloc = (v1_free_total() == free_before) ? saturn_v1_alloc_bytes : 0xFFFFFFFFu;
+        if (!refused && v1_free_total() < free_before + V1_EVICT_MIN_GAIN)
+            evict_backoff = V1_EVICT_BACKOFF;
     }
     if (v1_do_flush)
     {
@@ -2042,6 +2382,21 @@ void Saturn_Vdp1Wall_Reset(void)
                     __asm__ volatile("nop");
             }
         }
+#if SATURN_V1_MANUAL
+        /* Manual frame change (2026-11-21): the list committed last frame
+         * can still be PENDING (not yet started) while CEF reads 1 from the
+         * previous draw, and it references the textures about to be
+         * dropped. Wait (bounded, ~3 fields) until it has been drawn. */
+        if (saturn_v1_manual && v1m_double)
+        {
+            unsigned guard2 = 35000u;   /* x ~40 cycles = ~50 ms */
+            while ((v1m_pending || !v1m_draw_done()) && --guard2)
+            {
+                for (int w = 0; w < 32; w++)
+                    __asm__ volatile("nop");
+            }
+        }
+#endif
 #endif
         if (v1_tag[0])
         {
@@ -2052,6 +2407,8 @@ void Saturn_Vdp1Wall_Reset(void)
             if (v1_tag_n > v1_tag_spr0)
                 D_memset(&v1_tag[0][v1_tag_spr0], 0,
                          (size_t)(v1_tag_n - v1_tag_spr0) * sizeof(v1_tag_t));
+            /* warp tags were just cleared with the sprites: drop the slots */
+            D_memset(saturn_warp_tab, 0, sizeof(saturn_warp_tab));
             /* The flats' lazily uploaded variants (transposed / LOD1 tile,
              * Saturn_Vdp1_GetFlatSrcaVariant) live in this flushable arena,
              * unlike the preloaded base pyramids: forget them so they are
@@ -2281,19 +2638,22 @@ int Saturn_Vdp1FlatQuad_Add(int x0, int y0,
                                0, 0);
 }
 
-static int s_mru_flat = -999;
-static int s_mru_flat_srca = 0;
 
 int Saturn_Vdp1_GetFlatSrca(int flatnum)
 {
     if (flatnum < 0)
         return 0;
-    if (flatnum == s_mru_flat)
+    /* Keyed on the translated flat (2026-11-21): an animated flat's old
+     * frame used to be returned until some other flat replaced the MRU
+     * entry. A cached refusal (0) is dropped at every frame start
+     * (Saturn_Vdp1Wall_Reset) so the upload is retried next frame. */
+    int f = (flattranslation && flatnum < numflats) ? flattranslation[flatnum] : flatnum;
+    if (f == s_mru_flat)
         return s_mru_flat_srca;
 
     int tw, th;
     s_mru_flat_srca = v1_tex_get(-(flatnum + 1), &tw, &th);
-    s_mru_flat = flatnum;
+    s_mru_flat = f;
     return s_mru_flat_srca;
 }
 
@@ -2337,7 +2697,14 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     src = Saturn_FlatData(flatnum);
     if (!src)
         return 0;
-    off = v1_arena_alloc_soft(5440, 32768u, tag);
+    /* Above low water like the warp textures and late wall copies
+     * (2026-11-17): with a 32 KB reserve these optional variants kept the
+     * arena below V1_EVICT_LOWWATER, so eviction ran every few frames and
+     * refused wall uploads while walking through the E1M1 courtyard. */
+#ifndef V1_FLAT_VAR_RESERVE
+#define V1_FLAT_VAR_RESERVE (V1_EVICT_LOWWATER + 8u * 1024u)
+#endif
+    off = v1_arena_alloc_soft(5440, V1_FLAT_VAR_RESERVE, tag);
     if (off == 0)
         return 0;
     {
@@ -2385,6 +2752,188 @@ int Saturn_Vdp1_GetFlatSrcaVariant(int flatnum, int variant)
     return (int)*field;
 }
 
+/* Per-piece warped flat textures (baked QUV_WARP quads, saturn_hw_flats.c
+ * HW_PrepareWarp). VDP1 maps a texture rectangle bilinearly onto a quad's
+ * corners and can only pick texture rows, so a floor piece cut by a diagonal
+ * (or trimmed on both axes) squashed the whole flat into itself (E1M2 start
+ * ceiling lights, hardware 2026-11-16). Each such piece gets a w x h texture
+ * resampled from the flat through that same bilinear map, so the drawn quad
+ * shows world-aligned texels:
+ *   texel (s, r) = flat at P(u, a), u = (s + .5) / w, a = (r + .5) / h,
+ *   P(u, a) = lerp(lerp(P3, P2, u), lerp(P0, P1, u), a)
+ * (row 0 on the p3-p2 edge, column 0 on the p0-p3 edge: the flat emitters'
+ * convention), stored as 16-wide column strips (saturn_hw_flats.c
+ * HW_EmitWarpStrips). wx/wy = corners in 1/16 map units. Master only; cached in a
+ * direct-mapped slot per (quad, floor/ceiling); generation is budgeted per
+ * frame, a miss over budget returns 0 (caller keeps the row mapping). */
+#ifndef V1_WARP_BUDGET
+#define V1_WARP_BUDGET   6144       /* texels generated per frame */
+#endif
+#ifndef V1_WARP_RESERVE
+/* Optional textures must never take the arena below the low-water mark:
+ * every upload below it re-ran v1_evict towards V1_EVICT_TARGET, which
+ * evicted and re-uploaded textures each frame (hardware 2026-11-16, E1M2
+ * start: 4.4 FPS, HUD E9/344). */
+#define V1_WARP_RESERVE  (V1_EVICT_LOWWATER + 8u * 1024u)
+#endif
+/* Slot table, read by the slave flat worker through the uncached alias
+ * (saturn_hw_flats.c HW_WarpFind) and written only by the master: srca is
+ * cleared first on a re-key / drop and set last after a generation. The
+ * slave stamps `used` with saturn_warp_frame when it draws the texture. */
+saturn_warp_slot_t  saturn_warp_tab[V1_WARP_SLOTS];
+volatile uint16_t   saturn_warp_frame = 1;
+volatile uint8_t    saturn_warp_room = 0;
+int                 v1_warp_budget = 0;
+unsigned int        saturn_v1_warp_gens = 0, saturn_v1_warp_miss = 0;
+unsigned int        saturn_v1_warp_miss_c = 0, saturn_v1_warp_miss_b = 0, saturn_v1_warp_miss_a = 0;
+
+static uint16_t v1_warp_used16(int slot)
+{
+#ifndef SATURN_WIN32
+    const volatile saturn_warp_slot_t *e = (const volatile saturn_warp_slot_t *)
+        ((uintptr_t)&saturn_warp_tab[slot] | SATURN_WRAM_H_UNCACHED);
+    return e->used;
+#else
+    return saturn_warp_tab[slot].used;
+#endif
+}
+static unsigned int v1_warp_used_of(int slot)
+{
+    /* recent = drawn or made in the last two frames */
+    return (uint16_t)(saturn_warp_frame - v1_warp_used16(slot)) <= 2u ? v1_age_mark_prev : 0u;
+}
+
+/* Room for a warp texture of `bytes` without going under V1_WARP_RESERVE
+ * (HW_WarpService skips the corner work when there isn't). */
+int Saturn_Vdp1_WarpRoom(int bytes)
+{
+    return v1_tag[0] && v1_free_total() >= (unsigned int)bytes + V1_WARP_RESERVE &&
+           (v1_warp_budget >= bytes || v1_warp_budget >= V1_WARP_BUDGET);
+}
+
+/* Called once per rendered 3D frame (saturn_hw_render.c frame setup),
+ * before any flat job of the frame. */
+void Saturn_Vdp1_WarpNewFrame(void)
+{
+    v1_warp_budget = V1_WARP_BUDGET;
+    saturn_warp_frame++;
+    /* textures can be made this frame: the flat workers may draw the
+     * one-frame placeholder for a missing one (else the row mapping) */
+    saturn_warp_room = (uint8_t)(v1_tag[0] && v1_free_total() >= 2048u + V1_WARP_RESERVE);
+    saturn_v1_late_copy_armed = v1_tag[0] && v1_free_total() >= V1_LATE_COPY_RESERVE + 8u * 1024u;
+}
+
+int Saturn_Vdp1_GetWarpSrca(int quad, int is_ceil, int flatnum, int lv,
+                            const int32_t *wx, const int32_t *wy, int w, int h)
+{
+    static unsigned int rowbuf[16];        /* 64 bytes, 4-aligned */
+    const uint32_t k1  = ((uint32_t)quad << 1) | (uint32_t)(is_ceil & 1);
+    const uint32_t key = k1 + 1u;
+    int slot, way;
+    saturn_warp_slot_t *e;
+    v1_tag_t   *tag;
+    const byte *src;
+    unsigned int off;
+    int f, r, recent;
+
+    /* w = 8, or a multiple of 16 (stored as 16-wide column strips) */
+    if (flatnum < 0 || flatnum >= (int)numflats || w < 8 || w > 64 || (w != 8 && (w & 15)) || h < 1 || h > 64)
+        return 0;
+    if (v1_tag[0] == NULL)
+        return 0;
+    f = flatnum;                            /* callers pass the translated flat */
+    /* the piece's own slot if it has one, else an empty way, else the way
+     * not drawn recently (a recent texture may still be in a command table
+     * VDP1 is drawing) */
+    {
+        const int s0 = saturn_warp_slot(k1, 0), s1 = saturn_warp_slot(k1, 1);
+        const int r0 = (uint16_t)(saturn_warp_frame - v1_warp_used16(s0)) <= 2u;
+        const int r1 = (uint16_t)(saturn_warp_frame - v1_warp_used16(s1)) <= 2u;
+        if (saturn_warp_tab[s0].key == key)      way = 0;
+        else if (saturn_warp_tab[s1].key == key) way = 1;
+        else if (!v1_tag[0][v1_tag_warp0 + s0].srca) way = 0;
+        else if (!v1_tag[0][v1_tag_warp0 + s1].srca) way = 1;
+        else if (!r0) way = 0;
+        else if (!r1) way = 1;
+        else
+        {
+            saturn_v1_warp_miss++; saturn_v1_warp_miss_c++;
+            return 0;
+        }
+        slot = way ? s1 : s0;
+    }
+    e = &saturn_warp_tab[slot];
+    tag = &v1_tag[0][v1_tag_warp0 + slot];
+    recent = (uint16_t)(saturn_warp_frame - v1_warp_used16(slot)) <= 2u;
+
+    if (tag->srca && tag->srca != V1_TAG_BAD && e->key == key &&
+        e->lv == (uint8_t)lv && e->flat == (uint16_t)f && e->wh == (uint16_t)((w << 8) | h))
+        return (int)tag->srca;                          /* already resident */
+    if (tag->srca && tag->srca != V1_TAG_BAD && e->key == key &&
+        (uint16_t)(saturn_warp_frame - e->made) <= 3u)
+        return (int)tag->srca;  /* re-made under 4 frames ago: keep it (only one
+                                 * previous copy stays protected, srca_mono) */
+    /* An untouched budget always allows one texture, even one bigger than
+     * the budget (2026-11-18: with a budget below the largest piece, e.g.
+     * 2048 < 64x64, near pieces were never refined and stayed coarse). */
+    if (v1_warp_budget < w * h && v1_warp_budget < V1_WARP_BUDGET)
+    {
+        saturn_v1_warp_miss++; saturn_v1_warp_miss_b++;
+        return 0;
+    }
+    src = Saturn_FlatDataExact(flatnum);
+    if (!src)
+        return 0;
+    /* Re-key the slot. The same piece's previous texture (other level or
+     * animation frame) may still be in a command table VDP1 draws: keep it
+     * referenced through srca_mono until the next re-key, so v1_evict
+     * doesn't count it stale yet. Anything older becomes stale. */
+    e->srca = 0;
+    tag->srca_mono = (e->key == key && recent) ? tag->srca : 0;
+    tag->srca = 0;
+    tag->srca_64 = 0;
+    e->key = 0;
+    off = v1_arena_alloc_soft(w * h, V1_WARP_RESERVE, tag);
+    if (off == 0)
+    {
+        saturn_v1_warp_miss++; saturn_v1_warp_miss_a++;
+        return 0;
+    }
+    v1_warp_budget -= w * h;
+    saturn_v1_warp_gens++;
+
+    /* 1/16-unit corners with 8 more fraction bits: |coord| < 2^19, so all
+     * products below fit 32 bits after the row lerp (done in 64 bits). */
+    for (r = 0; r < h; r++)
+    {
+        const int32_t a = (int32_t)(((2 * r + 1) << 15) / h);     /* 0.16 */
+        int32_t lx = (wx[3] << 8) + (int32_t)(((int64_t)((wx[0] - wx[3]) << 8) * a) >> 16);
+        int32_t ly = (wy[3] << 8) + (int32_t)(((int64_t)((wy[0] - wy[3]) << 8) * a) >> 16);
+        int32_t rx = (wx[2] << 8) + (int32_t)(((int64_t)((wx[1] - wx[2]) << 8) * a) >> 16);
+        int32_t ry = (wy[2] << 8) + (int32_t)(((int64_t)((wy[1] - wy[2]) << 8) * a) >> 16);
+        int32_t dx = (rx - lx) / w, dy = (ry - ly) / w;
+        int32_t x = lx + (dx >> 1), ny = -(ly + (dy >> 1));
+        byte *row = (byte *)rowbuf;
+        int s;
+        for (s = 0; s < w; s++, x += dx, ny -= dy)
+            row[s] = src[(((ny >> 12) & 63) << 6) | ((x >> 12) & 63)];
+        {
+            /* strip k = columns k*sw.., an sw x h texture at off + k*sw*h */
+            const int sw = saturn_warp_strip_w(w);
+            for (s = 0; s < w; s += sw)
+                v1_copy_block(off + (unsigned int)(s * h + r * sw), row + s, sw);
+        }
+    }
+    tag->srca = (unsigned short)(off / 8u);
+    e->key  = key;
+    e->flat = (uint16_t)f;
+    e->wh   = (uint16_t)((w << 8) | h);
+    e->lv   = (uint8_t)lv;
+    e->used = saturn_warp_frame;
+    e->made = saturn_warp_frame;
+    e->srca = tag->srca;                    /* last: the slave may use it now */
+    return (int)tag->srca;
+}
 /* Backing colour for raster-hole patches (saturn_hw_flats.c
  * HW_FlatHoleBacking): the flat's most common palette index, computed once
  * per flat from its raw texels (no palette needed; a real texture colour
@@ -2424,6 +2973,7 @@ int Saturn_Vdp1_FlatAvgColor(int flatnum)
 void Saturn_Vdp1_ClearPages(void)
 {
     v1_tags_try_alloc();
+    D_memset(saturn_warp_tab, 0, sizeof(saturn_warp_tab));
     if (v1_tag[0])
         D_memset(v1_tag[0], 0, (size_t)v1_tag_n * sizeof(v1_tag_t));
     if (v1_tag[1] && v1_tag[1] != v1_tag[0])
@@ -2498,7 +3048,13 @@ int Saturn_Vdp1_GetTexSrca(int texnum, int *tw, int *th)
     if (texnum <= 0)
         return 0;
 
-    if (texnum == s_mru_texnum && s_mru_srca != 0)
+    /* MRU keyed on the TRANSLATED texture (2026-11-21): keyed on texnum it
+     * kept returning an animated wall's previous frame after
+     * texturetranslation moved on, and that frame was never uploaded. */
+    int t = texturetranslation ? texturetranslation[texnum] : texnum;
+    if ((unsigned)t >= (unsigned)numtextures)
+        t = texnum;
+    if (t == s_mru_texnum && s_mru_srca != 0)
     {
         *tw = s_mru_w;
         *th = s_mru_h;
@@ -2506,12 +3062,9 @@ int Saturn_Vdp1_GetTexSrca(int texnum, int *tw, int *th)
     }
 
     s_mru_srca = v1_tex_get(texnum, tw, th);
-    s_mru_texnum = texnum;
+    s_mru_texnum = t;
     s_mru_w = *tw;
     s_mru_h = *th;
-    int t = texturetranslation ? texturetranslation[texnum] : texnum;
-    if ((unsigned)t >= (unsigned)numtextures)
-        t = texnum;
     if (v1_tag[v1_tex_page] && v1_tag[v1_tex_page][t].srca_mono)
         s_mru_srca_mono = (int)v1_tag[v1_tex_page][t].srca_mono;
     else
@@ -2523,8 +3076,13 @@ int Saturn_Vdp1_GetTexSrcaMono(int texnum)
 {
     if (texnum <= 0)
         return 0;
-    if (texnum == s_mru_texnum && s_mru_srca_mono != 0)
-        return s_mru_srca_mono;
+    {
+        int t = texturetranslation ? texturetranslation[texnum] : texnum;
+        if ((unsigned)t >= (unsigned)numtextures)
+            t = texnum;
+        if (t == s_mru_texnum && s_mru_srca_mono != 0)
+            return s_mru_srca_mono;
+    }
     int tw, th;
     Saturn_Vdp1_GetTexSrca(texnum, &tw, &th);
     return s_mru_srca_mono;
@@ -2717,6 +3275,7 @@ void Saturn_Vdp1Wall_Frame(void)
         v1_page_committed = 1;
         v1_have_frame = 1;
         v1_hide_sprites = 0;
+        v1_hide_pending = 0;
         v1_patch_slot3();
         v1_write_priority_regs();
 #if SATURN_V1_MANUAL
@@ -2820,16 +3379,35 @@ void Saturn_Vdp1Wall_Frame(void)
 #endif /* HUD row retired 2026-09-08 */
 }
 
+/* I_FinishUpdate, at the flip to a 2D page (no hardware sky): that page
+ * replaces the last 3D frame, so hide the sprite layer now (the vblank
+ * callback writes the registers on the same vblank the flip takes effect). */
+void Saturn_Vdp1_Show2D(void)
+{
+    if (v1_hide_pending)
+    {
+        v1_hide_pending = 0;
+        v1_hide_sprites = 1;
+    }
+}
+
 void Saturn_Vdp1_Enter2D(void)
 {
     extern int saturn_game_started;
-    extern int saturn_vdp2_plane_active;
 
     saturn_game_started = 0;
-    saturn_vdp2_plane_active = 0;
+    /* (saturn_vdp2_plane_active is no longer cleared here: that switched the
+     * RBG0 floor off for good after a pause. 2D pages hide RBG0 through the
+     * flip -- saturn_vdp2_rbg0_on, i_video.c -- and every level load resets
+     * the plane in Saturn_HW_RenderInit.) */
     saturn_v1w_spr = 0;
-    v1_hide_sprites = 1;
-    v1_write_priority_regs();
+    /* Hide the sprite layer when the 2D page is SHOWN (I_FinishUpdate ->
+     * Saturn_Vdp1_Show2D), not now: the first pause frame loads and draws
+     * TITLEPIC (~0.3 s), and with the sprites hidden at once the old page's
+     * NBG0 - the hardware sky panorama in its view rows - showed alone for
+     * that long (hardware video 2026-11-16, sky before the pause menu). The
+     * last 3D frame stays up until the menu replaces it. */
+    v1_hide_pending = 1;
     v1q_count = 0;
     saturn_cmd_m_count = 0;
     saturn_cmd_s_count = 0;
@@ -2845,6 +3423,7 @@ void Saturn_Vdp1_Enter2D(void)
 
 void Saturn_Vdp1Wall_Init(void) { }
 void Saturn_Vdp1_Enter2D(void) { }
+void Saturn_Vdp1_Show2D(void) { }
 void Saturn_Vdp1Wall_Reset(void) { }
 void Saturn_Vdp1Wall_FlushCache(void) { }
 int  Saturn_Vdp1Wall_Add(int xa, int ya0, int ya1,

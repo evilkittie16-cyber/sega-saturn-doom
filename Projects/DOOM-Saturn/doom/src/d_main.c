@@ -53,7 +53,8 @@ extern void P_Init(void);
  * was within a hundred bytes of it), so keep this as small as still
  * serves its purpose — and trim it further whenever a debug build
  * needs the slack. */
-#define ZONE_POOL_BYTES    (2 * 1024)
+#define ZONE_POOL_BYTES    (1 * 1024)   /* 2026-11-20: 2 KB -> 1 KB for the
+                                         * sprite row expansion + cart texture arena code */
 
 static byte   z_zone_pool[ZONE_POOL_BYTES];
 
@@ -1597,6 +1598,12 @@ void D_DoomLoop(void)
                     saturn_tic_count++;  /* r56: census row T */
                     saturn_sim_site = 0x7;   /* r56: tic returned */
                     tic_frt_acc += Saturn_ProfSpan(tt, tt_v0);
+                    /* 2026-11-21: stop the catch-up burst once the level is
+                     * over (exit latched, quit, warp/restart/respawn
+                     * requested) — extra tics of the finished level used to
+                     * run after G_PlayerFinishLevel saved the loadout. */
+                    if (saturn_level_done || saturn_quit_to_title || saturn_warp_map > 0)
+                        break;
                 }
                 saturn_frt_tic = (int)(tic_frt_acc >> 8);
                 saturn_pf_acc[0] += Saturn_ProfSpan(pf_tf0, pf_tv0);
@@ -1621,7 +1628,12 @@ void D_DoomLoop(void)
                 D_Display();
                 saturn_prof_disp_comp = saturn_tex_comp_count - comp0;
             }
-            saturn_prof_frame_frt = (unsigned short)Saturn_ProfSpan(frame_f0, frame_v0);
+            {
+                unsigned int frame_span = Saturn_ProfSpan(frame_f0, frame_v0);
+                extern void Saturn_HW_AdaptiveDetail(unsigned int frame_ticks, unsigned int rate);
+                saturn_prof_frame_frt = (unsigned short)frame_span;
+                Saturn_HW_AdaptiveDetail(frame_span, (unsigned int)saturn_frt_rate);
+            }
             saturn_prof_frame_vbl = (int)(saturn_vbl_count - frame_v0);
             /* Hitch latch: freeze the breakdown of any >=10-vbl frame
              * (see the block comment above the definitions). */

@@ -1,4 +1,4 @@
-/* saturn_hw_walls.c — 2D Map-Space AABB Frustum & 1D Solid-Span Culling,
+/* saturn_hw_walls.c â€” 2D Map-Space AABB Frustum & 1D Solid-Span Culling,
  * Subsector Pillar Pair Projection, Near-Plane Seg Clipper, 1D Vertical Strip
  * & Monolithic VDP1 Wall Quad Emitters, and Subsector Flat Aperture Evaluator.
  */
@@ -8,6 +8,49 @@
  * level-load sector light + fake contrast; adding the delta makes glowing /
  * flickering / strobing sectors and light-change linedefs reach walls. */
 static int hw_wall_light_delta = 0;
+
+/* Strip-LOD tuning table (2026-11-19). Every screen-size / depth threshold
+ * that picks how many texels one wall quad covers, read at run time by the
+ * C emitters AND the asm (hw_asm_walk via hw_asm_em_ctx[19], hw_asm_lingen
+ * via hw_asm_lingen_ctx[8]) so the tuning harness can sweep it live with
+ * 5thPlanet `poke` (one build per view). Defaults = the old constants.
+ * dx = on-screen width in pixels of the quad that would be emitted. */
+enum {
+    HW_LOD_M16_DX,       /*  0  short wall (h,u<=16): one 16-texel quad if dx <= */
+    HW_LOD_M16_FAR_DX,   /*  1  far wall: one 16-texel quad if dx <= ...        */
+    HW_LOD_M16_FAR_CZ,   /*  2  ... and p0 depth > this (16.16)                 */
+    HW_LOD_M32_DX,       /*  3  tw 32, level top: one 32-wide quad if dx <=     */
+    HW_LOD_H64_DX,       /*  4  64-texel block -> half-width 32 copy if dx <=   */
+    HW_LOD_H64_NF_DX,    /*  5  ... same when no full 64 copy exists           */
+    HW_LOD_C4_NF_DX,     /*  6  strip coalesce, no full 64 copy: max dx        */
+    HW_LOD_C4_DG_DX,     /*  7  strip coalesce: full 64 -> half copy if dx <=   */
+    HW_LOD_MERGE_DX,     /*  8  32-wide mono pair -> one 64-wide quad if dx <=  */
+    HW_LOD_C_MAX_DX,     /*  9  strip coalesce, other cases: max dx            */
+    HW_LOD_P4_CZ,        /* 10  perspective strips: 4->1 coalesce if depth >=   */
+    HW_LOD_C8_DX,        /* 11  strip coalesce 8 -> 1 (128 texels, quarter copy) if dx <= */
+    HW_LOD_COUNT
+};
+#ifndef HW_LOD_REF
+#define HW_LOD_REF 0     /* 1: start with every lossy LOD rule off (check builds) */
+#endif
+#ifndef HW_LOD_C8_DEF
+#define HW_LOD_C8_DEF 32   /* quarter block = 32 texel columns: <= 32 px never undersamples it */
+#endif
+int32_t hw_wall_lod[16] = {
+#if HW_LOD_REF
+    -1, -1, 512 << 16, -1, -1, -1, -1, -1, 48, 1000, 0x7FFFFFFF, -1,
+#else
+    16, 6, 512 << 16, 28, 20, 56, 52, 20, 48, 1000, 192 << 16, HW_LOD_C8_DEF,
+#endif
+};
+#define HW_LOD(i) (hw_wall_lod[(i)])
+#if SATURN_BENCH
+/* Tuning-harness input: sdbg pokes [0..15] then bumps [16]; the renderer
+ * copies it into hw_wall_lod once per frame, reading cache-through. Poking
+ * hw_wall_lod directly is NOT safe: the master SH-2 keeps reading its own
+ * cached copy of the lines, so a sweep ran on a mix of old and new values. */
+volatile int32_t hw_wall_lod_in[17];
+#endif
 
 HW_ALWAYS_INLINE int HW_SegLight16(const baked_seg_t *seg)
 {
@@ -49,6 +92,20 @@ HW_ALWAYS_INLINE int HW_SegLight16(const baked_seg_t *seg)
     })
 #endif
 
+/* Compact rewrite stage E1: the BSP walk (HW_RenderBSPNode) and its node
+ * cull (HW_CullBSPBBox = CheckBBoxStatus + CheckBBoxOccluded +
+ * IsClippedSpanOccluded) are hw_asm_bsp / hw_asm_cullbox in
+ * saturn_hw_asm.s. The C below is the check-build reference only. */
+#ifdef HW_SUBMAX
+#define HW_BSP_SUBMAX_ HW_SUBMAX
+#else
+#define HW_BSP_SUBMAX_ HW_PROF_SUBTIMERS
+#endif
+#ifndef HW_ASM_BSP
+#define HW_ASM_BSP (HW_ASM && !HW_VIS_STATS && !HW_BSP_SUBMAX_)
+#endif
+
+#if !HW_ASM_BSP || HW_ASM_CHECK
 /* Fast 2D Map-Space AABB Frustum Test with Full-Accept & Near-Intersect Detection.
  * Evaluates exact bounding box boundaries against 2D frustum planes in map space.
  * Returns BBOX_OUTSIDE (0) if guaranteed outside view frustum (culled).
@@ -235,11 +292,15 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckBBoxOccluded(const int16_t *bbox, int n
 static HW_NOINLINE HW_HOT_O2 int HW_CullBSPBBox(const int16_t *bbox, int fully_inside)
 {
     int near_verified = 0;
+    HW_VS(2);
     if (!fully_inside)
     {
         int st = HW_CheckBBoxStatus(bbox);
         if (st == BBOX_OUTSIDE)
+        {
+            HW_VS(3);
             return -1;
+        }
         if (st == BBOX_INTERSECT_NEAR)
             return 0;
         if (st == BBOX_FULLY_INSIDE)
@@ -249,10 +310,12 @@ static HW_NOINLINE HW_HOT_O2 int HW_CullBSPBBox(const int16_t *bbox, int fully_i
     if (hw_solid_count > 0 && saturn_hw_bsp_occl != 2 && HW_CheckBBoxOccluded(bbox, near_verified))
     {
         saturn_hw_occl_culls++;
+        HW_VS(4);
         return -1;
     }
     return fully_inside;
 }
+#endif /* !HW_ASM_BSP || HW_ASM_CHECK */
 
 /* Precomputed inverses for du_vis in [1..16] (replaces runtime divisions with 1-cycle multiply-shift) */
 static const int32_t saturn_inv_du_vis_lut[17] = {
@@ -419,9 +482,25 @@ typedef struct {
     int      count;
 } hw_solid_snap_t;
 
+#if HW_DEFER_WALLS && !defined(SATURN_WIN32)
+/* Low WRAM (saturn_memmap.h): the High WRAM BSS has no room for ~37 KB
+ * (2026-11-17: also without HW_SLAVE_WALLS - the BSS copy overran the
+ * 0x060C0000 ceiling by 38 KB) */
+#define HW_DEFER_REC_BYTES  ((uint32_t)sizeof(hw_wall_rec_t) * HW_DEFER_REC_CAP)
+#define HW_DEFER_SUB_BYTES  ((uint32_t)sizeof(hw_wall_sub_t) * HW_DEFER_SUB_CAP)
+#define HW_DEFER_SNAP_BYTES ((uint32_t)sizeof(hw_solid_snap_t) * HW_DEFER_SNAP_CAP)
+_Static_assert(((sizeof(hw_wall_rec_t) * HW_DEFER_REC_CAP + sizeof(hw_wall_sub_t) * HW_DEFER_SUB_CAP + 15u) & ~15u)
+               + sizeof(hw_solid_snap_t) * HW_DEFER_SNAP_CAP <= SATURN_WRAM_L_DEFER_SIZE,
+               "deferred-wall queue must fit SATURN_WRAM_L_DEFER");
+#define hw_defer_rec  ((hw_wall_rec_t *)SATURN_WRAM_L_DEFER_ADDR)
+#define hw_defer_sub  ((hw_wall_sub_t *)(SATURN_WRAM_L_DEFER_ADDR + HW_DEFER_REC_BYTES))
+#define hw_defer_snap ((hw_solid_snap_t *)(SATURN_WRAM_L_DEFER_ADDR + \
+                       ((HW_DEFER_REC_BYTES + HW_DEFER_SUB_BYTES + 15u) & ~15u)))
+#else
 static hw_wall_rec_t   hw_defer_rec[HW_DEFER_REC_CAP];
 static hw_wall_sub_t   hw_defer_sub[HW_DEFER_SUB_CAP];
 static hw_solid_snap_t hw_defer_snap[HW_DEFER_SNAP_CAP];
+#endif
 static int     hw_defer_nrec = 0, hw_defer_nsub = 0, hw_defer_nsnap = 0;
 static int     hw_defer_on = 0;         /* this subsector records instead of emitting */
 static int     hw_defer_tex_seen = -1;  /* last wall texture touched in pass 1 */
@@ -544,6 +623,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_IsStripOccluded_Slow(int s_px0, int s_px1, i
     return 0;
 }
 
+#ifndef HW_ASM_LINGEN
+#define HW_ASM_LINGEN (HW_ASM && !HW_VIS_STATS)
+#endif
+/* Stage F1: hw_asm_lingen does this inline; C kept for the C emitter. */
+#if !HW_ASM_LINGEN || HW_ASM_CHECK
 static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     int s, int s_px0, uint32_t cmd_w2_cur)
 {
@@ -575,6 +659,22 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     if ((s << 4) < u_start)
         return 0;
 
+    /* 8 strips -> one 32-px quad from the quarter copy, which shares the
+     * half copy's allocation (saturn_vdp1.c v1_wall_opt_copies; can_coal
+     * already required tw % 64 == 0) */
+    if (tw >= 64 && srca_mono != srca && (cur_strip_idx & 7) == 0 && ((s + 8) << 4) <= u_end)
+    {
+        int px8 = (((s + 8) << 4) >= u_end) ? ctx->p1->px : ((cur_px_fp + step_px_fp * 7) >> 16);
+        if (px8 - s_px0 <= HW_LOD(HW_LOD_C8_DX))
+        {
+            emit_srca = srca_mono + (cur_v << 2) +
+                (int)(((unsigned)tw >> 6) + ((unsigned)cur_strip_idx >> 3)) * (th << 2);
+            hw_wall_coord_tmp[0] = (int)(((uint32_t)emit_srca << 16) | (4u << 8) | (cmd_w2_base & 0xFFu));
+            hw_wall_coord_tmp[1] = (int)(cmd_w2_cur + ((uint32_t)strip_srca_step << 16) * 7u);
+            return 8;
+        }
+    }
+
     if (tw >= 64 && (srca_64 != srca || srca_mono != srca) && (cur_strip_idx & 3) == 0 && ((s + 4) << 4) <= u_end)
     {
         coal_strips = 4;
@@ -595,11 +695,11 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     int adv = coal_strips - 1;
     int c_uhi = (s + coal_strips) << 4;
     int next_px1 = (c_uhi >= u_end) ? ctx->p1->px : ((cur_px_fp + step_px_fp * adv) >> 16);
-    int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? 52 : 1000;
+    int max_coal_dx = (coal_strips == 4 && srca_64 == srca) ? HW_LOD(HW_LOD_C4_NF_DX) : HW_LOD(HW_LOD_C_MAX_DX);
     if (next_px1 - s_px0 > max_coal_dx)
         return 0;
 
-    if (coal_strips == 4 && (next_px1 - s_px0 <= 20 || srca_64 == srca) && srca_mono != srca)
+    if (coal_strips == 4 && (next_px1 - s_px0 <= HW_LOD(HW_LOD_C4_DG_DX) || srca_64 == srca) && srca_mono != srca)
     {
         emit_srca = srca_mono + (cur_v << 2) + (cur_strip_idx >> 2) * (th << 2);
         emit_size_hi = 4u << 8;
@@ -608,6 +708,7 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     hw_wall_coord_tmp[1] = (int)(cmd_w2_cur + ((uint32_t)strip_srca_step << 16) * (uint32_t)adv);
     return coal_strips;
 }
+#endif
 
 /* Wrap a strip's packed (SRCA << 16 | size) word back into the texture
  * (2026-11-16 hang fix). The old test `cur >= base + wrap` overflows 32 bits
@@ -624,6 +725,27 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
                 (cur) -= w_;                                            \
     } while (0)
 
+/* Compact rewrite stage B2: HW_EmitWallStrips_Linear_General in assembly
+ * (saturn_hw_asm.s hw_asm_lingen, same arithmetic; the rare per-strip cases
+ * call the C helpers through this table). */
+#if HW_ASM_LINGEN
+extern void hw_asm_lingen(hw_wall_emit_ctx_t *ctx, int s_min, int s_max);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 &&
+               offsetof(hw_wall_emit_ctx_t, ybot_max) == 14 && offsetof(hw_wall_emit_ctx_t, yb0) == 20 &&
+               offsetof(hw_wall_emit_ctx_t, yb1) == 22 && offsetof(hw_wall_emit_ctx_t, p1) == 44 &&
+               offsetof(hw_wall_emit_ctx_t, rows) == 90 && offsetof(hw_wall_emit_ctx_t, inv_u_span) == 100 &&
+               offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
+               offsetof(hw_wall_emit_ctx_t, tw) == 68 && offsetof(hw_wall_emit_ctx_t, u_start) == 92 &&
+               CMDBUF_M_CAP == 1280 && sizeof(vdp1_cmd_t) == 32, "hw_asm_lingen: layout");
+const void *const hw_asm_lingen_ctx[12] = {
+    &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
+    &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
+    hw_wall_lod /* [8]: coalesce is inline since stage F1 */, (const void *)HW_IsStripOccluded_Slow,
+    (const void *)HW_EmitStripQuad_Slow, (const void *)HW_ModNonPow2
+};
+#endif
+
+#if !HW_ASM_LINGEN || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
 {
@@ -658,6 +780,16 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
     int wall_slow     = (!band_all_vis) | has_occl | wall_needs_clamp;
     int first_slow    = wall_slow | partial_first | (ctx->last_clip_x0 != -1);
 
+#if HW_VIS_STATS
+    /* [34] linear-general walls [35] can_coal [36] wall_slow [37] partial
+     * first [38] partial last [39] none of these (simple fast wall) */
+    HW_VS(34);
+    if (can_coal) HW_VS(35);
+    if (wall_slow) HW_VS(36);
+    if (partial_first) HW_VS(37);
+    if (partial_last) HW_VS(38);
+    if (!can_coal && !wall_slow && !partial_first && !partial_last && ctx->last_clip_x0 == -1) HW_VS(39);
+#endif
     uint32_t lin_flags = (uint32_t)can_coal |
                          ((uint32_t)first_slow << 1) |
                          ((uint32_t)band_all_vis << 2) |
@@ -836,6 +968,61 @@ next_strip_lin:
     saturn_hw_wall_quads  += l_quads;
     saturn_hw_wall_strips += l_strips;
 }
+#endif /* !HW_ASM_LINGEN || HW_ASM_CHECK */
+
+#if HW_ASM_LINGEN && HW_ASM_CHECK
+/* Self-check: run the asm, hash its output (commands + counters + clip
+ * state), roll back, run C, compare. [0] calls [1] mismatches
+ * [2] s_min [3] s_max [4] asm quads [5] C quads [6] asm hash [7] C hash */
+static volatile uint32_t hw_asm_chk_lingen[8];
+static uint32_t HW_LinGenHash(uint16_t m0, hw_wall_emit_ctx_t *ctx)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *p = (const uint32_t *)&saturn_cmd_m[m0];
+    const uint32_t *e = (const uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+    for (; p < e; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ (uint32_t)saturn_cmd_m_count) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_cells) * 16777619u;
+    h = (h ^ saturn_hw_wall_quads) * 16777619u;
+    h = (h ^ saturn_hw_wall_strips) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_drop) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_captured) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x0) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x1) * 16777619u;
+    return h;
+}
+static HW_NOINLINE void HW_LinGenCheck(hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+{
+    uint16_t m0 = saturn_cmd_m_count;
+    int16_t lc0 = ctx->last_clip_x0, lc1 = ctx->last_clip_x1;
+    int cells0 = saturn_v1w_cells, drop0 = saturn_v1w_drop, cap0 = saturn_v1w_captured;
+    unsigned int q0 = saturn_hw_wall_quads, st0 = saturn_hw_wall_strips;
+    hw_asm_lingen(ctx, s_min, s_max);
+    uint32_t ha = HW_LinGenHash(m0, ctx);
+    unsigned int qa = saturn_hw_wall_quads - q0;
+    saturn_cmd_m_count = m0;
+    ctx->last_clip_x0 = lc0; ctx->last_clip_x1 = lc1;
+    saturn_v1w_cells = cells0; saturn_v1w_drop = drop0; saturn_v1w_captured = cap0;
+    saturn_hw_wall_quads = q0; saturn_hw_wall_strips = st0;
+    HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+    uint32_t hc = HW_LinGenHash(m0, ctx);
+    hw_asm_chk_lingen[0]++;
+    if (ha != hc && hw_asm_chk_lingen[1]++ == 0)
+    {
+        hw_asm_chk_lingen[2] = (uint32_t)s_min;
+        hw_asm_chk_lingen[3] = (uint32_t)s_max;
+        hw_asm_chk_lingen[4] = qa;
+        hw_asm_chk_lingen[5] = saturn_hw_wall_quads - q0;
+        hw_asm_chk_lingen[6] = ha;
+        hw_asm_chk_lingen[7] = hc;
+    }
+}
+#define HW_LINGEN_CALL HW_LinGenCheck
+#elif HW_ASM_LINGEN
+#define HW_LINGEN_CALL hw_asm_lingen
+#else
+#define HW_LINGEN_CALL HW_EmitWallStrips_Linear_General
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
@@ -870,7 +1057,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
             (tw >= 64 && (ctx->srca_64 != srca || ctx->srca_mono != srca) && (((u_start + 63) & ~63) + 64 <= u_end)) ||
             (int)m_start + (s_max - s_min + 1) >= CMDBUF_M_CAP - 1, 0))
     {
-        HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+        HW_LINGEN_CALL(ctx, s_min, s_max);
         return;
     }
 
@@ -990,6 +1177,46 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     saturn_hw_wall_strips += l_quads;
 }
 
+/* Asm stage J (saturn_hw_asm.s hw_asm_persp): HW_EmitWallStrips_Persp_General
+ * below, same arithmetic; the rare per-strip cases call the C helpers. */
+#ifndef HW_ASM_PERSP
+#define HW_ASM_PERSP (HW_ASM && !HW_VIS_STATS)
+#endif
+#if HW_ASM_PERSP
+extern void hw_asm_persp(hw_wall_emit_ctx_t *ctx, int s_min, int s_max);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall_emit_ctx_t, top_overlap) == 5 &&
+               offsetof(hw_wall_emit_ctx_t, bot_overlap) == 6 && offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 &&
+               offsetof(hw_wall_emit_ctx_t, ybot_max) == 14 && offsetof(hw_wall_emit_ctx_t, ya0) == 16 &&
+               offsetof(hw_wall_emit_ctx_t, ya1) == 18 && offsetof(hw_wall_emit_ctx_t, yb0) == 20 &&
+               offsetof(hw_wall_emit_ctx_t, yb1) == 22 && offsetof(hw_wall_emit_ctx_t, srca) == 24 &&
+               offsetof(hw_wall_emit_ctx_t, th) == 26 && offsetof(hw_wall_emit_ctx_t, cur_v) == 30 &&
+               offsetof(hw_wall_emit_ctx_t, p0) == 40 && offsetof(hw_wall_emit_ctx_t, p1) == 44 &&
+               offsetof(hw_wall_emit_ctx_t, seg) == 48 && offsetof(hw_wall_emit_ctx_t, dz_top) == 52 &&
+               offsetof(hw_wall_emit_ctx_t, dz_bot) == 56 && offsetof(hw_wall_emit_ctx_t, tw) == 68 &&
+               offsetof(hw_wall_emit_ctx_t, srca_mono) == 70 && offsetof(hw_wall_emit_ctx_t, srca_64) == 72 &&
+               offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 && offsetof(hw_wall_emit_ctx_t, rows) == 90 &&
+               offsetof(hw_wall_emit_ctx_t, u_start) == 92 && offsetof(hw_wall_emit_ctx_t, u_span) == 96 &&
+               offsetof(hw_wall_emit_ctx_t, inv_u_span) == 100 && offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104,
+               "hw_asm_persp: ctx layout");
+_Static_assert(offsetof(hw_trans_pillar_t, cx) == 0 && offsetof(hw_trans_pillar_t, cz) == 4 &&
+               offsetof(hw_trans_pillar_t, px) == 12 && offsetof(baked_seg_t, baked_light) == 2 &&
+               sizeof(hw_wall_lod[0]) == 4 && HW_LOD_P4_CZ == 10 && sizeof(wall_zlight_cmdcolr_LUT[0]) == 256 &&
+               HW_NEAR_Z == 0x40000 && CMDBUF_M_CAP == 1280 && sizeof(vdp1_cmd_t) == 32 &&
+               sizeof(saturn_view_cy) == 4 && HW_VIEW_CX == 160 && HW_VIEW_W == 320 &&
+               sizeof(hw_wall_coord_tmp[0]) == 4, "hw_asm_persp: data layout");
+static HW_NOINLINE HW_HOT_O2 int HW_IsStripOccluded_Slow(int s_px0, int s_px1, int coal_strips);
+const void *const hw_asm_persp_ctx[16] = {
+    &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
+    &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
+    hw_wall_lod, (const void *)HW_IsStripOccluded_Slow, (const void *)HW_EmitStripQuad_Slow,
+    (const void *)HW_ModNonPow2, wall_zlight_cmdcolr_LUT, &hw_wall_light_delta, saturn_master_oclut,
+    &saturn_view_cy
+};
+#elif HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+const void *const hw_asm_persp_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+
+#if !HW_ASM_PERSP || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
 {
@@ -1097,10 +1324,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
         if (__builtin_expect((persp_flags & 256u) != 0, 0) &&
             ((cur_strip_idx & 3) == 0) && !(persp_flags & 16u) &&
             (((s + 4) << 4) <= u_end) &&
-            s_px0 >= 0 && s_cz0 >= (192 << FRACBITS))
+            s_px0 >= 0 && s_cz0 >= HW_LOD(HW_LOD_P4_CZ))
         {
             fixed_t end_cz3 = (s + 3 < s_max) ? (cur_cz1 + step_cz1 * 3) : ctx->p1->cz;
-            if (end_cz3 >= (192 << FRACBITS))
+            if (end_cz3 >= HW_LOD(HW_LOD_P4_CZ))
             {
                 coal_strips = 4;
                 int blk = cur_strip_idx >> 2;
@@ -1242,6 +1469,61 @@ next_strip_persp:
     saturn_hw_wall_quads  += l_quads;
     saturn_hw_wall_strips += l_quads;
 }
+#endif /* !HW_ASM_PERSP || HW_ASM_CHECK */
+
+#if HW_ASM_PERSP && HW_ASM_CHECK
+/* Self-check: asm, hash its output (commands + counters + clip state), roll
+ * back, C, compare. [0] calls [1] mismatches [2] s_min [3] s_max
+ * [4] asm quads [5] C quads [6] asm hash [7] C hash */
+static volatile uint32_t hw_asm_chk_persp[8];
+static uint32_t HW_PerspHash(uint16_t m0, hw_wall_emit_ctx_t *ctx)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *p = (const uint32_t *)&saturn_cmd_m[m0];
+    const uint32_t *e = (const uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+    for (; p < e; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ (uint32_t)saturn_cmd_m_count) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_cells) * 16777619u;
+    h = (h ^ saturn_hw_wall_quads) * 16777619u;
+    h = (h ^ saturn_hw_wall_strips) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_drop) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_captured) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x0) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x1) * 16777619u;
+    return h;
+}
+static HW_NOINLINE void HW_PerspCheck(hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+{
+    uint16_t m0 = saturn_cmd_m_count;
+    int16_t lc0 = ctx->last_clip_x0, lc1 = ctx->last_clip_x1;
+    int cells0 = saturn_v1w_cells, drop0 = saturn_v1w_drop, cap0 = saturn_v1w_captured;
+    unsigned int q0 = saturn_hw_wall_quads, st0 = saturn_hw_wall_strips;
+    hw_asm_persp(ctx, s_min, s_max);
+    uint32_t ha = HW_PerspHash(m0, ctx);
+    unsigned int qa = saturn_hw_wall_quads - q0;
+    saturn_cmd_m_count = m0;
+    ctx->last_clip_x0 = lc0; ctx->last_clip_x1 = lc1;
+    saturn_v1w_cells = cells0; saturn_v1w_drop = drop0; saturn_v1w_captured = cap0;
+    saturn_hw_wall_quads = q0; saturn_hw_wall_strips = st0;
+    HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+    uint32_t hc = HW_PerspHash(m0, ctx);
+    hw_asm_chk_persp[0]++;
+    if (ha != hc && hw_asm_chk_persp[1]++ == 0)
+    {
+        hw_asm_chk_persp[2] = (uint32_t)s_min;
+        hw_asm_chk_persp[3] = (uint32_t)s_max;
+        hw_asm_chk_persp[4] = qa;
+        hw_asm_chk_persp[5] = saturn_hw_wall_quads - q0;
+        hw_asm_chk_persp[6] = ha;
+        hw_asm_chk_persp[7] = hc;
+    }
+}
+#define HW_PERSPG_CALL HW_PerspCheck
+#elif HW_ASM_PERSP
+#define HW_PERSPG_CALL hw_asm_persp
+#else
+#define HW_PERSPG_CALL HW_EmitWallStrips_Persp_General
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
@@ -1287,7 +1569,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
             (tw >= 64 && (ctx->srca_64 != ctx->srca || ctx->srca_mono != ctx->srca) && (((u_start + 63) & ~63) + 64 <= u_end)) ||
             (int)m_start + (s_max - s_min + 1) >= CMDBUF_M_CAP - 1, 0))
     {
-        HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+        HW_PERSPG_CALL(ctx, s_min, s_max);
         return;
     }
 
@@ -1416,9 +1698,9 @@ HW_ALWAYS_INLINE void HW_EmitWallStrips(hw_wall_emit_ctx_t *ctx)
         HW_EmitWallStrips_Persp(ctx, s_min, s_max);
 #else
     if (__builtin_expect(!ctx->persp_strips, 1))
-        HW_EmitWallStrips_Linear_General(ctx, s_min, s_max);
+        HW_LINGEN_CALL(ctx, s_min, s_max);
     else
-        HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+        HW_PERSPG_CALL(ctx, s_min, s_max);
 #endif
 }
 
@@ -1701,6 +1983,37 @@ static HW_NOINLINE HW_COLD_OS int HW_LoadWallTexCtx_Miss(int texnum, hw_wall_emi
 }
 
 /* Outlined tag lookup (called only on texture changes, ~40% of visible segs) */
+#ifdef HW_SLAVE_TU
+/* Slave copy: lookup only. The tag is read cache-through (the master may
+ * have uploaded it this frame); nothing is allocated, copied or touched -
+ * pass 1 already uploaded every wall texture, and a texture still missing
+ * just skips the wall (counted as a texture miss), as an upload refusal
+ * does on the master. */
+static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_t *ctx)
+{
+    ctx->cur_tex_id = texnum;
+    ctx->srca = 0;
+    if ((unsigned)texnum >= (unsigned)numtextures)
+        return 0;
+    int t = texturetranslation ? texturetranslation[texnum] : texnum;
+    if ((unsigned)t >= (unsigned)numtextures)
+        t = texnum;
+    extern v1_tag_t *saturn_v1_wall_tags;
+    if (!saturn_v1_wall_tags)
+        return 0;
+    const volatile v1_tag_t *tag =
+        (const volatile v1_tag_t *)((uintptr_t)&saturn_v1_wall_tags[t] | 0x20000000u);   /* cache-through */
+    unsigned short s = tag->srca;
+    if (s == 0 || s == 0xFFFFu)
+        return 0;
+    ctx->srca      = s;
+    ctx->srca_mono = tag->srca_mono;
+    ctx->srca_64   = tag->srca_64;
+    ctx->tw        = (int16_t)((int)tag->w8 << 3);
+    ctx->th        = (int16_t)tag->h;
+    return (int)s;
+}
+#else
 static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_t *ctx)
 {
     ctx->cur_tex_id = texnum;
@@ -1716,6 +2029,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
             unsigned short s = tag->srca;
             if (__builtin_expect(s != 0 && s != 0xFFFFu, 1))
             {
+                /* no optional copies yet and VRAM has room this frame:
+                 * make them now (saturn_vdp1.c, one wall per frame) */
+                extern int saturn_v1_late_copy_armed;
+                if (__builtin_expect(saturn_v1_late_copy_armed && tag->srca_mono == s, 0))
+                    Saturn_Vdp1_WallLateCopy(texnum);
                 ctx->srca      = s;
                 ctx->srca_mono = tag->srca_mono;
                 ctx->srca_64   = tag->srca_64;
@@ -1727,7 +2045,48 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
     }
     return HW_LoadWallTexCtx_Miss(texnum, ctx);
 }
+#endif /* HW_SLAVE_TU */
 
+/* Compact rewrite stage H: HW_EmitMultiBandBakedWall in saturn_hw_asm.s
+ * (hw_asm_multiband). Loop state stays in registers (GCC spilled ~12
+ * words per band); globals are direct literals, only the static helpers
+ * go through hw_asm_multiband_ctx. */
+#ifndef HW_ASM_MULTIBAND
+#if HW_ASM && HW_STRIP_FASTPATH && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+#define HW_ASM_MULTIBAND 1
+#else
+#define HW_ASM_MULTIBAND 0
+#endif
+#endif
+#if HW_ASM_MULTIBAND
+extern void hw_asm_multiband(hw_wall_emit_ctx_t *ctx);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, top_overlap) == 5 && offsetof(hw_wall_emit_ctx_t, bot_overlap) == 6 &&
+               offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 && offsetof(hw_wall_emit_ctx_t, ybot_max) == 14 &&
+               offsetof(hw_wall_emit_ctx_t, ya0) == 16 && offsetof(hw_wall_emit_ctx_t, ya1) == 18 &&
+               offsetof(hw_wall_emit_ctx_t, yb0) == 20 && offsetof(hw_wall_emit_ctx_t, yb1) == 22 &&
+               offsetof(hw_wall_emit_ctx_t, th) == 26 && offsetof(hw_wall_emit_ctx_t, wall_h) == 28 &&
+               offsetof(hw_wall_emit_ctx_t, cur_v) == 30 && offsetof(hw_wall_emit_ctx_t, p0) == 40 &&
+               offsetof(hw_wall_emit_ctx_t, p1) == 44 && offsetof(hw_wall_emit_ctx_t, seg) == 48 &&
+               offsetof(hw_wall_emit_ctx_t, dz_top) == 52 && offsetof(hw_wall_emit_ctx_t, dz_bot) == 56 &&
+               offsetof(hw_wall_emit_ctx_t, should_subdivide) == 64 && offsetof(hw_wall_emit_ctx_t, needs_clip) == 65 &&
+               offsetof(hw_wall_emit_ctx_t, persp_strips) == 66 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
+               offsetof(hw_wall_emit_ctx_t, last_clip_x1) == 78 && offsetof(hw_wall_emit_ctx_t, mono_tw) == 80 &&
+               offsetof(hw_wall_emit_ctx_t, mono_base_srca) == 82 && offsetof(hw_wall_emit_ctx_t, rem_h) == 84 &&
+               offsetof(hw_wall_emit_ctx_t, q_xa) == 86 && offsetof(hw_wall_emit_ctx_t, q_xb) == 88 &&
+               offsetof(hw_wall_emit_ctx_t, rows) == 90 && offsetof(hw_wall_emit_ctx_t, u_start) == 92 &&
+               offsetof(hw_wall_emit_ctx_t, u_span) == 96 && offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104 &&
+               offsetof(hw_trans_pillar_t, s) == 8 && offsetof(baked_seg_t, flags) == 3 &&
+               SEG_FLAG_UPPER == 2 && CMDBUF_M_CAP == 1280 && HW_VIEW_W == 320 && sizeof(vdp1_cmd_t) == 32,
+               "hw_asm_multiband: layout");
+const void *const hw_asm_multiband_ctx[6] = {
+    hw_wall_coord_tmp, (const void *)HW_ExtrapolateMonoWallY, (const void *)HW_WallXYClamp_Slow,
+    (const void *)HW_EmitWallStrips_Linear, (const void *)HW_EmitWallStrips_Persp, (const void *)HW_EmitUserClip
+};
+#else
+const void *const hw_asm_multiband_ctx[1] = { NULL };
+#endif
+
+#if !HW_ASM_MULTIBAND || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 void HW_EmitMultiBandBakedWall(hw_wall_emit_ctx_t *ctx)
 {
     const baked_seg_t *seg = ctx->seg;
@@ -1863,6 +2222,65 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMultiBandBakedWall(hw_wall_emit_ctx_t *
         yb0 = raw_yb1;
     }
 }
+#endif /* !HW_ASM_MULTIBAND || HW_ASM_CHECK */
+
+#if HW_ASM_MULTIBAND && HW_ASM_CHECK
+/* Self-check: run the asm, hash its output (commands + counters) and keep
+ * the ctx it leaves, roll everything back, run C, compare.
+ * [0] calls [1] mismatches [2] rem_h [3] subdivide|needs_clip<<8|persp<<16
+ * [4] asm quads [5] C quads [6] 1 + first differing ctx byte (0: cmds/counters) [7] - */
+static volatile uint32_t hw_asm_chk_multiband[8];
+static uint32_t HW_MultiBandHash(uint16_t m0)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *p = (const uint32_t *)&saturn_cmd_m[m0];
+    const uint32_t *e = (const uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+    for (; p < e; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ (uint32_t)saturn_cmd_m_count) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_cells) * 16777619u;
+    h = (h ^ saturn_hw_wall_quads) * 16777619u;
+    h = (h ^ saturn_hw_wall_strips) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_drop) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_captured) * 16777619u;
+    return h;
+}
+static HW_NOINLINE void HW_MultiBandCheck(hw_wall_emit_ctx_t *ctx)
+{
+    static hw_wall_emit_ctx_t c0, ca;
+    uint16_t m0 = saturn_cmd_m_count;
+    int cells0 = saturn_v1w_cells, drop0 = saturn_v1w_drop, cap0 = saturn_v1w_captured;
+    unsigned int q0 = saturn_hw_wall_quads, st0 = saturn_hw_wall_strips;
+    c0 = *ctx;
+    hw_asm_multiband(ctx);
+    uint32_t ha = HW_MultiBandHash(m0);
+    unsigned int qa = saturn_hw_wall_quads - q0;
+    ca = *ctx;
+    saturn_cmd_m_count = m0;
+    saturn_v1w_cells = cells0; saturn_v1w_drop = drop0; saturn_v1w_captured = cap0;
+    saturn_hw_wall_quads = q0; saturn_hw_wall_strips = st0;
+    *ctx = c0;
+    HW_EmitMultiBandBakedWall(ctx);
+    uint32_t hc = HW_MultiBandHash(m0);
+    unsigned int diff = 0;
+    for (unsigned int i = 0; i < sizeof(ca); i++)
+        if (((const uint8_t *)&ca)[i] != ((const uint8_t *)ctx)[i]) { diff = i + 1; break; }
+    hw_asm_chk_multiband[0]++;
+    if ((ha != hc || diff) && hw_asm_chk_multiband[1]++ == 0)
+    {
+        hw_asm_chk_multiband[2] = (uint32_t)(int)c0.rem_h;
+        hw_asm_chk_multiband[3] = c0.should_subdivide | ((uint32_t)c0.needs_clip << 8) | ((uint32_t)c0.persp_strips << 16);
+        hw_asm_chk_multiband[4] = qa;
+        hw_asm_chk_multiband[5] = saturn_hw_wall_quads - q0;
+        hw_asm_chk_multiband[6] = diff;
+    }
+}
+#define HW_MULTIBAND HW_MultiBandCheck
+#elif HW_ASM_MULTIBAND
+#define HW_MULTIBAND hw_asm_multiband
+#else
+#define HW_MULTIBAND HW_EmitMultiBandBakedWall
+#endif
+
 static HW_NOINLINE HW_COLD_OS void HW_ClipPortalScales(
     int xa, int xb, int s_A, int s_B)
 {
@@ -1889,12 +2307,37 @@ static unsigned int hw_prof_wquad_acc = 0;
 static unsigned int hw_prof_sportal_acc = 0;
 static unsigned int hw_prof_unb_acc = 0;
 
-/* Takes 2 register arguments (r4=ctx, r5=bsec_idx), 0 stack arguments!
- * Uses 16-byte hw_sec_fast_t (1 SH-2 cache line, indexed by bsec_idx << 4) with pre-subtracted dz_ceil/dz_floor. */
+/* Compact rewrite stage C2: HW_RecordSegPortalAperture + HW_RecordPortalSpan
+ * in saturn_hw_asm.s (hw_asm_portal); every caller is routed to it. */
+#ifndef HW_ASM_PORTAL
+#define HW_ASM_PORTAL (HW_ASM && !HW_AP_1D && !HW_ORACLE && !HW_PROF_SUBTIMERS)
+#endif
+#if HW_ASM_PORTAL
+extern void hw_asm_portal(hw_wall_emit_ctx_t *ctx, int bsec_idx);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, portal_recorded) == 0 && offsetof(hw_wall_emit_ctx_t, is_sky_ceil) == 3 &&
+               offsetof(hw_wall_emit_ctx_t, sec_floor) == 36 && offsetof(hw_sec_fast_t, yt_attach) == 8 &&
+               offsetof(hw_sec_fast_t, yb_attach) == 10 && offsetof(hw_aperture_state_t, cur_sub_yt_attach) == 4 &&
+               offsetof(hw_aperture_state_t, cur_sub_yb_attach) == 6 && HW_MAX_AP_SECTORS == 512,
+               "hw_asm_portal: layout");
+const void *const hw_asm_portal_ctx[6] = {
+    hw_sec_fast, &hw_aperture_state, &saturn_view_cy, &saturn_view_h,
+    (const void *)HW_ClipPortalScales, hw_wall_coord_tmp
+};
+#if HW_ASM_CHECK
+#define HW_RecordSegPortalAperture HW_RecordSegPortalAperture_C
+#endif
+#endif
+
+#if !HW_ASM_PORTAL || HW_ASM_CHECK
+/* Takes 2 register arguments (r4=ctx, r5=bsec_idx), 0 stack arguments! * Uses 16-byte hw_sec_fast_t (1 SH-2 cache line, indexed by bsec_idx << 4) with pre-subtracted dz_ceil/dz_floor. */
 static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     hw_wall_emit_ctx_t *ctx, int bsec_idx)
 {
     ctx->portal_recorded = 1;
+#if HW_AP_1D
+    return;     /* D32XR-style walk: solid columns only, no vertical aperture */
+#endif
+    HW_ORACLE_SKIP();
     if (ctx->seg_sx >= ctx->seg_ex || (unsigned)bsec_idx >= HW_MAX_AP_SECTORS)
         return;
 
@@ -1982,11 +2425,82 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     hw_prof_sportal_acc += HW_ProfDelta(tsp0, SAT_FRT());
 #endif
 }
+#endif /* !HW_ASM_PORTAL || HW_ASM_CHECK */
 
+#if HW_ASM_PORTAL
+#undef HW_RecordSegPortalAperture
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] first differing byte [3] bsec */
+static volatile uint32_t hw_asm_chk_portal[8];
+typedef struct {
+    hw_portal_span_t spans[HW_MAX_PORTAL_SPANS];
+    hw_sec_fast_t sec;
+    uint8_t count, recorded, pad[2];
+} hw_portal_snap_t;
+static void HW_PortalSave(hw_portal_snap_t *s, const hw_wall_emit_ctx_t *ctx, int b)
+{
+    memset(s, 0, sizeof(*s));
+    memcpy(s->spans, hw_aperture_state.portal_spans, sizeof(s->spans));
+    if ((unsigned)b < HW_MAX_AP_SECTORS) s->sec = hw_sec_fast[b];
+    s->count = hw_aperture_state.portal_span_count;
+    s->recorded = ctx->portal_recorded;
+}
+static void HW_PortalLoad(const hw_portal_snap_t *s, hw_wall_emit_ctx_t *ctx, int b)
+{
+    memcpy(hw_aperture_state.portal_spans, s->spans, sizeof(s->spans));
+    if ((unsigned)b < HW_MAX_AP_SECTORS) hw_sec_fast[b] = s->sec;
+    hw_aperture_state.portal_span_count = s->count;
+    ctx->portal_recorded = s->recorded;
+}
+static HW_NOINLINE void HW_PortalCheck(hw_wall_emit_ctx_t *ctx, int b)
+{
+    hw_portal_snap_t s0, s1, s2;
+    HW_PortalSave(&s0, ctx, b);
+    hw_asm_portal(ctx, b);
+    HW_PortalSave(&s1, ctx, b);
+    HW_PortalLoad(&s0, ctx, b);
+    HW_RecordSegPortalAperture_C(ctx, b);
+    HW_PortalSave(&s2, ctx, b);
+    hw_asm_chk_portal[0]++;
+    const uint8_t *a = (const uint8_t *)&s1, *c = (const uint8_t *)&s2;
+    for (uint32_t i = 0; i < sizeof(s1); i++)
+        if (a[i] != c[i])
+        {
+            if (hw_asm_chk_portal[1]++ == 0)
+            {
+                hw_asm_chk_portal[2] = i;
+                hw_asm_chk_portal[3] = (uint32_t)b;
+                hw_asm_chk_portal[4] = a[i];
+                hw_asm_chk_portal[5] = c[i];
+            }
+            break;
+        }
+}
+#define HW_RecordSegPortalAperture HW_PortalCheck
+#else
+#define HW_RecordSegPortalAperture hw_asm_portal
+#endif
+#endif
 #if defined(__GNUC__) && !defined(__clang__)
 #define HW_HOT_O2_NOTHREAD __attribute__((optimize("O2,no-thread-jumps")))
 #else
 #define HW_HOT_O2_NOTHREAD HW_HOT_O2
+#endif
+/* HW_WALL_FUSE (2026-11-17, I-cache work): fold the single-caller wall chain
+ * EmitWallFromCtx -> EmitBakedWallQuads -> EmitMonolithicBakedSeg into
+ * HW_EmitVisibleBakedSeg (no calls, values stay in registers). */
+#ifndef HW_WALL_FUSE
+#define HW_WALL_FUSE 1      /* 5thPlanet: master -0.3..-0.6 ms, pixel-identical */
+#endif
+#ifndef HW_WALL_TINY
+#define HW_WALL_TINY 0
+#endif
+#if HW_WALL_FUSE && defined(__GNUC__)
+#define HW_WFUSE    inline __attribute__((always_inline))
+#define HW_WFUSE_O2 HW_HOT_O2_NOTHREAD
+#else
+#define HW_WFUSE    HW_NOINLINE
+#define HW_WFUSE_O2 HW_HOT_O2
 #endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_EmitSubdividedBakedSeg(
@@ -2035,7 +2549,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitSubdividedBakedSeg(
         ctx->rem_h            = (int16_t)rem_h;
         ctx->q_xa             = (int16_t)p0->px;
         ctx->q_xb             = (int16_t)p1->px;
-        HW_EmitMultiBandBakedWall(ctx);
+        HW_MULTIBAND(ctx);
     }
 }
 
@@ -2063,7 +2577,7 @@ static HW_NOINLINE HW_COLD_OS int HW_ClipSegNearPlane(
     return 1;
 }
 
-static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
+static HW_WFUSE HW_WFUSE_O2 void HW_EmitMonolithicBakedSeg(
     hw_wall_emit_ctx_t *ctx, int mono_tw, int mono_base_srca, int needs_clip)
 {
     if (__builtin_expect(saturn_cmd_m_count + 16 >= CMDBUF_M_CAP, 0))
@@ -2155,7 +2669,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
             {
                 int merged_dx = s_xb - (int)(int16_t)(prev[3] >> 16);
                 if (((w2 & 0x3F00u) == 0x0400u) && ctx->tw == 32 && ctx->srca_64 != ctx->srca &&
-                    merged_dx <= 48 &&
+                    merged_dx <= HW_LOD(HW_LOD_MERGE_DX) &&
                     (unsigned int)(q_ya0 - q_yb0 + 3) <= 6u)
                 {
                     int srca_64 = ctx->srca_64;
@@ -2203,11 +2717,11 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitMonolithicBakedSeg(
         ctx->rem_h            = (int16_t)rem_h;
         ctx->q_xa             = (int16_t)q_xa;
         ctx->q_xb             = (int16_t)q_xb;
-        HW_EmitMultiBandBakedWall(ctx);
+        HW_MULTIBAND(ctx);
     }
 }
 
-static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t *ctx)
+static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t *ctx)
 {
 #if HW_PROF_SUBTIMERS
     unsigned short twq0 = SAT_FRT();
@@ -2218,6 +2732,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
 
     if (__builtin_expect(ctx->was_near_clipped, 0))
     {
+        HW_VS(12);
         HW_EmitSubdividedBakedSeg(ctx, (dx >= 24 && saturn_wall_subdivision));
 #if HW_PROF_SUBTIMERS
         hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
@@ -2261,6 +2776,8 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
             ((unsigned int)(u_start ^ (u_start + u_span - 1)) > 15u) &&
             HW_NeedPerspectiveStrips(dx, u_span, p0->cz, p1->cz, tw))
         {
+            HW_VS(13);
+            if (p0->cz >= (512 << FRACBITS) && p1->cz >= (512 << FRACBITS)) HW_VS(17);
             HW_EmitSubdividedBakedSeg(ctx, 1);
 #if HW_PROF_SUBTIMERS
             hw_prof_wquad_acc += HW_ProfDelta(twq0, SAT_FRT());
@@ -2272,7 +2789,8 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         int srca_mono = ctx->srca_mono;
         int srca_64   = ctx->srca_64;
         int th        = ctx->th;
-        if (((ctx->wall_h <= 16 && dx <= 16 && u_span <= 16) || (dx <= 6 && p0->cz > (512 << FRACBITS))) &&
+        if (((ctx->wall_h <= 16 && dx <= HW_LOD(HW_LOD_M16_DX) && u_span <= 16) ||
+             (dx <= HW_LOD(HW_LOD_M16_FAR_DX) && p0->cz > HW_LOD(HW_LOD_M16_FAR_CZ))) &&
             (unsigned)u_start < (unsigned)tw)
         {
             mono_base_srca = srca + (int)(((unsigned)u_start >> 4) * (unsigned)(th << 1));
@@ -2280,7 +2798,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         }
         else if (tw == 32 && u_start == 0)
         {
-            if ((u_span == 32 || (dx <= 28 && (unsigned int)(ctx->ya0 - ctx->yb0 + 3) <= 6u)) && srca_mono != srca)
+            if ((u_span == 32 || (dx <= HW_LOD(HW_LOD_M32_DX) && (unsigned int)(ctx->ya0 - ctx->yb0 + 3) <= 6u)) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono;
                 mono_tw = 32;
@@ -2294,7 +2812,7 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         }
         else if (tw >= 64 && (((u_span ^ 64) | (u_start & 63)) == 0) && (unsigned)u_start < (unsigned)tw)
         {
-            if ((dx <= 20 || (srca_64 == srca && dx <= 56)) && srca_mono != srca)
+            if ((dx <= HW_LOD(HW_LOD_H64_DX) || (srca_64 == srca && dx <= HW_LOD(HW_LOD_H64_NF_DX))) && srca_mono != srca)
             {
                 mono_base_srca = srca_mono + (int)(((unsigned)u_start >> 6) * (unsigned)(th << 2));
                 mono_tw = 32;
@@ -2307,6 +2825,30 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ct
         }
     }
 
+#if HW_VIS_STATS
+    /* wall-path census: [14] linear strips [15] mono [16] linear, min cz >= 512
+     * [18] linear, min cz >= 256 [19] sum dx of linear >= 512 [20] linear >= 512
+     * with u range inside one 64-texel period [21] ... inside one 32 period
+     * [22] linear >= 512 with tw >= 128 [23] linear >= 512 with tw == 64 */
+    if (!mono_tw)
+    {
+        fixed_t czmin = (p0->cz < p1->cz) ? p0->cz : p1->cz;
+        int u_end = u_start + u_span - 1;
+        HW_VS(14);
+        if (czmin >= (256 << FRACBITS)) HW_VS(18);
+        if (czmin >= (512 << FRACBITS))
+        {
+            HW_VS(16);
+            hw_vis_stats[19] += (uint32_t)dx;
+            if ((u_start >> 6) == (u_end >> 6)) HW_VS(20);
+            if ((u_start >> 5) == (u_end >> 5)) HW_VS(21);
+            if (tw >= 128) HW_VS(22);
+            else if (tw == 64) HW_VS(23);
+        }
+    }
+    else
+        HW_VS(15);
+#endif
     if (!mono_tw)
         HW_EmitSubdividedBakedSeg(ctx, 0);
     else
@@ -2366,7 +2908,7 @@ static HW_NOINLINE HW_COLD_OS void HW_OccludeZeroHeightSeg(
     }
 }
 
-static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
+static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
     hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg);
 
 static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
@@ -2533,7 +3075,16 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
         {
             int ttw, tth, tmono, t64;
             hw_defer_tex_seen = tex_id;
+#if HW_SLAVE_WALLS
+            /* the optional wall copies HW_LoadWallTexCtx makes in pass 2 on
+             * the master: make them here, the slave's pass 2 can't */
+            int ts = HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
+            extern int saturn_v1_late_copy_armed;
+            if (__builtin_expect(saturn_v1_late_copy_armed && ts != 0 && ts != 0xFFFF && tmono == ts, 0))
+                Saturn_Vdp1_WallLateCopy(tex_id);
+#else
             (void)HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
+#endif
         }
         hw_wall_rec_t *r = &hw_defer_rec[hw_defer_nrec++];
         r->seg              = seg;
@@ -2571,12 +3122,55 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     ctx->yb1         = (int16_t)yb1;
     ctx->top_overlap = (uint8_t)top_overlap;
     ctx->bot_overlap = (uint8_t)bot_overlap;
+#if HW_VIS_STATS
+    /* size census (2026-11-17, distance-LOD study): [24] walls emitted
+     * [25] width <= 2 px [26] width <= 4 [27] height <= 3 px (before the
+     * overlap pad) [28] w<=4 || h<=3 ("tiny") [29] quads, all walls
+     * [30] quads from tiny walls [31] tiny with both ends cz >= 1024
+     * [32] tiny with both ends cz >= 512 [33] tiny, cz < 512 */
+    uint16_t census_m0 = saturn_cmd_m_count;
+    int c_w = ctx->p1->px - ctx->p0->px;
+    int c_h0 = (ya1 - bot_overlap) - (ya0 + top_overlap);
+    int c_h1 = (yb1 - bot_overlap) - (yb0 + top_overlap);
+    int c_h = (c_h0 > c_h1) ? c_h0 : c_h1;
+    int c_tiny = (c_w <= 4 || c_h <= 3);
+    HW_VS(24);
+    if (c_w <= 2) HW_VS(25);
+    if (c_w <= 4) HW_VS(26);
+    if (c_h <= 3) HW_VS(27);
+    if (c_tiny)
+    {
+        HW_VS(28);
+        if (ctx->p0->cz >= (1024 << FRACBITS) && ctx->p1->cz >= (1024 << FRACBITS)) HW_VS(31);
+        if (ctx->p0->cz >= (512 << FRACBITS) && ctx->p1->cz >= (512 << FRACBITS)) HW_VS(32);
+        else HW_VS(33);
+    }
+#endif
+#if HW_WALL_TINY
+    /* distance LOD study: far walls only a few pixels big are not drawn
+     * (occlusion above still counts them) - measurement upper bound */
+    {
+        int t_w = ctx->p1->px - ctx->p0->px;
+        int t_h0 = (ya1 - bot_overlap) - (ya0 + top_overlap);
+        int t_h1 = (yb1 - bot_overlap) - (yb0 + top_overlap);
+        if ((t_w <= 4 || (t_h0 <= 3 && t_h1 <= 3)) &&
+            ctx->p0->cz >= (512 << FRACBITS) && ctx->p1->cz >= (512 << FRACBITS))
+            return;
+    }
+#endif
     HW_EmitWallFromCtx(ctx, seg);
+#if HW_VIS_STATS
+    {
+        uint32_t nq = (uint32_t)(uint16_t)(saturn_cmd_m_count - census_m0);
+        hw_vis_stats[29] += nq;
+        if (c_tiny) hw_vis_stats[30] += nq;
+    }
+#endif
 }
 
 /* Texture + quad emission for the wall described by hw_wctx (immediate
  * path above, or pass 2 from a hw_wall_rec_t). */
-static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
+static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
     hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
 {
     uint8_t seg_flags = seg->flags;
@@ -2649,9 +3243,17 @@ static HW_NOINLINE HW_HOT_O2 void HW_ProjectPortalEndpoint(hw_trans_pillar_t *tp
     }
 }
 
-static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals(hw_wall_emit_ctx_t *ctx)
+/* portal-seg endpoints (file scope: asm stage K reads them through its table) */
+static hw_trans_pillar_t hw_unbp_tp0, hw_unbp_tp1;
+
+static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals_C(hw_wall_emit_ctx_t *ctx)
 {
-    static hw_trans_pillar_t p_tp0, p_tp1;
+#define p_tp0 hw_unbp_tp0
+#define p_tp1 hw_unbp_tp1
+#if HW_AP_1D
+    ctx->portal_recorded = 0;
+    return;
+#endif
     const hw_aperture_state_t *ap = HW_APERTURE;
     int count = (int)ctx->portal_count;
     const hw_portal_seg_t *p = &HW_PORTAL_SEGS[ctx->portal_first];
@@ -2785,7 +3387,70 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSubsectorUnbakedPortals(hw_wall_emit_
         ctx->portal_recorded = 0;
         HW_RecordSegPortalAperture(ctx, (int)p->back_sec_idx);
     }
+#undef p_tp0
+#undef p_tp1
 }
+
+/* Asm stage K (saturn_hw_asm.s hw_asm_unbp): the function above. */
+#ifndef HW_ASM_UNBP
+#define HW_ASM_UNBP (HW_ASM && !HW_AP_1D)
+#endif
+#if HW_ASM_UNBP
+extern void hw_asm_unbp(hw_wall_emit_ctx_t *ctx);
+static HW_NOINLINE int HW_UnbpSpanAperture(int sx, int ex) { return HW_GetSpanAperture(sx, ex); }
+_Static_assert(offsetof(hw_wall_emit_ctx_t, portal_recorded) == 0 && offsetof(hw_wall_emit_ctx_t, seg_sx) == 8 &&
+               offsetof(hw_wall_emit_ctx_t, seg_ex) == 10 && offsetof(hw_wall_emit_ctx_t, portal_first) == 120 &&
+               offsetof(hw_wall_emit_ctx_t, portal_count) == 122 && sizeof(hw_portal_seg_t) == 12 &&
+               offsetof(hw_portal_seg_t, back_sec_idx) == 8 && offsetof(hw_portal_seg_t, chain_prev) == 10 &&
+               sizeof(hw_ap_word_t) == 8 && offsetof(hw_ap_word_t, yb_max) == 2 &&
+               offsetof(hw_aperture_state_t, aperture_active) == 2 && sizeof(hw_trans_pillar_t) == 16 &&
+               offsetof(hw_frust_t, Ny) - offsetof(hw_frust_t, Nx) == 2 &&
+               offsetof(hw_frust_t, cz_origin) - offsetof(hw_frust_t, Nx) == 32 &&
+               offsetof(hw_frust_t, cx_origin) - offsetof(hw_frust_t, Nx) == 36 &&
+               sizeof(saturn_view_h) == 4 && HW_FAR_Z == 0x40000000, "hw_asm_unbp: layout");
+const void *const hw_asm_unbp_ctx[20] = {
+    &hw_cam_x, &hw_cam_y, &hw_frust.Nx, saturn_master_oclut, HW_PORTAL_SEGS, &hw_unbp_tp0, &hw_unbp_tp1,
+    hw_solid_mask, hw_mask_left, hw_mask_right, hw_ap_words, &hw_solid_count, &hw_aperture_state,
+    &saturn_view_h, (const void *)HW_CheckSpanOcclusion, (const void *)HW_UnbpSpanAperture,
+    (const void *)HW_ClipWallNearPlane, (const void *)HW_RecordSegPortalAperture,
+    &hw_p0_clipped, &hw_p1_clipped
+};
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] first differing byte of the ctx [3] portal count */
+static volatile uint32_t hw_asm_chk_unbp[8];
+static HW_NOINLINE void HW_UnbpCheck(hw_wall_emit_ctx_t *ctx)
+{
+    /* the portal records go to the aperture state: compare that whole state
+     * plus the ctx after asm vs after C (rolled back in between) */
+    static hw_aperture_state_t ap0, apa;
+    static hw_wall_emit_ctx_t c0, ca;
+    static hw_trans_pillar_t t0[2], ta[2];
+    ap0 = hw_aperture_state; c0 = *ctx; t0[0] = hw_unbp_tp0; t0[1] = hw_unbp_tp1;
+    hw_asm_unbp(ctx);
+    apa = hw_aperture_state; ca = *ctx; ta[0] = hw_unbp_tp0; ta[1] = hw_unbp_tp1;
+    hw_aperture_state = ap0; *ctx = c0; hw_unbp_tp0 = t0[0]; hw_unbp_tp1 = t0[1];
+    HW_RecordSubsectorUnbakedPortals_C(ctx);
+    hw_asm_chk_unbp[0]++;
+    if ((memcmp(&apa, &hw_aperture_state, sizeof(apa)) != 0 || memcmp(&ca, ctx, sizeof(ca)) != 0) &&
+        hw_asm_chk_unbp[1]++ == 0)
+    {
+        const uint8_t *a = (const uint8_t *)&ca, *c = (const uint8_t *)ctx;
+        hw_asm_chk_unbp[2] = 0xFFFFu;
+        for (uint32_t i = 0; i < sizeof(ca); i++)
+            if (a[i] != c[i]) { hw_asm_chk_unbp[2] = i; break; }
+        hw_asm_chk_unbp[3] = ctx->portal_count;
+    }
+}
+#define HW_RecordSubsectorUnbakedPortals HW_UnbpCheck
+#else
+#define HW_RecordSubsectorUnbakedPortals hw_asm_unbp
+#endif
+#else
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+const void *const hw_asm_unbp_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+#define HW_RecordSubsectorUnbakedPortals HW_RecordSubsectorUnbakedPortals_C
+#endif
 
 /* Outlined Pillar Pair Projection + 1D Frustum + Occlusion + Aperture Check
  * Takes 3 register arguments (r4=pair_key, r5=obj_dx, r6=obj_dy), 0 stack arguments! */
@@ -2992,9 +3657,437 @@ static HW_NOINLINE HW_HOT_O2 void HW_WalkSubsectorBakedSegs(
     }
 }
 
+#ifndef HW_ASM_WALK
+#define HW_ASM_WALK (HW_ASM && HW_ASM_SPANAP && !HW_DEFER_WALLS && !HW_VIS_STATS && !HW_WALL_TINY)
+#endif
+#if HW_ASM_WALK
+/* Compact rewrite stage A: seg walk + pillar projection/cull + the front of
+ * HW_EmitVisibleBakedSeg in saturn_hw_asm.s (hw_asm_walk); layout there. */
+extern void hw_asm_walk(const baked_seg_t *seg, const baked_seg_t *seg_end,
+                        const saturn_wl_pillar_t *pillars, const void *const *ctx);
+_Static_assert(!HW_DEFER_WALLS && !HW_VIS_STATS && !HW_WALL_TINY, "hw_asm_walk: default build only");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, needs_near_clip) == 7 &&
+               offsetof(hw_wall_emit_ctx_t, seg_sx) == 8 &&
+               offsetof(hw_wall_emit_ctx_t, ya0) == 16 &&
+               offsetof(hw_wall_emit_ctx_t, wall_h) == 28 &&
+               offsetof(hw_wall_emit_ctx_t, cur_v) == 30 &&
+               offsetof(hw_wall_emit_ctx_t, sec_ceiling) == 32 &&
+               offsetof(hw_wall_emit_ctx_t, p0) == 40 &&
+               offsetof(hw_wall_emit_ctx_t, seg) == 48 &&
+               offsetof(hw_wall_emit_ctx_t, dz_top) == 52 &&
+               offsetof(hw_wall_emit_ctx_t, dz_bot) == 56, "hw_asm_walk: hw_wctx layout");
+_Static_assert(sizeof(baked_seg_t) == 16 && offsetof(baked_seg_t, flags) == 3 &&
+               offsetof(baked_seg_t, tex_64) == 4 && offsetof(baked_seg_t, mid_static_v_offset) == 6 &&
+               offsetof(baked_seg_t, back_sec_idx) == 14, "hw_asm_walk: baked_seg_t layout");
+_Static_assert(sizeof(hw_trans_pillar_t) == 16 && offsetof(hw_trans_pillar_t, cz) == 4 &&
+               offsetof(hw_trans_pillar_t, s) == 8 && offsetof(hw_trans_pillar_t, px) == 12,
+               "hw_asm_walk: hw_trans_pillar_t layout");
+_Static_assert(offsetof(hw_frust_t, cz_origin) == 44 && offsetof(hw_frust_t, cx_origin) == 48,
+               "hw_asm_walk: hw_frust layout");
+_Static_assert(offsetof(hw_sec_fast_t, dz_floor) == 4 && offsetof(hw_sec_fast_t, is_sky) == 12,
+               "hw_asm_walk: hw_sec_fast_t layout");
+_Static_assert(HW_FAR_Z == (1 << 30) && HW_VIEW_W == 320, "hw_asm_walk: constants");
+
+static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx_Call(hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
+{
+    HW_EmitWallFromCtx(ctx, seg);
+}
+
+/* Stage B1: one-band unclipped mono walls emitted inside hw_asm_walk
+ * (layout in saturn_hw_asm.s at .Le_*); everything else -> C emitter. */
+#ifndef HW_ASM_EMIT
+#define HW_ASM_EMIT 1
+#endif
+_Static_assert(offsetof(hw_wall_emit_ctx_t, srca) == 24 && offsetof(hw_wall_emit_ctx_t, th) == 26 &&
+               offsetof(hw_wall_emit_ctx_t, cur_tex_id) == 60 && offsetof(hw_wall_emit_ctx_t, tw) == 68 &&
+               offsetof(hw_wall_emit_ctx_t, srca_mono) == 70 && offsetof(hw_wall_emit_ctx_t, srca_64) == 72 &&
+               offsetof(hw_wall_emit_ctx_t, sub_m_start) == 74 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
+               offsetof(hw_wall_emit_ctx_t, u_start) == 92 && offsetof(hw_wall_emit_ctx_t, u_span) == 96,
+               "hw_asm_walk emitter: hw_wctx layout");
+_Static_assert(offsetof(hw_wall_emit_ctx_t, should_subdivide) == 64 && offsetof(hw_wall_emit_ctx_t, needs_clip) == 65 &&
+               offsetof(hw_wall_emit_ctx_t, persp_strips) == 66 && offsetof(hw_wall_emit_ctx_t, mono_tw) == 80 &&
+               offsetof(hw_wall_emit_ctx_t, mono_base_srca) == 82 && offsetof(hw_wall_emit_ctx_t, rem_h) == 84 &&
+               offsetof(hw_wall_emit_ctx_t, q_xa) == 86 && offsetof(hw_wall_emit_ctx_t, q_xb) == 88 &&
+               offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104, "hw_asm_walk emitter: multi-band fields");
+_Static_assert(offsetof(baked_seg_t, baked_light) == 2 && offsetof(baked_seg_t, u_start) == 8 &&
+               offsetof(baked_seg_t, u_span) == 10 && sizeof(vdp1_cmd_t) == 32 && CMDBUF_M_CAP == 1280 &&
+               SEG_FLAG_STATIC == 0x40 && SEG_FLAG_MID == 0x08,
+               "hw_asm_walk emitter: layout/constants");
+#if HW_ASM_EMIT
+#ifndef HW_ASM_EMSTAT
+#define HW_ASM_EMSTAT 0
+#endif
+#if HW_ASM_EMSTAT
+/* Full-C fallbacks by reason (the other exits call the C helpers directly
+ * and are not counted): [3] tw<=16 partial (clipped mono), [7] user clip
+ * reset. [1] [2] [4] [5] [6] [8] [9] are no longer fallbacks. */
+volatile uint32_t hw_asm_emstat[10];
+#endif
+static const void *const hw_asm_em_ctx[20] = {
+    &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &hw_wall_light_delta, wall_zlight_cmdcolr_LUT,
+    (const void *)(uintptr_t)((((PMOD_WALL | PMOD_CLIP_IN) & 0xFFFFu)) << 16),
+    (const void *)(uintptr_t)(((((PMOD_WALL & ~0x0040u) | PMOD_CLIP_IN) & 0xFFFFu)) << 16),
+    &saturn_v1w_cells, &saturn_hw_wall_quads, &saturn_v1w_drop, &saturn_v1w_captured,
+    &saturn_hw_tex_miss, (const void *)HW_LoadWallTexCtx,
+#if HW_ASM_EMSTAT
+    (const void *)hw_asm_emstat,
+#else
+    NULL,
+#endif
+    &saturn_wall_subdivision, (const void *)HW_ModNonPow2, (const void *)HW_WallXYClamp_Slow,
+    hw_wall_coord_tmp, (const void *)HW_EmitSubdividedBakedSeg, (const void *)HW_MULTIBAND,
+    hw_wall_lod                                     /* [19] strip-LOD tuning table */
+};
+#endif
+
+static const void *const hw_asm_walk_ctx[30] = {
+    &hw_wctx, &hw_cam_x, &hw_cam_y, local_trans_pillars,
+    hw_pil_gen, &hw_cur_pil_gen, &hw_cur_pfrac, &hw_frust,
+    saturn_master_oclut, hw_solid_mask, hw_mask_left, hw_mask_right,
+    hw_ap_words, &hw_solid_count, &hw_aperture_state, &saturn_view_h,
+    &saturn_view_cy, hw_sec_fast, &saturn_cmd_m_needs_ytrim, hw_asm_spanap_ctx,
+    (const void *)HW_TransformPillar_Shifted, (const void *)HW_CheckSpanOcclusion,
+    (const void *)HW_OccludeZeroHeightSeg, (const void *)HW_ClipSegNearPlane,
+    (const void *)HW_MarkSubSolidSpan, (const void *)HW_RecordSegPortalAperture,
+    (const void *)HW_EmitWallFromCtx_Call, &hw_p0_clipped, &hw_p1_clipped,
+#if HW_ASM_EMIT
+    hw_asm_em_ctx
+#else
+    NULL
+#endif
+};
+#endif /* HW_ASM_WALK */
+
+/* Compact rewrite stage E2: HW_RenderSubsector_Body (saturn_hw_render.c)
+ * and HW_RenderSubsectorBakedWalls below are one asm routine,
+ * hw_asm_subsector (saturn_hw_asm.s). Both have side effects (they draw),
+ * so there is no C-beside-asm check: verified by VDP1 VRAM equality
+ * against -DHW_ASM_SUBBODY=0. */
+/* RESULT (5thPlanet, 2026-11-19, sets asmE1 -> asmE2): VDP1 VRAM identical,
+ * but master busy w +0.08, p2 +0.21, m1a +0.88 ms - the routine misses
+ * on nearly every line like the C pair it replaces, plus a data miss per
+ * table pointer. OFF by default; -DHW_ASM_SUBBODY=1 enables it (needs
+ * HW_ASM_BSP && HW_ASM_WALK && !HW_ORACLE && !HW_WALLS_ONLY &&
+ * !HW_PROF_SUBTIMERS && !HW_DEFER_WALLS). */
+#ifndef HW_ASM_SUBBODY
+#define HW_ASM_SUBBODY 0
+#endif
+#if HW_ASM_SUBBODY && !(HW_ASM_BSP && HW_ASM_WALK && !HW_ORACLE && !HW_WALLS_ONLY && \
+                        !HW_PROF_SUBTIMERS && !HW_DEFER_WALLS)
+#error "HW_ASM_SUBBODY needs HW_ASM_BSP, HW_ASM_WALK and no ORACLE/WALLS_ONLY/SUBTIMERS/DEFER_WALLS"
+#endif
+
+#if !HW_ASM_SUBBODY
 /* Master Blueprint: Zero-Runtime-Math 1D LOD Subsector Wall Renderer (Phase 3)
  * Fast Culling & Pillar Projection Loop (< 400 bytes, zero register spills):
  * rejects ~72% of segs in registers and dispatches surviving visible segs to HW_EmitVisibleBakedSeg. */
+/* VDP2 floor plane punch-through (2026-11-20, user report: E1M1 X2122
+ * Y-3167 A274, a dark box under the outdoor hut's doorway).
+ *
+ * A plane sector's floor is drawn by VDP2 RBG0, BEHIND every VDP1 pixel,
+ * so it cannot hide anything. On VDP1 a farther surface seen through a
+ * portal is normally covered below the portal's floor line by the nearer
+ * sector's floor quads, drawn later; with the plane those quads are gone
+ * and the farther wall (here the hut's inner back wall, below the
+ * courtyard floor) shows on top of the plane. For each front-facing
+ * portal of a plane-floored subsector into a sector that is NOT
+ * plane-floored, emit one polygon in the transparent colour from the
+ * portal's floor line to the bottom of the view, after the farther
+ * geometry and before this subsector's sprites: it erases exactly what
+ * this floor hides and lets the plane show (the same colour-0 polygon the
+ * list's clear uses). The back sector's own riser and floor lie above the
+ * line, so a higher back floor is unaffected; what lies below it is
+ * hidden by this floor whatever the back floor's height (E1M1: courtyard
+ * -> doorway at the same height -> lower hut interior). Portals into
+ * other plane sectors are punched by those sectors' own subsectors. */
+#ifndef HW_V2P_PUNCH
+#define HW_V2P_PUNCH 1
+#endif
+#if HW_V2P_PUNCH
+#define HW_V2P_SPILL_PX 24   /* widest far-strip spill past a portal edge */
+#define HW_V2P_SPANS    16
+/* screen spans (+- spill) of this frame's punched portals (frame = hw_render_frame) */
+static int16_t  hw_v2p_lo[HW_V2P_SPANS], hw_v2p_hi[HW_V2P_SPANS];
+static int      hw_v2p_n = 0;
+static unsigned hw_v2p_frame = 0xFFFFFFFFu;
+
+/* Punch below one seg's floor line, from its two projected ends. Returns
+ * its screen span (xa << 16 | xb) or -1 when it emitted nothing.
+ * near_only: punch only if the span overlaps one of this frame's
+ * punched-portal spans. */
+static HW_NOINLINE HW_COLD_OS int HW_V2PlanePunchProj(const hw_trans_pillar_t *pa, const hw_trans_pillar_t *pb,
+                                                      int dz, int near_only)
+{
+    const hw_trans_pillar_t a = *pa, b = *pb;
+    if (a.cz < HW_NEAR_Z || b.cz < HW_NEAR_Z)
+        return -1;                              /* crosses the near plane: skip */
+    int xa = a.px, xb = b.px;
+    if (xb <= xa || xb <= 0 || xa >= HW_VIEW_W || xa < -30000 || xb > 30000)
+        return -1;                              /* off screen / extreme projection */
+    if (near_only)
+    {
+        int k = 0;
+        while (k < hw_v2p_n && (xb < hw_v2p_lo[k] || xa > hw_v2p_hi[k]))
+            k++;
+        if (k == hw_v2p_n)
+            return -1;                          /* not next to a punched portal */
+    }
+    int ya, yb;
+    HW_ProjYPair(HW_VIEW_CY, dz, a.s, dz, b.s, &ya, &yb);
+    const int vh = HW_VIEW_H;
+    if (ya >= vh && yb >= vh)
+        return -1;                              /* floor line below the view */
+    const int span = (int)(((uint32_t)(uint16_t)xa << 16) | (uint16_t)xb);
+    if (ya < -1000) ya = -1000;
+    if (yb < -1000) yb = -1000;
+    if (ya > vh) ya = vh;
+    if (yb > vh) yb = vh;
+    /* keep VDP1's 11-bit coordinates: clip the top edge to x in [-512, 832]
+     * (|dy| <= 1168 and |dx| < 30512: the products fit in 32 bits) */
+    if (xa < -512)
+    {
+        ya += (yb - ya) * (-512 - xa) / (xb - xa);
+        xa = -512;
+    }
+    if (xb > 832)
+    {
+        yb = ya + (yb - ya) * (832 - xa) / (xb - xa);
+        xb = 832;
+    }
+
+    uint16_t m_cnt = saturn_cmd_m_count;
+    if (m_cnt >= CMDBUF_M_CAP - 1)
+        return -1;
+    saturn_cmd_m_count = m_cnt + 1;
+    aliased_uint32_t *c = (aliased_uint32_t *)&saturn_cmd_m[m_cnt];
+    uint32_t xa_p = (uint32_t)xa << 16, xb_p = (uint32_t)xb << 16;
+    c[0] = 0x00040000u;                         /* polygon */
+    c[1] = 0x00C00000u;                         /* PMOD ECD|SPD (no user clip), COLR 0 = transparent */
+    c[2] = 0;
+    c[3] = xa_p | (uint16_t)ya;                 /* A: floor line left  */
+    c[4] = xb_p | (uint16_t)yb;                 /* B: floor line right */
+    c[5] = xb_p | (uint16_t)vh;                 /* C: bottom right */
+    c[6] = xa_p | (uint16_t)vh;                 /* D: bottom left  */
+    c[7] = 0;
+    return span;
+}
+
+/* unbaked portal: world coords, projected here */
+static HW_NOINLINE HW_COLD_OS int HW_V2PlanePunchSeg(int x0, int y0, int seg_dx, int seg_dy, int dz)
+{
+    hw_trans_pillar_t a, b;
+    int obj_dx = x0 - hw_cam_x;
+    int obj_dy = y0 - hw_cam_y;
+
+    if (HW_CrossBackface(obj_dy, seg_dx, obj_dx, seg_dy) <= 0)
+        return -1;                              /* faces away */
+    HW_ProjectPortalEndpoint(&a, obj_dx, obj_dy);
+    HW_ProjectPortalEndpoint(&b, obj_dx + seg_dx, obj_dy + seg_dy);
+    return HW_V2PlanePunchProj(&a, &b, dz, 0);
+}
+
+/* baked seg: its pillars as the walk transformed them this frame; a pillar
+ * the walk did not transform belongs to a wall it already culled */
+static int HW_V2PlanePunchBaked(const saturn_wl_pillar_t *pil, const baked_seg_t *seg, int dz, int near_only)
+{
+    int i0 = seg->pillar_idx[0], i1 = seg->pillar_idx[1];
+    uint8_t gen = hw_cur_pil_gen;
+    const saturn_wl_pillar_t *p0 = &pil[i0], *p1 = &pil[i1];
+    int obj_dx = (int)p0->x - hw_cam_x, obj_dy = (int)p0->z - hw_cam_y;
+    int seg_dx = (int)p1->x - p0->x, seg_dy = (int)p1->z - p0->z;
+    if (HW_CrossBackface(obj_dy, seg_dx, obj_dx, seg_dy) <= 0)
+        return -1;                              /* faces away */
+    if (hw_pil_gen[i0] == gen && hw_pil_gen[i1] == gen)
+        return HW_V2PlanePunchProj(&local_trans_pillars[i0], &local_trans_pillars[i1], dz, near_only);
+    if (seg->flags)
+        return -1;                              /* a wall the walk culled */
+    /* a geometry-less seg the walk skips (flags 0): project it here */
+    hw_trans_pillar_t a, b;
+    HW_ProjectPortalEndpoint(&a, obj_dx, obj_dy);
+    HW_ProjectPortalEndpoint(&b, obj_dx + seg_dx, obj_dy + seg_dy);
+    return HW_V2PlanePunchProj(&a, &b, dz, near_only);
+}
+
+static void HW_V2PlaneAddSpan(int sp)
+{
+    if (sp == -1 || hw_v2p_n >= HW_V2P_SPANS)
+        return;
+    hw_v2p_lo[hw_v2p_n] = (int16_t)((int16_t)(sp >> 16) - HW_V2P_SPILL_PX);
+    hw_v2p_hi[hw_v2p_n] = (int16_t)((int16_t)sp + HW_V2P_SPILL_PX);
+    hw_v2p_n++;
+}
+
+/* Per-level candidate flags (built lazily on the first punch of a level):
+ * which segs can ever need a punch is fixed by the map and the plane's
+ * sector set. Baked seg flag 1 = portal into a non-plane sector (first
+ * entry of its pillar-pair group), 2 = one-sided wall with an endpoint
+ * within HW_V2P_NEAR_U map units of such a portal's endpoint (the
+ * far-strip spill; the screen-span test still applies per frame).
+ * Subsector flag: any candidate. Unbaked portal flag: 1 = punch. */
+#define HW_V2P_NEAR_U  160
+#define HW_V2P_ENDS    256
+static uint8_t    *hw_v2p_segf = NULL;      /* zone (level) memory, read only for flagged subsectors */
+static uint8_t    *hw_v2p_portf = NULL;     /* [HW_MAX_PORTAL_SEGS], same zone block */
+/* subsector has a candidate (fast RAM bitmap, tested inline by the body;
+ * subsectors past the bitmap always take the call) */
+static uint8_t     hw_v2p_subbits[(HW_MAX_SUBSECTORS + 7) / 8];
+static unsigned    hw_v2p_key_gen = 0xFFFFFFFFu;
+extern unsigned int saturn_level_gen;        /* g_game.c, ++ at every level load */
+
+#define HW_V2P_PLANE_SEC(s) (saturn_vdp2_plane_secmask[(unsigned)(s) & (SATURN_V2P_MAX_SECTORS - 1)])
+
+static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
+{
+    const int nseg = saturn_baked_wall_num_segs, nsub = saturn_baked_wall_num_subsectors;
+    if (hw_v2p_key_gen == saturn_level_gen)
+        return hw_v2p_segf != NULL;
+    hw_v2p_key_gen = saturn_level_gen;
+    D_memset(hw_v2p_subbits, 0, sizeof(hw_v2p_subbits));
+    /* one level block: seg flags | portal flags | endpoint scratch (static
+     * arrays would cost High WRAM BSS under the 0x060C0000 ceiling) */
+    const int seg_bytes = (nseg + 3) & ~3;
+    uint8_t *blk = (uint8_t *)Z_Malloc(seg_bytes + HW_MAX_PORTAL_SEGS + 4 * HW_V2P_ENDS, PU_LEVEL);
+    hw_v2p_segf = blk;
+    if (!blk)
+        return 0;
+    hw_v2p_portf = blk + seg_bytes;
+    D_memset(blk, 0, seg_bytes + HW_MAX_PORTAL_SEGS);
+    int16_t *ex = (int16_t *)(blk + seg_bytes + HW_MAX_PORTAL_SEGS);
+    int16_t *ey = ex + HW_V2P_ENDS;
+#define HW_V2P_MARK_SUB(s) do { if ((unsigned)(s) < HW_MAX_SUBSECTORS) \
+                                    hw_v2p_subbits[(s) >> 3] |= (uint8_t)(1u << ((s) & 7)); } while (0)
+
+    int ne = 0, overflow = 0;
+    for (int s = 0; s < nsub && s < numsubsectors; s++)
+    {
+        if (!HW_V2P_PLANE_SEC(subsectors[s].sector))
+            continue;
+        const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[s];
+        const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
+        int last_key = -1;
+        for (int i = 0; i < (int)ss->num_segs; i++)
+        {
+            const baked_seg_t *seg = &saturn_baked_wall_segs[ss->seg_start + i];
+            int bs = seg->back_sec_idx;
+            int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
+            if (bs < 0 || key == last_key || HW_V2P_PLANE_SEC(bs))
+                continue;
+            last_key = key;
+            hw_v2p_segf[ss->seg_start + i] = 1;
+            HW_V2P_MARK_SUB(s);
+            for (int e = 0; e < 2; e++)
+            {
+                if (ne >= HW_V2P_ENDS) { overflow = 1; break; }
+                ex[ne] = pil[seg->pillar_idx[e]].x;
+                ey[ne] = pil[seg->pillar_idx[e]].z;
+                ne++;
+            }
+        }
+        for (int i = 0; i < (int)ss->portal_count; i++)
+        {
+            int pi = ss->portal_first + i;
+            const hw_portal_seg_t *p = &HW_PORTAL_SEGS[pi];
+            if (pi >= HW_MAX_PORTAL_SEGS || p->back_sec_idx < 0 || HW_V2P_PLANE_SEC(p->back_sec_idx))
+                continue;
+            hw_v2p_portf[pi] = 1;
+            HW_V2P_MARK_SUB(s);
+            if (ne + 2 > HW_V2P_ENDS) { overflow = 1; continue; }
+            ex[ne] = p->x0;          ey[ne] = p->y0;          ne++;
+            ex[ne] = p->x0 + p->dx;  ey[ne] = p->y0 + p->dy;  ne++;
+        }
+    }
+    if (!ne)
+        return 1;
+    for (int s = 0; s < nsub && s < numsubsectors; s++)
+    {
+        if (!HW_V2P_PLANE_SEC(subsectors[s].sector))
+            continue;
+        const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[s];
+        const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
+        int last_key = -1;
+        for (int i = 0; i < (int)ss->num_segs; i++)
+        {
+            const baked_seg_t *seg = &saturn_baked_wall_segs[ss->seg_start + i];
+            int key = (seg->pillar_idx[0] << 8) | seg->pillar_idx[1];
+            if (seg->back_sec_idx >= 0 || key == last_key)
+                continue;
+            last_key = key;
+            int is_near = overflow;            /* endpoint list full: keep every wall */
+            for (int e = 0; e < 2 && !is_near; e++)
+            {
+                int x = pil[seg->pillar_idx[e]].x, y = pil[seg->pillar_idx[e]].z;
+                for (int k = 0; k < ne; k++)
+                {
+                    int dx = x - ex[k], dy = y - ey[k];
+                    if (dx < 0) dx = -dx;
+                    if (dy < 0) dy = -dy;
+                    if (dx <= HW_V2P_NEAR_U && dy <= HW_V2P_NEAR_U) { is_near = 1; break; }
+                }
+            }
+            if (is_near)
+            {
+                hw_v2p_segf[ss->seg_start + i] = 2;
+                HW_V2P_MARK_SUB(s);
+            }
+        }
+    }
+    return 1;
+}
+
+static HW_NOINLINE HW_COLD_OS void HW_V2PlanePunch(int subnum, const hw_sec_fast_t *sf)
+{
+    const int dz = sf->dz_floor;
+    if (dz >= 0 || !saturn_baked_walls_active || (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
+        return;                                 /* eye at/below the floor: plane not seen */
+    if (!hw_v2p_segf)
+        return;
+    const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[subnum];
+    const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
+    const baked_seg_t *seg0 = &saturn_baked_wall_segs[ss->seg_start];
+    const uint8_t *f0 = &hw_v2p_segf[ss->seg_start];
+    /* Far walls are drawn in coalesced strips that spill past a portal's
+     * screen edge into columns hidden by solid walls, and below those walls
+     * only the plane floor is left to hide them. So one-sided walls near a
+     * portal (flag 2) whose span comes within HW_V2P_SPILL_PX of a portal
+     * punched this frame (in this or an earlier-walked plane subsector) are
+     * punched below their floor line too (they lie above it and were drawn
+     * first: they stay intact). */
+    if (hw_v2p_frame != (unsigned)hw_render_frame)
+    {
+        hw_v2p_frame = (unsigned)hw_render_frame;
+        hw_v2p_n = 0;
+    }
+    int n2 = 0;
+    for (int i = 0; i < (int)ss->num_segs; i++)
+    {
+        if (f0[i] == 1)
+            HW_V2PlaneAddSpan(HW_V2PlanePunchBaked(pil, &seg0[i], dz, 0));
+        else if (f0[i] == 2)
+            n2++;
+    }
+    const hw_portal_seg_t *p = &HW_PORTAL_SEGS[ss->portal_first];
+    for (int i = 0; i < (int)ss->portal_count; i++, p++)
+        if (hw_v2p_portf[ss->portal_first + i])
+            HW_V2PlaneAddSpan(HW_V2PlanePunchSeg(p->x0, p->y0, p->dx, p->dy, dz));
+    if (!n2 || !hw_v2p_n)
+        return;
+    for (int i = 0; i < (int)ss->num_segs; i++)
+        if (f0[i] == 2)
+            HW_V2PlanePunchBaked(pil, &seg0[i], dz, 1);
+}
+
+/* Body-side gate: build the level's flags once, then call the punch only
+ * for subsectors that have a candidate. */
+HW_ALWAYS_INLINE int HW_V2PlaneWanted(int subnum)
+{
+    if (__builtin_expect(hw_v2p_key_gen != saturn_level_gen, 0))
+        HW_V2PlaneBuild();
+    if ((unsigned)subnum >= HW_MAX_SUBSECTORS)
+        return hw_v2p_segf != NULL;
+    return (hw_v2p_subbits[subnum >> 3] >> (subnum & 7)) & 1;
+}
+#endif
+
 static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const hw_sec_fast_t *sf)
 {
     if (!saturn_baked_walls_active || (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
@@ -3057,7 +4150,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
     hw_wctx.ytop_min     = 0;
     hw_wctx.ybot_max     = (int16_t)HW_VIEW_H;
 
+#if HW_ASM_WALK
+    hw_asm_walk(seg, seg_end, pillars, hw_asm_walk_ctx);
+#else
     HW_WalkSubsectorBakedSegs(seg, seg_end, pillars);
+#endif
 #if HW_PROF_SUBTIMERS
     unsigned short tw1 = SAT_FRT();
     hw_prof_wseg_acc += HW_ProfDelta(tw0, tw1);
@@ -3082,25 +4179,12 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
     hw_prof_segs_acc += HW_ProfDelta(tw0, SAT_FRT());
     return 1;
 }
+#endif /* !HW_ASM_SUBBODY */
 
 #if HW_DEFER_WALLS
-/* Emit one deferred subsector: its walls, then its sprites, into a fresh
- * m range. The solid mask must already be the subsector's (snapshot
- * restored, or the live mask when emitted straight from pass 1). */
-static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredSub(const hw_wall_sub_t *h)
+/* One recorded wall -> hw_wctx -> quads (both CPUs' pass 2). */
+HW_ALWAYS_INLINE void HW_EmitDeferredRec(hw_wall_emit_ctx_t *ctx, const hw_wall_rec_t *r)
 {
-    hw_wall_emit_ctx_t *ctx = &hw_wctx;
-    uint16_t m_start = saturn_cmd_m_count;
-
-    hw_wall_light_delta = h->light_delta;
-    ctx->sub_m_start  = m_start;
-    ctx->last_clip_x0 = -1;
-    ctx->last_clip_x1 = -1;
-
-    const hw_wall_rec_t *r  = &hw_defer_rec[h->rec_first];
-    const hw_wall_rec_t *re = r + h->rec_count;
-    for (; r < re; r++)
-    {
         ctx->p0               = &r->p0;
         ctx->p1               = &r->p1;
         ctx->dz_top           = r->dz_top;
@@ -3124,7 +4208,26 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredSub(const hw_wall_sub_t *h)
         ctx->occl_state       = r->occl_state;
         ctx->seg              = r->seg;
         HW_EmitWallFromCtx(ctx, r->seg);
-    }
+}
+
+#ifndef HW_SLAVE_TU
+/* Emit one deferred subsector: its walls, then its sprites, into a fresh
+ * m range. The solid mask must already be the subsector's (snapshot
+ * restored, or the live mask when emitted straight from pass 1). */
+static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredSub(const hw_wall_sub_t *h)
+{
+    hw_wall_emit_ctx_t *ctx = &hw_wctx;
+    uint16_t m_start = saturn_cmd_m_count;
+
+    hw_wall_light_delta = h->light_delta;
+    ctx->sub_m_start  = m_start;
+    ctx->last_clip_x0 = -1;
+    ctx->last_clip_x1 = -1;
+
+    const hw_wall_rec_t *r  = &hw_defer_rec[h->rec_first];
+    const hw_wall_rec_t *re = r + h->rec_count;
+    for (; r < re; r++)
+        HW_EmitDeferredRec(ctx, r);
     if (ctx->last_clip_x0 != -1)
     {
         HW_EmitUserClip(0, 0, HW_VIEW_W - 1, HW_VIEW_H - 1);
@@ -3155,6 +4258,115 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredSub(const hw_wall_sub_t *h)
     ranges[h->visit_idx].m_count = (uint16_t)(saturn_cmd_m_count - m_start);
 #endif
 }
+
+/* Restore item i's occlusion state and emit it (master). */
+static void HW_EmitDeferredIdx(int i)
+{
+    const hw_wall_sub_t *h = &hw_defer_sub[i];
+    if (h->snap >= 0)
+    {
+        const hw_solid_snap_t *sn = &hw_defer_snap[h->snap];
+        for (int w = 0; w < HW_SOLID_WORDS; w++)
+            hw_solid_mask[w] = sn->mask[w];
+        hw_solid_summary = sn->summary;
+        hw_solid_any     = sn->any;
+        hw_solid_count   = sn->count;
+    }
+    else
+    {
+        hw_solid_count = 0;     /* no occlusion test needed / nothing solid yet */
+    }
+    HW_EmitDeferredSub(h);
+}
+
+/* Emit items [lo, hi), keeping the live occlusion state (the walk's). */
+static void HW_EmitDeferredRange(int lo, int hi)
+{
+    if (lo >= hi)
+        return;
+    uint32_t live_mask[HW_SOLID_WORDS];
+    int      live_count   = hw_solid_count;
+    uint32_t live_summary = hw_solid_summary;
+    uint32_t live_any     = hw_solid_any;
+    for (int w = 0; w < HW_SOLID_WORDS; w++)
+        live_mask[w] = hw_solid_mask[w];
+    for (int i = lo; i < hi; i++)
+        HW_EmitDeferredIdx(i);
+    for (int w = 0; w < HW_SOLID_WORDS; w++)
+        hw_solid_mask[w] = live_mask[w];
+    hw_solid_summary = live_summary;
+    hw_solid_any     = live_any;
+    hw_solid_count   = live_count;
+}
+
+#if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
+/* ---- pass 2 shared with the slave (master side) ---- */
+static int hw_sw_on    = 0;     /* the slave takes deferred walls this frame */
+static int hw_sw_m_low = 0;     /* lowest item the master emitted from the back */
+extern unsigned char saturn_slave_enabled;
+#define HW_WALL_IPC() (&((volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED)->walls)
+
+/* Frame start, before the walk (hw_cur_sub_ranges already set). */
+static void HW_SlaveWalls_BeginFrame(int enabled)
+{
+    saturn_cmd_sw_count = 0;
+    hw_sw_on = enabled;
+    if (!enabled)
+        return;
+    volatile hw_wall_ipc_t *w = HW_WALL_IPC();
+    w->ready     = 0;
+    w->walk_done = 0;
+    w->m_claim   = 0x7FFF;
+    w->s_claim   = -1;
+    w->s_done    = 0;
+    w->s_stopped = 0;
+    w->s_cmds    = 0;
+    w->s_quads   = 0;
+    w->s_strips  = 0;
+    w->s_miss    = 0;
+    w->s_subs    = 0;
+    w->subs   = (uint32_t)(uintptr_t)hw_defer_sub;
+    w->recs   = (uint32_t)(uintptr_t)hw_defer_rec;
+    w->snaps  = (uint32_t)(uintptr_t)hw_defer_snap;
+    w->ranges = (uint32_t)(uintptr_t)hw_cur_sub_ranges;
+    w->cmd_m  = (uint32_t)(uintptr_t)saturn_cmd_m;
+    w->gen    = (int16_t)(w->gen + 1);  /* last: the slave starts on this */
+    int dummy = w->gen;
+    (void)dummy;
+    __asm__ volatile("" ::: "memory");
+}
+
+/* After the slave's flat queue drained, before Saturn_CmdBuf_CullOccluded:
+ * wait for the slave to stop taking walls, emit what neither CPU took. */
+static void HW_SlaveWalls_Finish(void)
+{
+    if (!hw_sw_on)
+        return;
+    volatile hw_wall_ipc_t *w = HW_WALL_IPC();
+    int guard = 1000000;    /* x 64 cycles, like the flat wait */
+    while (!w->s_stopped && saturn_slave_enabled && --guard > 0)
+        HW_BUS_YIELD();
+    int s_done = w->s_done;
+    if (!w->s_stopped)
+    {
+        /* slave gone (timeout): take everything it hadn't finished */
+        saturn_hw_slave_timeout++;
+        if (s_done < 0) s_done = 0;
+    }
+    HW_EmitDeferredRange(s_done, hw_sw_m_low);
+    saturn_cmd_sw_count    = (uint16_t)(w->s_stopped ? w->s_cmds : 0);
+    saturn_hw_wall_quads  += (unsigned int)w->s_quads;
+    saturn_hw_wall_strips += (unsigned int)w->s_strips;
+    saturn_hw_tex_miss    += (unsigned int)w->s_miss;
+    hw_sw_on = 0;
+    hw_defer_nsub = 0;
+    hw_defer_nrec = 0;
+    hw_defer_nsnap = 0;
+}
+#else
+static void HW_SlaveWalls_BeginFrame(int enabled) { (void)enabled; }
+static void HW_SlaveWalls_Finish(void) { }
+#endif
 
 /* Pass 1, end of a subsector that recorded (rec_first.. = its records):
  * queue it for pass 2, or emit it right now if it needs an occlusion
@@ -3191,52 +4403,244 @@ static void HW_DeferCloseSub(int visit_idx, int subnum, int rec_first,
         h->snap = (int16_t)hw_defer_nsnap++;
     }
     hw_defer_nsub++;
+#if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
+    if (hw_sw_on)
+    {
+        /* Mark the visit's m range pending: pass 2 (slave, or master in
+         * Finish) rewrites it with the real walls+sprites range. Until then
+         * HW_StealPick (HW_FLAT_STEAL) must not take it as an empty m range
+         * for a stolen floor job, or one side's write would drop the
+         * other's quads. */
+        ((volatile sub_range_t *)((uint32_t)hw_cur_sub_ranges | SATURN_WRAM_H_UNCACHED))[visit_idx].m_count = HW_RANGE_PENDING;
+        HW_WALL_IPC()->ready = hw_defer_nsub;   /* records + header written above */
+    }
+#endif
 }
 
 /* Pass 2: emit every queued subsector in visit order. */
 static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredWalls(void)
 {
+#ifdef HW_DEFER_SKIP_EMIT   /* measurement only: pass 2 costs the master nothing (walls missing) */
+    int nsub = 0;
+#else
     int nsub = hw_defer_nsub;
-    if (nsub > 0)
+#endif
+#if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
+    if (hw_sw_on)
     {
-        uint32_t live_mask[HW_SOLID_WORDS];
-        int      live_count   = hw_solid_count;
-        uint32_t live_summary = hw_solid_summary;
-        uint32_t live_any     = hw_solid_any;
-        for (int w = 0; w < HW_SOLID_WORDS; w++)
-            live_mask[w] = hw_solid_mask[w];
-
-        for (int i = 0; i < nsub; i++)
+        /* The slave has been taking items from the front since the walk
+         * began; take them from the back until we meet it. What's left
+         * between us is emitted by HW_SlaveWalls_Finish. */
+        volatile hw_wall_ipc_t *w = HW_WALL_IPC();
+        w->ready     = nsub;
+        w->walk_done = 1;
+        int i = nsub - 1;
+        if (nsub > 0)
         {
-            const hw_wall_sub_t *h = &hw_defer_sub[i];
-            if (h->snap >= 0)
+            uint32_t live_mask[HW_SOLID_WORDS];
+            int      live_count   = hw_solid_count;
+            uint32_t live_summary = hw_solid_summary;
+            uint32_t live_any     = hw_solid_any;
+            for (int k = 0; k < HW_SOLID_WORDS; k++)
+                live_mask[k] = hw_solid_mask[k];
+            for (; i >= 0; i--)
             {
-                const hw_solid_snap_t *sn = &hw_defer_snap[h->snap];
-                for (int w = 0; w < HW_SOLID_WORDS; w++)
-                    hw_solid_mask[w] = sn->mask[w];
-                hw_solid_summary = sn->summary;
-                hw_solid_any     = sn->any;
-                hw_solid_count   = sn->count;
+                w->m_claim = i;
+                int rb = w->m_claim;            /* the claim is on the bus before we look */
+                (void)rb;
+                __asm__ volatile("" ::: "memory");
+                if (w->s_claim >= i)
+                    break;
+                HW_EmitDeferredIdx(i);
             }
-            else
-            {
-                hw_solid_count = 0;     /* no occlusion test needed / nothing solid yet */
-            }
-            HW_EmitDeferredSub(h);
+            for (int k = 0; k < HW_SOLID_WORDS; k++)
+                hw_solid_mask[k] = live_mask[k];
+            hw_solid_summary = live_summary;
+            hw_solid_any     = live_any;
+            hw_solid_count   = live_count;
         }
-
-        for (int w = 0; w < HW_SOLID_WORDS; w++)
-            hw_solid_mask[w] = live_mask[w];
-        hw_solid_summary = live_summary;
-        hw_solid_any     = live_any;
-        hw_solid_count   = live_count;
+        hw_sw_m_low = i + 1;
+        return;                 /* the queue stays valid until Finish */
     }
+#endif
+    HW_EmitDeferredRange(0, nsub);
     hw_defer_nsub = 0;
     hw_defer_nrec = 0;
     hw_defer_nsnap = 0;
 }
+#endif /* !HW_SLAVE_TU */
+
+#if defined(HW_SLAVE_TU) && !defined(SATURN_WIN32)
+/* ---- pass 2 shared with the master (slave side, saturn_hw_slave_walls.c).
+ * Everything the master writes during the walk (queue headers, records,
+ * snapshots, the pass-1 sprite quads, ranges) is read cache-through. */
+static int hw_sw_gen    = 0x7FFFFFFF;  /* last frame generation seen (never a 16-bit value) */
+static int hw_sw_next   = 0;           /* next item from the front */
+static int hw_sw_active = 0;           /* still taking items this frame */
+static hw_wall_rec_t   hw_sw_rec;      /* private copies (not on the small stack) */
+static hw_wall_sub_t   hw_sw_sub;
+static hw_solid_snap_t hw_sw_snap;
+
+/* SH-2 cache-through alias (bit 29), valid for High and Low WRAM alike;
+ * SATURN_WRAM_H_UNCACHED (0x26000000) is right for High WRAM only. */
+#define HW_SW_THRU 0x20000000u
+
+static void HW_SW_Read32(void *dst, uint32_t src, int bytes)
+{
+    const volatile uint32_t *s = (const volatile uint32_t *)(src | HW_SW_THRU);
+    uint32_t *d = (uint32_t *)dst;
+    for (bytes >>= 2; bytes > 0; bytes--)
+        *d++ = *s++;
+}
+
+static void HW_SW_Read16(void *dst, uint32_t src, int bytes)
+{
+    const volatile uint16_t *s = (const volatile uint16_t *)(src | HW_SW_THRU);
+    uint16_t *d = (uint16_t *)dst;
+    for (bytes >>= 1; bytes > 0; bytes--)
+        *d++ = *s++;
+}
+
+static HW_NOINLINE HW_HOT_O2 void HW_SlaveEmitSub(volatile hw_wall_ipc_t *w, int j)
+{
+    hw_wall_emit_ctx_t *ctx = &hw_wctx;
+    hw_wall_sub_t *h = &hw_sw_sub;
+    HW_SW_Read16(h, w->subs + (uint32_t)j * sizeof(hw_wall_sub_t), (int)sizeof(hw_wall_sub_t));
+    if (h->snap >= 0)
+    {
+        HW_SW_Read32(&hw_sw_snap, w->snaps + (uint32_t)h->snap * sizeof(hw_solid_snap_t),
+                     (int)sizeof(hw_solid_snap_t));
+        for (int k = 0; k < HW_SOLID_WORDS; k++)
+            hw_solid_mask[k] = hw_sw_snap.mask[k];
+        hw_solid_summary = hw_sw_snap.summary;
+        hw_solid_any     = hw_sw_snap.any;
+        hw_solid_count   = hw_sw_snap.count;
+    }
+    else
+    {
+        hw_solid_count = 0;
+    }
+
+    const uint16_t m_start = saturn_cmd_m_count;    /* this CPU's region */
+    hw_wall_light_delta = h->light_delta;
+    ctx->sub_m_start  = m_start;
+    ctx->last_clip_x0 = -1;
+    ctx->last_clip_x1 = -1;
+    uint32_t rsrc = w->recs + (uint32_t)h->rec_first * sizeof(hw_wall_rec_t);
+    for (int k = 0; k < (int)h->rec_count; k++, rsrc += sizeof(hw_wall_rec_t))
+    {
+        HW_SW_Read32(&hw_sw_rec, rsrc, (int)sizeof(hw_wall_rec_t));
+        HW_EmitDeferredRec(ctx, &hw_sw_rec);
+    }
+    if (ctx->last_clip_x0 != -1)
+    {
+        HW_EmitUserClip(0, 0, HW_VIEW_W - 1, HW_VIEW_H - 1);
+        ctx->last_clip_x0 = -1;
+        ctx->last_clip_x1 = -1;
+    }
+    if (h->spr_count)
+    {
+        uint32_t dst = saturn_cmd_m_count;
+        if (dst + h->spr_count <= CMDBUF_M_CAP)
+        {
+            HW_SW_Read32(&saturn_cmd_m[dst], w->cmd_m + (uint32_t)h->spr_start * sizeof(vdp1_cmd_t),
+                         (int)h->spr_count * (int)sizeof(vdp1_cmd_t));
+            saturn_cmd_m_count = (uint16_t)(dst + h->spr_count);
+        }
+    }
+
+    /* Saturn_CmdBuf_CullOccluded trims only the master's quads: trim ours */
+    if (HW_VIEW_W <= 320 && HW_VIEW_H <= 168)
+    {
+        uint32_t *c32 = (uint32_t *)&saturn_cmd_m[m_start];
+        uint32_t *c_end = (uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+        for (; c32 != c_end; c32 += 8)
+        {
+            if (((c32[0] >> 16) & 0x802Fu) != 0x0002u)
+                continue;
+            int yLt = (int16_t)c32[3], yRt = (int16_t)c32[4];
+            int yRb = (int16_t)c32[5], yLb = (int16_t)c32[6];
+            if ((yLt < -8 && yRt < -8) || (yLb > 168 + 8 && yRb > 168 + 8))
+                Saturn_CmdBuf_TrimWallY(c32);
+        }
+    }
+
+    sub_range_t *ranges = (sub_range_t *)(uintptr_t)w->ranges;     /* cache-through alias */
+    ((volatile uint32_t *)&ranges[h->visit_idx])[0] =
+        ((uint32_t)(HW_SW_M_BASE + m_start) << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
+}
+
+/* Slave idle loop (HW_Slave_FlatWorker_Loop): 1 = emitted one item. */
+int HW_SlaveWallsService(void)
+{
+    volatile hw_wall_ipc_t *w = &((volatile hw_slave_ipc_t *)HW_SLAVE_BASE_UNCACHED)->walls;
+    /* While active the generation can't change (the master waits for
+     * s_stopped before its next frame), so an active idle spin costs one
+     * bus read (ready); gen is polled only between frames. */
+    if (!hw_sw_active)
+    {
+        int g = w->gen;
+        if (g == hw_sw_gen)
+            return 0;
+
+        /* new frame: drop every cached line (view size, translations,
+         * texture tags may all have changed), reset this CPU's region */
+        hw_sw_gen    = g;
+        hw_sw_next   = 0;
+        hw_sw_active = 1;
+        HW_PURGE_L1_CACHE();
+        saturn_cmd_m        = (vdp1_cmd_t *)(uintptr_t)w->cmd_m + HW_SW_M_BASE;
+        saturn_cmd_m_count  = 0;
+        saturn_hw_wall_quads  = 0;
+        saturn_hw_wall_strips = 0;
+        saturn_hw_tex_miss    = 0;
+        saturn_v1w_cells    = 0;
+        saturn_v1w_drop     = 0;
+        saturn_v1w_captured = 0;
+        hw_wctx.cur_tex_id  = -1;
+    }
+    int j = hw_sw_next;
+    if (j >= w->ready)
+    {
+        if (!w->walk_done)
+            return 0;           /* walk still running: wait for more */
+        if (j >= w->ready)
+            goto stop;          /* queue complete (ready is final once walk_done) */
+    }
+    if (saturn_cmd_m_count > CMDBUF_M_CAP - 128)
+        goto stop;              /* region nearly full: the master takes the rest */
+    w->s_claim = j;
+    {
+        int rb = w->s_claim;    /* the claim is on the bus before we look */
+        (void)rb;
+        __asm__ volatile("" ::: "memory");
+    }
+    if (w->m_claim <= j)
+        goto stop;              /* met the master */
+    HW_SlaveEmitSub(w, j);
+    hw_sw_next = j + 1;
+    w->s_done  = j + 1;
+    return 1;
+stop:
+    w->s_done   = j;
+    w->s_cmds   = saturn_cmd_m_count;
+    w->s_quads  = (int)saturn_hw_wall_quads;
+    w->s_strips = (int)saturn_hw_wall_strips;
+    w->s_miss   = (int)saturn_hw_tex_miss;
+    w->s_subs   = j;
+    w->s_stopped = 1;
+    {
+        int rb = w->s_stopped;
+        (void)rb;
+    }
+    hw_sw_active = 0;
+    return 0;
+}
+#endif /* HW_SLAVE_TU */
 #else
 static void HW_EmitDeferredWalls(void) { }
+static void HW_SlaveWalls_BeginFrame(int enabled) { (void)enabled; }
+static void HW_SlaveWalls_Finish(void) { }
 #endif
 
 static HW_NOINLINE HW_COLD_OS int HW_CheckNearSubsectorFrustum(const saturn_flat_bbox_t *fb)
@@ -3262,7 +4666,7 @@ static HW_NOINLINE HW_COLD_OS int HW_CheckNearSubsectorFrustum(const saturn_flat
 
 static const hw_sec_fast_t *hw_psec_fast = NULL;
 
-static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
+static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) int HW_EvalSubsectorFlatAperture(
     hw_sec_fast_t *sf, uint32_t flags, int s_max, int s_min)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
@@ -3405,12 +4809,29 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorFlatAperture(
             : HW_ProjY(dzf, (dzf <= 0) ? s_max : s_min, vcy);
         if (sub_y_max + pad <= ytop_min)
             return -1;
-        if (!is_sky)
+        /* Height-aware (2026-11-20): sky sectors too. Their walls and
+         * things still end at the ceiling height; the sky above it is the
+         * VDP2 back layer, drawn whether or not this subsector is. Without
+         * this, outdoor areas seen over a low wall (E1M8, E1M1 courtyard)
+         * were walked and drawn although hidden below the window. */
         {
-            int sub_y_min = (dzc > 0)
+            /* sky: the ceiling is not drawn, so the top of what can be
+             * drawn is the content top (saturn_hw_sky.c HW_BuildSecContentTop) */
+            fixed_t dzt = dzc;
+            int pad_t = pad;
+            if (is_sky && hw_sec_dz_top)
+            {
+                dzt = hw_sec_dz_top[sf - hw_sec_fast];
+                /* open sector, floor above the eye, nothing higher: nothing
+                 * in it can be seen (floors only show from above) */
+                if (dzt == sf->dz_floor && dzt > 0 && sf->dz_ceil > sf->dz_floor)
+                    return -1;
+                pad_t = 0;      /* exact map heights (lower-wall tops) */
+            }
+            int sub_y_min = (dzc > 0 && !is_sky)
                 ? yc_min
-                : HW_ProjY(dzc, (dzc >= 0) ? s_max : s_min, vcy);
-            if (sub_y_min - pad >= ybot_max)
+                : HW_ProjY(dzt, (dzt >= 0) ? s_max : s_min, vcy);
+            if (sub_y_min - pad_t >= ybot_max)
                 return -1;
         }
     }
@@ -3462,8 +4883,204 @@ static HW_NOINLINE HW_COLD_OS int HW_CheckPortalSubsectorStepCull(
     return 1;
 }
 
-/* Walk a subsector: returns flat_flags = (fully_inside & 3) | ((allow_floor | (allow_ceil << 1) | use_lod1) << 2), or -1 if culled */
-static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int fully_inside)
+/* Compact rewrite stage D1: the whole HW_CheckSubsectorAperture (front
+ * half hw_asm_subap + tail + HW_EvalSubsectorFlatAperture) in
+ * saturn_hw_asm.s (hw_asm_subsec). */
+#ifndef HW_ASM_SUBSEC
+#define HW_ASM_SUBSEC (HW_ASM && HW_DBG_FLAT_LOD && !HW_ASM_SUBAP)
+#endif
+#if HW_ASM_SUBAP || HW_ASM_SUBSEC
+/* Front half in saturn_hw_asm.s (hw_asm_subap); layout documented there. */
+typedef struct {
+    int32_t max_cz, s_max, s_min, ytop_min, ybot_max, sx, ex, flags;
+} hw_subap_out_t;
+extern int hw_asm_subap(const saturn_flat_bbox_t *fb, int fully_inside,
+                        hw_subap_out_t *o, const void *const *ctx);
+_Static_assert(offsetof(hw_frust_t, Nx) == 12 && offsetof(hw_frust_t, Ny) == 14 &&
+               offsetof(hw_frust_t, cz_off12) == 36 && offsetof(hw_frust_t, cx_off12) == 40,
+               "hw_asm_subap hw_frust offsets");
+_Static_assert(offsetof(hw_aperture_state_t, aperture_active) == 2 &&
+               offsetof(hw_aperture_state_t, cur_ytop_min) == 20, "hw_asm_subap ap offsets");
+#ifndef HW_LOD1_MIN_A   /* same defaults as in HW_CheckSubsectorAperture_C */
+#define HW_LOD1_MIN_A 192
+#define HW_LOD1_MAX_A 240
+#define HW_LOD1_MIN_B 132
+#define HW_LOD1_MAX_B 336
+#endif
+_Static_assert(HW_NEAR_Z_UNITS == 4 && HW_FAR_Z_UNITS == 16384 && HW_VIEW_CX == 160 &&
+               HW_DBG_FLAT_LOD && HW_LOD1_MIN_A == 192 && HW_LOD1_MAX_A == 240 &&
+               HW_LOD1_MIN_B == 132 && HW_LOD1_MAX_B == 336,
+               "hw_asm_subap constants");
+static const void *const hw_asm_subap_ctx[11] = {
+    &hw_cam_x, &hw_cam_y, &hw_frust, saturn_master_oclut, &hw_solid_count,
+    &hw_aperture_state, hw_solid_mask, hw_mask_left, hw_mask_right,
+    hw_ap_words, &saturn_view_h
+};
+
+#if HW_ASM_SUBAP
+static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture_A(int subnum, hw_sec_fast_t *sf, int fully_inside)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    const saturn_flat_bbox_t *fb = saturn_baked_flat_bboxes ? &saturn_baked_flat_bboxes[subnum] : NULL;
+    hw_subap_out_t o;
+    int r = hw_asm_subap(fb, fully_inside, &o, hw_asm_subap_ctx);
+    if (r <= 0)
+    {
+        if (r < 0)
+            return -1;
+        int vh = HW_VIEW_H;
+        ap->cur_sub_yt_attach = 0;
+        ap->cur_sub_yb_attach = (int16_t)vh;
+        ap->cur_sub_ytop      = 0;
+        ap->cur_sub_ybot      = (uint8_t)vh;
+        return fully_inside | (int)HW_FLAT_ALLOW_BOTH;
+    }
+    if (__builtin_expect(r >= 2, 0))
+    {
+        if (r == 2)
+        {
+            if (!HW_CheckNearSubsectorFrustum(fb))
+                return -1;
+        }
+        else
+        {
+            int ap_pack = HW_EvalSubsectorSpanSlow(o.sx, o.ex);
+            if (ap_pack < 0)
+                return -1;
+            o.ytop_min = ap_pack >> 16;
+            o.ybot_max = (int16_t)ap_pack;
+        }
+    }
+    int ytop_min = o.ytop_min;
+    int ybot_max = o.ybot_max;
+    int s_max = o.s_max;
+    int s_min = o.s_min;
+    int any_behind = (o.flags >> 8) & 1;
+    uint32_t keep = (uint32_t)o.flags & (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK);
+
+    /* == the tail of HW_CheckSubsectorAperture_C below */
+    int vh = HW_VIEW_H;
+    ap->cur_sub_yt_attach = 0;
+    ap->cur_sub_yb_attach = (int16_t)vh;
+    ap->cur_sub_ytop      = 0;
+    ap->cur_sub_ybot      = (uint8_t)vh;
+    ap->cur_ytop_min      = (int16_t)ytop_min;
+    ap->cur_ybot_max      = (int16_t)ybot_max;
+    int check_ap = 0;
+    if (ytop_min > 0 || ybot_max < vh)
+    {
+        int pad = (s_max < 8192) ? 1 : 2;
+        check_ap = 1;
+        ap->cur_sub_ytop = (ytop_min > pad) ? (uint8_t)(ytop_min - pad) : 0;
+        ap->cur_sub_ybot = (ybot_max + pad < vh) ? (uint8_t)(ybot_max + pad) : (uint8_t)vh;
+    }
+
+    int near_or_psec = (any_behind || sf == hw_psec_fast);
+    if (__builtin_expect((check_ap || near_or_psec) && !s_min, 0))
+        s_min = HW_FastDiv(o.max_cz);
+
+    uint32_t packed = (near_or_psec ? HW_FLAT_NEAR_OR_PSEC : 0u) |
+                      (check_ap     ? HW_FLAT_CHECK_AP     : 0u) | keep;
+    int flat_flags = HW_EvalSubsectorFlatAperture(sf, packed, s_max, s_min);
+    if (__builtin_expect(flat_flags >= 0 && check_ap && !near_or_psec &&
+                         !(flat_flags & (int)HW_FLAT_ALLOW_FLOOR) &&
+                         (sf->is_sky || !(flat_flags & (int)HW_FLAT_ALLOW_CEIL)), 0))
+    {
+        if (HW_CheckPortalSubsectorStepCull(subnum, sf, s_min))
+            return -1;
+    }
+    return flat_flags;
+}
+
+#if HW_ASM_CHECK
+/* Check build: C reference first, then asm (the shared flat/attach updates
+ * are monotone, so the second call sees the same inputs). [0] calls,
+ * [1] mismatches, [2..5] first mismatch subnum, C result, asm result,
+ * aperture-header diff. */
+static int HW_CheckSubsectorAperture_C(int subnum, hw_sec_fast_t *sf, int fully_inside);
+static volatile uint32_t hw_asm_chk_subap[8];
+static HW_NOINLINE int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int fully_inside)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    int c = HW_CheckSubsectorAperture_C(subnum, sf, fully_inside);
+    uint32_t h0[6];
+    memcpy(h0, ap, 24);
+    int a = HW_CheckSubsectorAperture_A(subnum, sf, fully_inside);
+    uint32_t h1[6];
+    memcpy(h1, ap, 24);
+    /* cur_sub_ytop/ybot (+0,+1), attaches (+4..7), cur_ytop_min/ybot_max (+20..23) */
+    uint32_t hd = (c >= 0) ? (((h0[0] ^ h1[0]) & 0xFFFF0000u) | (h0[1] ^ h1[1]) | (h0[5] ^ h1[5])) : 0;
+    hw_asm_chk_subap[0]++;
+    if ((a != c || hd) && hw_asm_chk_subap[1]++ == 0)
+    {
+        hw_asm_chk_subap[2] = (uint32_t)subnum;
+        hw_asm_chk_subap[3] = (uint32_t)c;
+        hw_asm_chk_subap[4] = (uint32_t)a;
+        hw_asm_chk_subap[5] = hd;
+    }
+    return a;
+}
+#else
+#define HW_CheckSubsectorAperture HW_CheckSubsectorAperture_A
+#endif
+#endif /* HW_ASM_SUBAP (_A) */
+#endif /* HW_ASM_SUBAP || HW_ASM_SUBSEC */
+
+#if HW_ASM_SUBSEC
+extern int hw_asm_subsec(int subnum, hw_sec_fast_t *sf, int fully_inside);
+_Static_assert(sizeof(saturn_flat_bbox_t) == 8 && offsetof(hw_sec_fast_t, is_sky) == 12 &&
+               offsetof(hw_aperture_state_t, cur_ybot_max) == 22 &&
+               HW_FLAT_CHECK_AP == 0x100 && HW_FLAT_NEAR_OR_PSEC == 0x200 &&
+               (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK) == 0x13 && HW_FLAT_ALLOW_BOTH == 12,
+               "hw_asm_subsec: layout");
+const void *const hw_asm_subsec_ctx[12] = {
+    &saturn_baked_flat_bboxes, &hw_aperture_state, &saturn_view_h, &saturn_view_cy,
+    hw_asm_subap_ctx, &hw_psec_fast, saturn_master_oclut,
+    (const void *)HW_CheckNearSubsectorFrustum, (const void *)HW_EvalSubsectorSpanSlow,
+    (const void *)HW_CheckPortalSubsectorStepCull,
+    hw_sec_fast, &hw_sec_dz_top                     /* [40] [44] sky content top */
+};
+#if HW_ASM_CHECK
+/* [0] calls [1] mismatches [2] subnum [3] C result [4] asm result
+ * [5] 1 = aperture header differs, 2 = sector entry differs */
+static int HW_CheckSubsectorAperture_C(int subnum, hw_sec_fast_t *sf, int fully_inside);
+static volatile uint32_t hw_asm_chk_subsec[8];
+static HW_NOINLINE int HW_CheckSubsectorAperture(int subnum, hw_sec_fast_t *sf, int fully_inside)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    uint8_t a0[24], a1[24];
+    hw_sec_fast_t s0 = *sf, s1;
+    memcpy(a0, ap, 24);
+    int a = hw_asm_subsec(subnum, sf, fully_inside);
+    memcpy(a1, ap, 24);
+    s1 = *sf;
+    memcpy(ap, a0, 24);
+    *sf = s0;
+    int c = HW_CheckSubsectorAperture_C(subnum, sf, fully_inside);
+    uint32_t hd = (memcmp(a1, ap, 24) != 0 ? 1u : 0u) | (memcmp(&s1, sf, sizeof(s1)) != 0 ? 2u : 0u);
+    hw_asm_chk_subsec[0]++;
+    if ((a != c || hd) && hw_asm_chk_subsec[1]++ == 0)
+    {
+        hw_asm_chk_subsec[2] = (uint32_t)subnum;
+        hw_asm_chk_subsec[3] = (uint32_t)c;
+        hw_asm_chk_subsec[4] = (uint32_t)a;
+        hw_asm_chk_subsec[5] = hd;
+    }
+    return c;
+}
+#else
+#define HW_CheckSubsectorAperture hw_asm_subsec
+#endif
+#endif /* HW_ASM_SUBSEC */
+
+#if HW_ASM_SUBAP || HW_ASM_SUBSEC
+#define HW_SUBAP_C_NAME HW_CheckSubsectorAperture_C
+#else
+#define HW_SUBAP_C_NAME HW_CheckSubsectorAperture
+#endif
+
+#if !(HW_ASM_SUBAP || HW_ASM_SUBSEC) || HW_ASM_CHECK/* Walk a subsector: returns flat_flags = (fully_inside & 3) | ((allow_floor | (allow_ceil << 1) | use_lod1) << 2), or -1 if culled */
+static HW_NOINLINE HW_HOT_O2 int HW_SUBAP_C_NAME(int subnum, hw_sec_fast_t *sf, int fully_inside)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     int default_flags = fully_inside | (int)HW_FLAT_ALLOW_BOTH;
@@ -3544,10 +5161,10 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fa
      * for the 2026-11-16 E1M8 experiment (the slave transforms ~4000 LOD0
      * flat vertices/frame in the arena). */
 #ifndef HW_LOD1_MIN_A
-#define HW_LOD1_MIN_A 256
-#define HW_LOD1_MAX_A 320
-#define HW_LOD1_MIN_B 176
-#define HW_LOD1_MAX_B 448
+#define HW_LOD1_MIN_A 192    /* x0.75 of the 11-16 values (2026-11-17 LOD sweep) */
+#define HW_LOD1_MAX_A 240
+#define HW_LOD1_MIN_B 132
+#define HW_LOD1_MAX_B 336
 #endif
     int use_lod1 = ((true_min_cz >= (HW_LOD1_MIN_A << FRACBITS) && max_cz >= (HW_LOD1_MAX_A << FRACBITS)) ||
                     (true_min_cz >= (HW_LOD1_MIN_B << FRACBITS) && max_cz >= (HW_LOD1_MAX_B << FRACBITS)))
@@ -3682,4 +5299,5 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture(int subnum, hw_sec_fa
     }
     return flat_flags;
 }
+#endif /* !HW_ASM_SUBAP || HW_ASM_CHECK */
 

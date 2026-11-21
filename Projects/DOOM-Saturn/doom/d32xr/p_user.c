@@ -800,22 +800,6 @@ void P_ResetResp(player_t* p)
 	for (j = 0; j < NUMAMMO; j++)
 		resp->maxammo[j] = maxammo[j];
 
-	extern VINT gamemap;
-	if (gamemap == 8)
-	{
-		int i;
-		for (i = 0; i < NUMWEAPONS; i++)
-			resp->weaponowned[i] = true;
-		resp->backpack = true;
-		for (j = 0; j < NUMAMMO; j++)
-		{
-			resp->maxammo[j] = maxammo[j] * 2;
-			resp->ammo[j] = resp->maxammo[j];
-		}
-		resp->armorpoints = 200;
-		resp->armortype = 2;
-		resp->weapon = wp_plasma;
-	}
 }
 
 void P_RestoreResp(player_t* p)
@@ -839,24 +823,6 @@ void P_RestoreResp(player_t* p)
 	p->armortype = resp->armortype;
 	p->backpack = resp->backpack;
 	p->cheats = resp->cheats;
-
-	extern VINT gamemap;
-	if (gamemap == 8)
-	{
-		int k;
-		for (k = 0; k < NUMWEAPONS; k++)
-			p->weaponowned[k] = true;
-		p->backpack = true;
-		for (k = 0; k < NUMAMMO; k++)
-		{
-			p->maxammo[k] = maxammo[k] * 2;
-			p->ammo[k] = p->maxammo[k];
-		}
-		p->armorpoints = 200;
-		p->armortype = 2;
-		if (p->readyweapon == wp_pistol)
-			p->readyweapon = p->pendingweapon = wp_plasma;
-	}
 }
 
 void P_UpdateResp(player_t* p)

@@ -40,7 +40,6 @@ static const switchlist_t alphSwitchList[] =
 	{"SW1DBLU",     "SW2DBLU"},
 	{"SW1BRIK", 	"SW2BRIK"},
 	{"SW1BROWN", 	"SW2BROWN"},
-	{"SW1CMT", 		"SW2CMT"},
 	{"SW1DRED",     "SW2DRED"},
 	{"SW1DYEL",     "SW2DYEL"},
 	{"SW1MOD1", 	"SW2MOD1"},
@@ -50,6 +49,19 @@ static const switchlist_t alphSwitchList[] =
 	{"SW1TEK", 		"SW2TEK"},
 	{"SW1WUD", 		"SW2WUD"},
 	{"SW1ZIM", 		"SW2ZIM"},
+
+	// Vanilla DOOM / Ultimate DOOM switches the lists above missed
+	// (2026-11-21: E1M1's exit switch SW1EXIT never flipped)
+	{"SW1DIRT", 	"SW2DIRT"},
+	{"SW1EXIT", 	"SW2EXIT"},
+	{"SW1STARG", 	"SW2STARG"},
+	{"SW1STON2", 	"SW2STON2"},
+	{"SW1STONE", 	"SW2STONE"},
+	{"SW1STRTN", 	"SW2STRTN"},
+	{"SW1LION", 	"SW2LION"},
+	{"SW1SATYR", 	"SW2SATYR"},
+	{"SW1SKIN", 	"SW2SKIN"},
+	{"SW1VINE", 	"SW2VINE"},
 
 	{"SW1S0", 		"SW1S1"},
 	{"SW2S0", 		"SW2S1"},
@@ -75,20 +87,28 @@ void P_InitSwitchList(void)
 {
 	int		i;
 	int		index;
+	const int	n = sizeof(alphSwitchList)/sizeof(alphSwitchList[0]);
 
-	numswitches = sizeof(alphSwitchList)/sizeof(alphSwitchList[0]);
-	
-	for (index = 0,i = 0;i < numswitches;i++)
+	/* Only pairs whose BOTH textures exist in this IWAD (2026-11-21). A
+	 * missing name used to store texture 0 — the same number as "-" (no
+	 * texture) — so P_ChangeSwitchTexture matched every switch's empty
+	 * top texture first and returned without flipping the real switch
+	 * texture, and the 0 also cut short the zero-terminated walk over
+	 * this list in saturn_hw_sky.c. One slot stays for the terminator. */
+	for (index = 0,i = 0;i < n && index < MAXSWITCHES*2 - 2;i++)
 	{
+		int t1, t2;
+
 		if (!alphSwitchList[i].name1[0])
 			break;
-		
-		switchlist[index] = R_TextureNumForName(alphSwitchList[i].name1);
-		index++;
-		switchlist[index] = R_TextureNumForName(alphSwitchList[i].name2);
-		index++;
+		t1 = R_CheckTextureNumForName(alphSwitchList[i].name1);
+		t2 = R_CheckTextureNumForName(alphSwitchList[i].name2);
+		if (t1 <= 0 || t2 <= 0)
+			continue;
+		switchlist[index++] = t1;
+		switchlist[index++] = t2;
 	}
-	
+	numswitches = index / 2;
 	switchlist[index] = 0;
 }
 

@@ -94,6 +94,7 @@ volatile unsigned int saturn_init_site = 0;
  * Saturn_G_InitNew. d32xr's g_game.c (not linked) never tracked one —
  * the Jaguar WI screen was cut. */
 int saturn_leveltime = 0;
+unsigned int saturn_level_gen = 0;   /* ++ at every level load */
 
 /* 1 = the next Saturn_G_InitNew is a FRESH GAME start (pistol + 50
  * bullets via P_ResetResp); 0 = a level ADVANCE (the loadout saved by
@@ -122,6 +123,12 @@ void Saturn_G_InitNew(int skill, int episode, int map)
     {
         players[i].playerstate = PST_REBORN;
         players[i].mo = (mobj_t *)&emptymobj;   /* net consistency checks */
+        /* Per-level stats (2026-11-21): d32xr zeroes these in its (unlinked)
+         * G_DoLoadLevel; G_PlayerReborn carries them over, so without this
+         * the intermission showed the running total of all levels. */
+        players[i].killcount   = 0;
+        players[i].itemcount   = 0;
+        players[i].secretcount = 0;
         if (saturn_new_game)
             P_ResetResp(&players[i]);   /* fresh game: 100 hp, pistol, 50 */
     }
@@ -147,6 +154,7 @@ void Saturn_G_InitNew(int skill, int episode, int map)
     totalitems  = 0;
     totalsecret = 0;
     saturn_leveltime = 0;
+    saturn_level_gen++;     /* per-level caches (e.g. saturn_hw_walls.c plane punch) rebuild */
 
     /* Level setup with the correct lump name. */
     {
@@ -415,8 +423,21 @@ void Saturn_WarpToLevel(int episode, int map)
 #endif
 }
 
+#if SATURN_BENCH
+/* Bench-only world freeze (strip-LOD tuning harness, 2026-11-19): poked to 1
+ * by sdbg after the hold view settles, so every captured setting renders the
+ * same world state (monsters, lights, animated textures) and frames differ
+ * only by the setting under test. */
+int saturn_freeze_world = 0;
+#endif
+
 void Saturn_P_Ticker(void)
 {
+#if SATURN_BENCH
+    /* read cache-through: sdbg's poke does not reach the SH-2 cache */
+    if (*(const volatile int *)((uintptr_t)&saturn_freeze_world | 0x20000000u))
+        return;
+#endif
     P_Ticker();
 }
 

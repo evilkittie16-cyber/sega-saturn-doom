@@ -174,7 +174,11 @@ static int  scratch_used = 0;
 __attribute__((aligned(16))) unsigned int saturn_master_oclut[3072];
 __attribute__((aligned(16))) uint32_t     hw_wram_h_sub_flat_info[608 * 4];
 __attribute__((aligned(16))) uint32_t     hw_wram_h_proj_verts_slave[960 * 4];
+#if defined(HW_SLAVE_WALLS) && HW_SLAVE_WALLS
+__attribute__((aligned(16))) uint32_t     hw_wram_h_slave_stack[640];   /* + wall emitters */
+#else
 __attribute__((aligned(16))) uint32_t     hw_wram_h_slave_stack[224];
+#endif
 __attribute__((aligned(16))) uint32_t     hw_wram_h_portal_segs[336 * 3];
 byte *I_TempBuffer(int size)
 {
@@ -297,7 +301,22 @@ int saturn_cnt_usebbox   = 0;
 int  G_Ticker(void) { return 0; }
 void G_DeathMatchSpawnPlayer(int p) { (void)p; }
 void G_DoLoadLevel(void) { }
-void G_DoReborn(int p) { (void)p; }
+/* Dead player pressed USE (p_user.c sets PST_REBORN; P_Ticker calls this
+ * every tic while it stays set). 2026-11-21: was an empty stub, so the
+ * player stayed dead until Pause -> Restart. Single player in vanilla
+ * restarts the map with a pistol start: request exactly the pause menu's
+ * Restart (D_DoomLoop runs Saturn_WarpToLevel outside the tic). */
+void G_DoReborn(int p)
+{
+    extern volatile int saturn_warp_episode, saturn_warp_map;
+    extern int saturn_episode, saturn_map;
+    (void)p;
+    if (saturn_warp_map <= 0)
+    {
+        saturn_warp_episode = (saturn_episode > 0) ? saturn_episode : 1;
+        saturn_warp_map     = (saturn_map > 0) ? saturn_map : 1;
+    }
+}
 void G_ExitLevel(void)      { gameaction = ga_completed; }
 void G_SecretExitLevel(void){ gameaction = ga_secretexit; }
 

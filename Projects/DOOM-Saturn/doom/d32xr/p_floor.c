@@ -260,6 +260,8 @@ int EV_DoFloorTag(line_t *line,floor_e floortype, int tag)
 					P_FindLowestCeilingSurrounding(sec);
 				if (floor->floordestheight > sec->ceilingheight)
 					floor->floordestheight = sec->ceilingheight;
+				if (floortype == raiseFloorCrush)
+					floor->floordestheight -= 8*FRACUNIT;	/* vanilla: crush floors stop 8 below */
 				break;
 			case raiseFloorTurbo:
 				floor->direction = 1;

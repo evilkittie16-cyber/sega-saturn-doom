@@ -54,6 +54,7 @@ int   Saturn_TexInfoNoLoad(int texnum, stexinfo_t *out);
 /* Raw 64x64 8bpp pixels for flat `flatnum` (raw index, NOT through
  * flattranslation). Stable zone copy, cached. NULL if unavailable. */
 byte *Saturn_FlatData(int flatnum);
+byte *Saturn_FlatDataExact(int f);   /* no animation translation */
 /* Slave-safe twin of Saturn_FlatData: cached flats only. */
 byte *Saturn_FlatDataNoLoad(int flatnum);
 int   Saturn_FlatActive(void);
@@ -123,6 +124,11 @@ void Saturn_CacheZoneReset(void);
 void Saturn_BakedTextures_Init(const char *lumpname);
 void Saturn_BakedSprites_Init(const char *lumpname);
 int  Saturn_BakedTextures_Parse(byte *blob, unsigned fsize);
+/* streaming MTEX load (saturn_pak.c): one entry per placed texture */
+typedef struct { byte *dst; uint32_t ofs, sz; uint8_t holes; } saturn_tex_place_t;
+int  Saturn_BakedTex_Plan(const byte *blob, unsigned dirbytes, unsigned fsize,
+                          saturn_tex_place_t *out, int max);
+void Saturn_BakedTex_Finish(const saturn_tex_place_t *p, int n);
 int  Saturn_BakedSprites_Parse(byte *blob, unsigned fsize);
 
 #endif

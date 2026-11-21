@@ -32,7 +32,11 @@
 #define SATURN_BENCH_MAPS 9
 #endif
 #ifndef BENCH_POS
+#ifdef BENCH_HOLD_MAP
+#define BENCH_POS 1     /* hold mode uses one view: keeps __bend under 0x060C0000 */
+#else
 #define BENCH_POS 32
+#endif
 #endif
 #ifndef BENCH_ANGLES
 #define BENCH_ANGLES 8
@@ -80,6 +84,12 @@ typedef struct {
 volatile int         saturn_bench_done = 0;
 volatile int         saturn_bench_rate = 0;      /* FRT ticks per 1/60 s */
 bench_sum_t          saturn_bench_sum[SATURN_BENCH_MAPS];
+/* Slave idle summary per map (FRT ticks): [0] sum render [1] sum slave busy
+ * [2] views [3] views with render > 1/60 s [4] slave busy in those views
+ * [5] render in those views [6] slow views where the slave was idle > 1/3
+ * of render [7] sum slave wait (master waiting on the slave) */
+uint32_t             saturn_bench_idle[SATURN_BENCH_MAPS][8];
+uint32_t             saturn_hw_prof_slave_busy = 0;
 static bench_rec_t   bench_rec[BENCH_MAX_VIEWS];
 
 static int16_t       bench_pos[BENCH_POS][2];
@@ -188,6 +198,40 @@ static void bench_place_camera(int view)
         mo->z        = mo->floorz;
     }
     mo->angle = (angle_t)a * (ANG90 / 2);
+#if BENCH_HOLD && defined(BENCH_HOLD_DEG)
+    /* exact angle in degrees (e.g. to match a hardware photo's HUD "A57") */
+    mo->angle = (angle_t)((unsigned int)(BENCH_HOLD_DEG) * (ANG90 / 90u));
+#endif
+#if BENCH_HOLD && defined(BENCH_HOLD_TURN)
+    {
+        /* turning hold: BENCH_HOLD_TURN degrees more at every placement */
+        static unsigned int bench_turn_n = 0;
+        mo->angle += (angle_t)(bench_turn_n++ * (unsigned int)(BENCH_HOLD_TURN) * (ANG90 / 90u));
+    }
+#endif
+#if BENCH_HOLD && defined(BENCH_HOLD_WALK)
+    {
+        /* walking hold: BENCH_HOLD_WALK units further along the view angle at
+         * every placement, looping back to the start after BENCH_HOLD_WALKN */
+#ifndef BENCH_HOLD_WALKN
+#define BENCH_HOLD_WALKN 32
+#endif
+        static unsigned int bench_walk_n = 0;
+        fixed_t d = (fixed_t)((bench_walk_n++ % (BENCH_HOLD_WALKN)) * (BENCH_HOLD_WALK)) << FRACBITS;
+        unsigned int fa = mo->angle >> ANGLETOFINESHIFT;
+        P_UnsetThingPosition(mo);
+        mo->x += FixedMul(d, finecosine(fa));
+        mo->y += FixedMul(d, finesine(fa));
+        P_SetThingPosition(mo);
+        if (mo->subsector)
+        {
+            sector_t *sec = SSEC_SECTOR(mo->subsector);
+            mo->floorz = sec->floorheight;
+            mo->ceilingz = sec->ceilingheight;
+            mo->z = mo->floorz;
+        }
+    }
+#endif
     mo->momx = mo->momy = mo->momz = 0;
     players[0].viewz = mo->z + VIEWHEIGHT;
     players[0].viewheight = VIEWHEIGHT;
@@ -195,6 +239,13 @@ static void bench_place_camera(int view)
     players[0].cheats |= CF_GODMODE;
     players[0].health = 100;
     mo->health = 100;
+#if BENCH_HOLD && defined(BENCH_HOLD_DEAD)
+    /* dead-player eye (P_DeathThink settles viewheight at 6): reproduces a
+     * hardware photo taken after dying */
+    players[0].playerstate = PST_DEAD;
+    players[0].viewheight  = 6 * FRACUNIT;
+    players[0].viewz       = mo->z + 6 * FRACUNIT;
+#endif
     bench_rec[view].x    = bench_pos[p][0];
     bench_rec[view].y    = bench_pos[p][1];
     bench_rec[view].ang8 = (uint8_t)a;
@@ -292,7 +343,10 @@ int Saturn_Bench_Step(void)
     if (saturn_map != bench_map)
     {
         bench_built = 0;
-        Saturn_WarpToLevel(1, bench_map);
+#ifndef BENCH_HOLD_EP
+#define BENCH_HOLD_EP 1     /* -DBENCH_HOLD_EP=3 for E3Mx (retail WAD) */
+#endif
+        Saturn_WarpToLevel(BENCH_HOLD_EP, bench_map);
         return 1;
     }
     if (!bench_built)
@@ -315,6 +369,9 @@ int Saturn_Bench_Step(void)
         bench_measured = 0;
         bench_frame = 0;
 #if BENCH_HOLD
+#if defined(BENCH_HOLD_TURN) || defined(BENCH_HOLD_WALK)
+        bench_place_camera(0);  /* turning / walking hold: next step */
+#endif
         return 0;               /* stay on the held view */
 #endif
         bench_view++;
@@ -362,6 +419,26 @@ void Saturn_Bench_AfterRender(unsigned int render_ticks)
         r->fq     = (uint16_t)saturn_hw_flat_quads;
         r->subs   = (uint16_t)saturn_visit_count;
         bench_measured = 1;
+        {
+            uint32_t *id = saturn_bench_idle[bench_map - 1];
+            uint32_t busy = saturn_hw_prof_slave_busy;
+            id[0] += render_ticks;
+            id[1] += busy;
+            id[2]++;
+            id[7] += saturn_hw_prof_slave_wait;
+            if (render_ticks > (uint32_t)saturn_frt_rate)
+            {
+                id[3]++;
+                id[4] += busy;
+                id[5] += render_ticks;
+                if (busy * 3u < render_ticks * 2u)
+                    id[6]++;
+            }
+        }
+#if BENCH_HOLD && defined(BENCH_HOLD_FPS)
+        /* hold-mode FPS runs: no VDP1 timing spin, so frames pace as in play */
+        if (0)
+#endif
         {
             /* saturn_vdp1.c times this frame's VDP1 draw at the commit */
             extern volatile int          saturn_bench_vdp1_want;

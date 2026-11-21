@@ -69,6 +69,8 @@ const saturn_flat_quad_idx_t        *saturn_baked_flat_quads     = NULL;
 const uint8_t                       *saturn_baked_flat_vfrac     = NULL;
 const uint16_t                      *saturn_baked_flat_quv       = NULL;
 const uint8_t                       *saturn_baked_flat_subflags  = NULL;
+const saturn_flat_chunk_t           *saturn_baked_flat_chunks    = NULL;
+const uint16_t                      *saturn_baked_flat_sub_chunk = NULL;
 int                                  saturn_baked_flat_numsubsectors = 0;
 
 /* QUV1 extension block (tools/bake_flats.py quad_uv): sits at
@@ -85,6 +87,8 @@ static void Saturn_BakedFlats_FindQuv(uint32_t len)
 
     saturn_baked_flat_quv      = NULL;
     saturn_baked_flat_subflags = NULL;
+    saturn_baked_flat_chunks    = NULL;
+    saturn_baked_flat_sub_chunk = NULL;
     if (of < 64 || of + h->numvertexes > len)
         return;
     qo = (of + h->numvertexes + 3u) & ~3u;
@@ -108,6 +112,25 @@ static void Saturn_BakedFlats_FindQuv(uint32_t len)
 #endif
     saturn_baked_flat_quv      = (const uint16_t *)(cur_blob + qo + 12u);
     saturn_baked_flat_subflags = cur_blob + so;
+
+#ifndef SATURN_WIN32   /* big-endian blob as-is; the Windows build ignores chunks */
+    /* CHK1 block right after the subflags (optional). */
+    {
+        uint32_t co = (so + ns + 3u) & ~3u;
+        if (co + 12u > len)
+            return;
+        b = cur_blob + co;
+        if (b[0] != 'C' || b[1] != 'H' || b[2] != 'K' || b[3] != '1')
+            return;
+        uint32_t nc = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
+        uint32_t cs = ((uint32_t)b[8] << 24) | ((uint32_t)b[9] << 16) | ((uint32_t)b[10] << 8) | b[11];
+        uint32_t ro = (co + 12u + ns * 2u + 3u) & ~3u;
+        if (cs != ns || nc < 2u || nc > 16384u || ro + nc * 16u > len)
+            return;
+        saturn_baked_flat_sub_chunk = (const uint16_t *)(cur_blob + co + 12u);
+        saturn_baked_flat_chunks    = (const saturn_flat_chunk_t *)(cur_blob + ro);
+    }
+#endif
 }
 
 #define cur_sub_q_first saturn_baked_flat_q_first
@@ -120,8 +143,13 @@ static void Saturn_BakedFlats_FindQuv(uint32_t len)
 #define cur_vert_frac   saturn_baked_flat_vfrac
 #define cur_numsubsectors saturn_baked_flat_numsubsectors
 
-#define SATURN_MAX_WRAM_H_FLAT_SUBS 608
-static __attribute__((aligned(16))) saturn_flat_bbox_t hw_wram_h_flat_bboxes[SATURN_MAX_WRAM_H_FLAT_SUBS];
+/* High-WRAM copy of the per-subsector flat bboxes, from the jo heap
+ * (2026-11-21: was 4.75 KB of static BSS for 608 subsectors; the heap copy
+ * covers 1024, i.e. every Ultimate DOOM map, and the BSS pays for the
+ * 512-sector renderer tables). Allocated on first use; without it the
+ * bboxes stay in the loaded blob. */
+#define SATURN_MAX_WRAM_H_FLAT_SUBS 1024
+static saturn_flat_bbox_t *hw_wram_h_flat_bboxes = NULL;
 
 /* Version 1 fallback support if loaded */
 static const saturn_flt_header_t    *cur_header1       = NULL;
@@ -269,7 +297,12 @@ int Saturn_BakedFlats_Parse(void *data, unsigned len)
     cur_sub_v_first   = (const uint32_t *)(cur_blob + cur_hdr2->ofs_sub_v_first);
     cur_sub_v_count   = (const uint16_t *)(cur_blob + cur_hdr2->ofs_sub_v_count);
     cur_bbox          = (const saturn_flat_bbox_t *)(cur_blob + cur_hdr2->ofs_sub_bbox);
-    if (cur_numsubsectors > 0 && cur_numsubsectors <= SATURN_MAX_WRAM_H_FLAT_SUBS)
+    if (!hw_wram_h_flat_bboxes)
+    {
+        extern byte *I_AllocHigh(int length);
+        hw_wram_h_flat_bboxes = (saturn_flat_bbox_t *)I_AllocHigh(SATURN_MAX_WRAM_H_FLAT_SUBS * (int)sizeof(saturn_flat_bbox_t));
+    }
+    if (hw_wram_h_flat_bboxes && cur_numsubsectors > 0 && cur_numsubsectors <= SATURN_MAX_WRAM_H_FLAT_SUBS)
     {
         memcpy(hw_wram_h_flat_bboxes, cur_bbox, (size_t)cur_numsubsectors * sizeof(saturn_flat_bbox_t));
         cur_bbox = hw_wram_h_flat_bboxes;

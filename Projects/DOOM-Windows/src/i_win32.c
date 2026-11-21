@@ -17,6 +17,8 @@
 #include "r_local.h"
 #include "saturn_vdp1.h"
 #include "saturn_hw_render.h"
+#include "saturn_cmdbuf.h"
+#include "saturn_baked_segs.h"
 #include "tester_telemetry.h"
 
 #define PANE_W      352
@@ -735,7 +737,7 @@ void I_FinishUpdate(void)
                     dst->x = mo->x;
                     dst->y = mo->y;
                     dst->z = mo->z;
-                    dst->angle = mo->angle;
+                    dst->angle = (mo->flags & MF_STATIC) ? 0 : mo->angle;   /* static mobjs end before angle */
                     memcpy(dst->name, sprnames[st->sprite], 4);
                     dst->frame = st->frame;
                     /* Only MF_SHADOW means the same thing in both trees. d32xr
@@ -1178,6 +1180,159 @@ void I_FinishUpdate(void)
                         fflush(stdout);
                         exit(0);
                     }
+                }
+            }
+        }
+    }
+
+    /* -sweep FILE: every listed view, any episode (2026-11-21 level audit) */
+    if (is_test == 23 && players && players[0].mo) {
+        extern const char *g_sweep_file;
+        extern int saturn_episode, saturn_map, saturn_warp_map;
+        extern subsector_t *R_PointInSubsector2(fixed_t x, fixed_t y, int node);
+        extern void Win32_RequestLevelWarp(int episode, int map);
+        static FILE *s_sw_f = NULL;
+        static int s_sw_have = 0, s_sw_step = 0, s_sw_ep, s_sw_map, s_sw_x, s_sw_y, s_sw_deg;
+        static char s_sw_tag[64];
+        if (!s_sw_f) {
+            s_sw_f = fopen(g_sweep_file, "r");
+            if (!s_sw_f) { printf("[SWEEP] cannot open %s\n", g_sweep_file); exit(1); }
+            CreateDirectoryA("sweep", NULL);
+        }
+        if (!s_sw_have) {
+            if (fscanf(s_sw_f, "%d %d %d %d %d %63s", &s_sw_ep, &s_sw_map, &s_sw_x, &s_sw_y, &s_sw_deg, s_sw_tag) != 6) {
+                printf("[SWEEP] done\n");
+                fflush(stdout);
+                exit(0);
+            }
+            s_sw_have = 1;
+            s_sw_step = 0;
+        }
+        if (saturn_warp_map == 0) {
+            if (saturn_episode != s_sw_ep || saturn_map != s_sw_map) {
+                Win32_RequestLevelWarp(s_sw_ep, s_sw_map);
+                s_sw_step = 0;
+            } else {
+                /* Frozen world for comparable frames: no monster walks up
+                 * to the camera or kills the player between views. */
+                {
+                    mobj_t *mo2;
+                    for (mo2 = mobjhead.next; mo2 != (void *)&mobjhead; mo2 = mo2->next)
+                        if (mo2 != players[0].mo) {
+                            mo2->tics = -1;
+                            /* MF_STATIC mobjs are allocated only up to
+                             * offsetof(mobj_t, angle): writing the momenta
+                             * of the pool's last one overran into the next
+                             * zone block header, cutting the zone chain
+                             * (Z_Malloc failed on the 3rd level load). */
+                            if (!(mo2->flags & MF_STATIC))
+                                mo2->momx = mo2->momy = mo2->momz = 0;
+                        }
+                    players[0].cheats |= CF_GODMODE;
+                    players[0].health = 100;
+                    players[0].mo->health = 100;
+                    players[0].playerstate = PST_LIVE;
+                }
+            }
+            if (saturn_episode == s_sw_ep && saturn_map == s_sw_map && gametic >= 8) {
+                players[0].mo->momx = players[0].mo->momy = players[0].mo->momz = 0;
+                P_UnsetThingPosition(players[0].mo);
+                players[0].mo->x = s_sw_x * FRACUNIT;
+                players[0].mo->y = s_sw_y * FRACUNIT;
+                players[0].mo->angle = (angle_t)(((unsigned long long)(unsigned)s_sw_deg << 32) / 360u);
+                {
+                    subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
+                    if (ss) {
+                        sector_t *sec = SSEC_SECTOR(ss);
+                        players[0].mo->subsector = ss;
+                        players[0].mo->floorz = sec->floorheight;
+                        players[0].mo->ceilingz = sec->ceilingheight;
+                        players[0].mo->z = sec->floorheight;
+                        players[0].viewz = sec->floorheight + 41 * FRACUNIT;
+                    }
+                }
+                Saturn_HW_ForceSkyRepaint();
+                P_SetThingPosition(players[0].mo);
+                {
+                    extern int hw_dbg_trace;   /* trace only the captured frame's render */
+                    static int s_sw_steps_t = 0;
+                    if (!s_sw_steps_t) { const char *e = getenv("SWEEP_STEPS"); s_sw_steps_t = (e && atoi(e) > 0) ? atoi(e) : 6; }
+                    hw_dbg_trace = (getenv("SWEEP_TRACE") != NULL) && (s_sw_step + 1 == s_sw_steps_t);
+                }
+                static int s_sw_steps = 0;
+                if (!s_sw_steps) {
+                    const char *e = getenv("SWEEP_STEPS");   /* settle tics per view (default 6) */
+                    s_sw_steps = (e && atoi(e) > 0) ? atoi(e) : 6;
+                }
+                if (++s_sw_step == s_sw_steps) {
+                    char fn[160];
+                    sprintf(fn, "sweep\\%s.bmp", s_sw_tag);
+                    SaveFramebufferBMP(fn, s_combined_fb, COMBINED_W, COMBINED_H);
+                    printf("[SWEEP] %s E%dM%d %d %d %d | AvgErr:%6.2f%% MaxErr:%6.2f%% >=1%%:%5.1f%% | Quads:%3d (W:%3d F:%3d Drop:%d Ref:%d) Subs:%d\n",
+                           s_sw_tag, s_sw_ep, s_sw_map, s_sw_x, s_sw_y, s_sw_deg,
+                           g_telemetry.avg_err_pct, g_telemetry.max_err_pct, g_telemetry.ratio_gte_1,
+                           g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads,
+                           g_telemetry.hud_diag.quads_dropped, g_telemetry.hud_diag.tex_refused,
+                           g_telemetry.hud_diag.subsectors);
+                    if (getenv("SWEEP_DUMP")) {
+                        /* visit list of the frame just rendered: subsector,
+                         * sector, wall (m) and flat (s) command counts */
+                        extern int saturn_visit_count;
+                        extern sub_range_t *saturn_sub_ranges;
+                        subsector_t *css = players[0].mo->subsector;
+                        printf("[SWDUMP] cam ss %d sec %d viewz %d visits %d\n",
+                               css ? (int)(css - subsectors) : -1,
+                               css ? (int)(SSEC_SECTOR(css) - sectors) : -1,
+                               players[0].viewz >> FRACBITS, saturn_visit_count);
+                        for (int vi = 0; vi < saturn_visit_count; vi++) {
+                            const sub_range_t *r = &saturn_sub_ranges[vi];
+                            int sn = r->subnum;
+                            {
+                                /* screen footprint of this visit's commands: summed
+                                 * quad area (shoelace, clamped to the view) and the
+                                 * union bbox - for the "tiny subsector" study */
+                                extern vdp1_cmd_t *saturn_cmd_m, *saturn_cmd_s;
+                                double area = 0;
+                                int bx0 = 9999, by0 = 9999, bx1 = -9999, by1 = -9999, nq = 0;
+                                for (int pass = 0; pass < 2; pass++) {
+                                    const vdp1_cmd_t *base = pass ? saturn_cmd_s : saturn_cmd_m;
+                                    int st = pass ? r->s_start : r->m_start, ct = pass ? r->s_count : r->m_count;
+                                    if (!base) continue;
+                                    for (int q = st; q < st + ct; q++) {
+                                        const uint32_t *c = (const uint32_t *)&base[q];
+                                        if ((c[0] >> 16) & 0x8000u) continue;
+                                        if (((c[0] >> 16) & 0xFu) > 4u) continue;
+                                        int px[4], py[4];
+                                        for (int k = 0; k < 4; k++) {
+                                            px[k] = (int)(int16_t)(c[3 + k] >> 16);
+                                            py[k] = (int)(int16_t)(c[3 + k] & 0xFFFFu);
+                                            if (px[k] < 0) px[k] = 0; if (px[k] > 320) px[k] = 320;
+                                            if (py[k] < 0) py[k] = 0; if (py[k] > 168) py[k] = 168;
+                                            if (px[k] < bx0) bx0 = px[k]; if (px[k] > bx1) bx1 = px[k];
+                                            if (py[k] < by0) by0 = py[k]; if (py[k] > by1) by1 = py[k];
+                                        }
+                                        double s2 = 0;
+                                        for (int k = 0; k < 4; k++)
+                                            s2 += (double)px[k] * py[(k + 1) & 3] - (double)px[(k + 1) & 3] * py[k];
+                                        area += (s2 < 0 ? -s2 : s2) * 0.5;
+                                        nq++;
+                                    }
+                                }
+                                printf("[SWAREA] v%d ss %d quads %d area %.0f bbox %d %d %d %d\n", vi, sn, nq, area,
+                                       nq ? bx0 : 0, nq ? by0 : 0, nq ? bx1 : 0, nq ? by1 : 0);
+                            }
+                            extern int hw_dbg_visit_flags[1024];
+                            extern const uint16_t *saturn_baked_flat_q_count;
+                            extern const saturn_wl_subsector_t *saturn_baked_wall_subsectors;
+                            printf("[SWDUMP] v%d ss %d sec %d m %d s %d flags %X | baked fq %d wsegs %d\n", vi, sn,
+                                   (sn >= 0 && sn < numsubsectors) ? (int)(SSEC_SECTOR(&subsectors[sn]) - sectors) : -1,
+                                   r->m_count, r->s_count, vi < 1024 ? hw_dbg_visit_flags[vi] : -1,
+                                   saturn_baked_flat_q_count ? saturn_baked_flat_q_count[sn] : -1,
+                                   saturn_baked_wall_subsectors ? (int)saturn_baked_wall_subsectors[sn].num_segs : -1);
+                        }
+                    }
+                    fflush(stdout);
+                    s_sw_have = 0;
                 }
             }
         }

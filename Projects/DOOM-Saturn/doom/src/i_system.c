@@ -562,8 +562,17 @@ int I_ReadControls(void)
          * taking this read's own edge would count a press twice when the read
          * sees it before the next vblank sample does. Saturn_G_Ticker consumes
          * them once. */
-        unsigned short rise = saturn_pad_rise;
-        saturn_pad_rise = (unsigned short)(saturn_pad_rise & ~rise);
+        /* Take-and-clear with interrupts masked (2026-11-21): the vblank
+         * callback ORs new presses in; a sample landing between the load
+         * and the store of a plain read-modify-write was wiped out. */
+        unsigned short rise;
+        unsigned int sr, sr_off;
+        __asm__ volatile("stc sr,%0" : "=r"(sr));
+        sr_off = sr | 0xF0u;
+        __asm__ volatile("ldc %0,sr" : : "r"(sr_off) : "memory");
+        rise = saturn_pad_rise;
+        saturn_pad_rise = 0;
+        __asm__ volatile("ldc %0,sr" : : "r"(sr) : "memory");
         saturn_pad_edges |= (unsigned int)saturn_keys_to_bt(rise);
         players[consoleplayer].oldticbuttons = players[consoleplayer].ticbuttons;
         players[consoleplayer].ticbuttons    = buttons;

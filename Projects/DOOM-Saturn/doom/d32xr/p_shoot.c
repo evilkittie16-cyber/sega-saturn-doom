@@ -50,6 +50,7 @@ typedef struct intercept_s
 typedef struct
 {
    mobj_t    *shooter;
+   int       isattack;                 // from lineattack_t
    fixed_t   attackrange;
    fixed_t   aimmidslope;              // for detecting first wall hit
    fixed_t   aimbottomslope;
@@ -181,7 +182,10 @@ static boolean PA_ShootLine(shootWork_t *sw, line_t *li, fixed_t interceptfrac)
    sector_t *front, *back;
    fixed_t   opentop, openbottom;
 
-   if (li->special)
+   /* 2026-11-21: only a real hitscan triggers G1/GR lines (vanilla
+    * PTR_ShootTraverse); aim traces (rockets, plasma, BFG, monster aiming)
+    * used to open shootable doors and switches too. */
+   if (li->special && sw->isattack)
 		P_ShootSpecialLine (sw->shooter, li);
 
    if(li->sidenum[1] < 0)
@@ -447,6 +451,7 @@ void P_Shoot2(lineattack_t *la)
 
    t1        = la->shooter;
    sw.shooter = la->shooter;
+   sw.isattack = la->isattack;
    sw.shootline = NULL;
    sw.shootmobj = NULL;
    angle     = la->attackangle >> ANGLETOFINESHIFT;

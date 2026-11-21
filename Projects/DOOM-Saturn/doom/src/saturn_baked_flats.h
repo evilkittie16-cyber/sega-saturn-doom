@@ -57,10 +57,27 @@ extern const uint8_t                *saturn_baked_flat_vfrac;
  * v0-v1 edge. */
 extern const uint16_t               *saturn_baked_flat_quv;
 extern const uint8_t                *saturn_baked_flat_subflags; /* bit0: LOD0 uses transposed */
+
+/* CHK1 spatial chunks (tools/bake_flats.py chunk_subsector): a big subsector's
+ * LOD0 quads / vertices are contiguous per-chunk ranges (subsector-relative),
+ * so the slave can frustum-cull a chunk by its bbox. Record 0 = "none". */
+typedef struct {
+    int16_t  min_x, max_x, min_y, max_y;
+    uint16_t q_off, q_cnt, v_off, v_cnt;   /* v_cnt bit 15: last chunk of the subsector */
+} saturn_flat_chunk_t;
+#define SATURN_FLAT_CHUNK_LAST 0x8000u
+extern const saturn_flat_chunk_t    *saturn_baked_flat_chunks;
+extern const uint16_t               *saturn_baked_flat_sub_chunk;
 #define SATURN_QUV_NORMAL      1
 #define SATURN_QUV_TRANSPOSED  2
 #define SATURN_QUV_TILE        3
 #define SATURN_SUBFLAG_TRANSPOSED 1
+/* QUV bit 7: the piece is not an exact row mapping (cut by a diagonal or
+ * trimmed on both axes); drawn with its own warped texture when one is
+ * resident (Saturn_Vdp1_GetWarpSrca). Subflag bit 1: LOD0 list has some. */
+#define SATURN_QUV_WARP        0x80u
+#define SATURN_SUBFLAG_WARP    2
+#define SATURN_SUBFLAG_WARP_LOD1 4  /* LOD1 (128-unit) list has QUV_WARP quads */
 extern int                           saturn_baked_flat_numsubsectors;
 
 #endif /* SATURN_BAKED_FLATS_H */

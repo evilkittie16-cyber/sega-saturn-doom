@@ -154,7 +154,7 @@ int EV_DoCeiling (line_t *line, ceiling_e  type)
 			case fastCrushAndRaise:
 				ceiling->crush = true;
 				ceiling->topheight = sec->ceilingheight;
-				ceiling->bottomheight = sec->floorheight;
+				ceiling->bottomheight = sec->floorheight + 8*FRACUNIT;	/* vanilla: crushers stop 8 above the floor */
 				ceiling->direction = -1;
 				ceiling->speed = CEILSPEED * 2;
 				break;
@@ -165,6 +165,8 @@ int EV_DoCeiling (line_t *line, ceiling_e  type)
 			case lowerAndCrush:
 			case lowerToFloor:
 				ceiling->bottomheight = sec->floorheight;
+				if (type != lowerToFloor)
+					ceiling->bottomheight += 8*FRACUNIT;	/* vanilla */
 				ceiling->direction = -1;
 				ceiling->speed = CEILSPEED;
 				break;

@@ -394,7 +394,10 @@ typedef struct {
  * demotes surplus lumps to COLD (CD streaming), which is correct, only
  * slower on their first access. 768 entries accommodates all ~722 hot lumps
  * under SATURN_CART_REC_OFF while saving 4KB of BSS. */
-#define SATURN_FILL_QUEUE_MAX  768
+#define SATURN_FILL_QUEUE_MAX  640   /* 2026-11-20: 768 -> 640 (2 KB BSS for the
+                                      * streaming MTEX loader); flats now come
+                                      * first in pass 1, the cut entries are raw
+                                      * patches/sprites the baked packs replace */
 static saturn_fill_t saturn_fill_queue[SATURN_FILL_QUEUE_MAX];
 static int           saturn_fill_head = 0;
 static int           saturn_fill_count = 0;
@@ -703,6 +706,24 @@ int Saturn_CartPresent(void)
     return cart_initialized;
 }
 
+/* Level texture arena (2026-11-20): cart 512 KB .. 1008 KB. The hot fill
+ * stops below SATURN_CART_REC_OFF (512 KB - 512) since r92; r69-r91 filled
+ * up to the 1008 KB clamp on real hardware, so this range is HW-proven and
+ * now unused. saturn_tex.c places baked textures here when WRAM-L is full,
+ * before falling back to the Z zone (E3M6: ~2.1 MB of level data would
+ * not fit the 2 MB zone). Reset per level by the texture loader. */
+#define CART_ARENA_OFF   0x00080000UL
+#define CART_ARENA_END   (1008UL * 1024UL)
+byte *Saturn_CartArena(unsigned int *size)
+{
+    if (!cart_initialized || cart_real_bytes < (CART_HOT_CAP + CART_ZONE_SIZE) ||
+        SATURN_CART_REC_OFF + 512u > CART_ARENA_OFF)
+        return NULL;
+    if (size)
+        *size = (unsigned int)(CART_ARENA_END - CART_ARENA_OFF);
+    return (byte *)(CART_RAM_CACHED + CART_ARENA_OFF);
+}
+
 /* Z-zone base: the cart's upper half via the CACHED mirror (the zone
  * is CPU-only memory â€” Z_Malloc headers, mobjthinker lists â€” so cached
  * access is correct and fast). Returns NULL when no cart is present;
@@ -718,7 +739,22 @@ byte *Saturn_ZoneBase(int *size)
         return NULL;
     if (size)
         *size = (int)CART_ZONE_SIZE;
+#ifndef SATURN_ZONE_CACHED
+#define SATURN_ZONE_CACHED 0
+#endif
+#if SATURN_ZONE_CACHED
+    /* NOTE 2026-11-20: despite its name, CART_RAM_CACHED (0x22400000) is
+     * the SH-2 CACHE-THROUGH mirror (0x2xxxxxxx); the cached view of the
+     * cart is 0x02400000. The zone is written only by the master CPU, so
+     * the cached view would be coherent, but it MEASURED SLOWER (5thPlanet,
+     * w/p2/m1a: 2 fewer frames per 240 fields each; D-miss +0.4..0.8 ms vs
+     * uncached -0.2): zone data is read sparsely, a 16-byte line fill over
+     * the 16-bit A-bus costs 8 accesses and evicts the renderer's lines.
+     * So the zone stays uncached (the default below). */
+    return (byte *)((CART_RAM_CACHED & 0x0FFFFFFFUL) + CART_ZONE_OFF);
+#else
     return (byte *)(CART_RAM_CACHED + CART_ZONE_OFF);
+#endif
 }
 
 /* Compare 8-character big-endian DOOM lump name (case-insensitive).
@@ -2001,8 +2037,15 @@ byte *I_WadBase(void)
                     first_map_block_end > first_map_block_start &&
                     i >= first_map_block_start && i < first_map_block_end)
                     is_hot = 1;
-                else if (lump_is_named_hot(dir[i].name))
+                else if (lump_is_named_hot(dir[i].name) &&
+                         (unsigned)BIGLONG(dir[i].size) <= 32768u)
                     is_hot = 1;
+                /* 2026-11-20: full-screen pictures (TITLEPIC, CREDIT, HELP1,
+                 * INTERPIC, VICTORY2, PFUB1/2: ~67 KB each, 470 KB in the
+                 * retail WAD) wait for pass 2 - they took nearly the whole
+                 * 512 KB hot region ahead of the flats, so every flat a
+                 * retail level used was copied into the Z zone (E2M5 ran
+                 * out). Menus/intermissions stream them from CD instead. */
             }
             else if (pass == 1)
             {
@@ -2012,7 +2055,9 @@ byte *I_WadBase(void)
             }
             else /* pass == 2 */
             {
-                if (first_patch >= 0 && last_patch >= 0 &&
+                if (lump_is_named_hot(dir[i].name))
+                    is_hot = 1;                 /* the big pictures, if room is left */
+                else if (first_patch >= 0 && last_patch >= 0 &&
                     i > first_patch && i < last_patch)
                     is_hot = 1;
                 else if (first_sprt >= 0 && last_sprt >= 0 &&
@@ -2205,8 +2250,15 @@ void saturn_iwad_fill_drain_all(void)
            (int)(saturn_vbl_count - v0) < 60 * 60)
         saturn_iwad_background_fill();
     saturn_fill_boot_mode = 0;
-    saturn_fill_remaining = 0;
-    saturn_fill_active = 0;
+    /* 2026-11-21: only switch the fill off when the queue really emptied;
+     * after a watchdog timeout the leftovers stay queued for the in-game
+     * async drain, as the comment above intends (it used to turn the fill
+     * off for good, so the rest streamed from CD on every access). */
+    if (!saturn_fill_active || saturn_fill_head >= saturn_fill_count)
+    {
+        saturn_fill_remaining = 0;
+        saturn_fill_active = 0;
+    }
 }
 
 /* Drain the background cart-fill queue. Called once per displayed frame
@@ -2562,6 +2614,7 @@ int I_SeekCDFile(int offset, int whence)
  * GFS seek + sector staging read (dozens of ms); d_main.c reports the
  * per-displayed-frame delta on the HUD. */
 int saturn_wad_cold_reads = 0;
+static byte *saturn_cd_big = NULL;   /* oversized cold lump (see I_ReadCDFile) */
 
 int I_ReadCDFile(int length)
 {
@@ -2570,6 +2623,11 @@ int I_ReadCDFile(int length)
     int          from_cart = 0;
 
     saturn_cd_pre_read_pos = (int)pos;
+    if (saturn_cd_big)
+    {
+        Z_Free(saturn_cd_big);      /* previous oversized lump's buffer */
+        saturn_cd_big = NULL;
+    }
 
     if (length <= 0)
     {
@@ -2608,6 +2666,19 @@ int I_ReadCDFile(int length)
     saturn_wad_cold_reads++;    /* profile: this read hit the CD */
     if ((unsigned)length > SATURN_CD_SCRATCH_SIZE)
     {
+        /* Retail lumps over the 64 KB scratch (E2M7 SIDEDEFS 67,560 B):
+         * a temporary zone block, returned by I_GetCDFileBuffer until the
+         * next CD read frees it (callers copy straight out, like the
+         * scratch). */
+        extern memzone_t *mainzone;
+        if (mainzone)
+            saturn_cd_big = (byte *)Z_Malloc(length, PU_STATIC);
+        if (saturn_cd_big &&
+            saturn_iwad_pread(real_cd, saturn_cd_big, (unsigned)length) == length)
+        {
+            saturn_cd_seek_pos = (int)(pos + (unsigned)length);
+            return length;
+        }
         I_Error("I_ReadCDFile: lump of %d bytes exceeds %u-byte scratch",
                 length, (unsigned)SATURN_CD_SCRATCH_SIZE);
         return -1;
@@ -2632,6 +2703,8 @@ int I_ReadCDFile(int length)
 void *I_GetCDFileBuffer(void)
 {
     unsigned int pos = (unsigned int)saturn_cd_pre_read_pos;
+    if (saturn_cd_big)
+        return saturn_cd_big;
     if (!(pos & COLD_BIAS) && cart_initialized && hot_lump_filled(pos, NULL))
         return cart_base_ptr + pos;
     return saturn_cd_scratch;
@@ -2654,6 +2727,16 @@ void *I_GetCDFileBuffer(void)
  *     allocations by Z_FreeTags at the next level load;
  *   - zone too full for the copy: the aliased scratch pointer (the old
  *     behavior) rather than failing the level setup. */
+/* Cart-resident bytes of `lump`, or NULL when it is a cold (CD) lump - no
+ * zone copy. R_FixupTextures uses it for the flats (2026-11-20): copying
+ * every cold flat cost the retail IWAD 107 x 4 KB of zone per level; the
+ * flats a level uses load on first use instead (Saturn_FlatDataExact). */
+void *I_PointResidentLump(int lump)
+{
+	void *raw = W_POINTLUMPNUM(lump);
+	return (raw == saturn_cd_scratch || raw == saturn_cd_big) ? NULL : raw;
+}
+
 void *I_PointStableLump(int lump)
 {
 	void	*raw;
@@ -2661,7 +2744,9 @@ void *I_PointStableLump(int lump)
 	int		length;
 
 	raw = W_POINTLUMPNUM(lump);	/* cart bytes, or fresh bytes in scratch */
-	if (raw != saturn_cd_scratch)
+	/* saturn_cd_big (cold lumps > 64 KB) is freed by the next CD read just
+	 * like scratch is overwritten: neither is stable (2026-11-21). */
+	if (raw != saturn_cd_scratch && raw != saturn_cd_big)
 		return raw;			/* stable: cart DRAM or in-RAM wad */
 
 	length = W_LumpLength(lump);

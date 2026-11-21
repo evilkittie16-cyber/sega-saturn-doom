@@ -59,6 +59,7 @@ SRCS = main.c \
        doom/src/saturn_vdp1.c \
        doom/src/saturn_cmdbuf.c \
        doom/src/saturn_hw_render.c \
+       doom/src/saturn_hw_slave_walls.c \
        doom/src/saturn_vdp2_plane.c \
        doom/src/saturn_baked_flats.c \
        doom/src/saturn_baked_segs.c \
@@ -144,8 +145,8 @@ CCFLAGS += -ffunction-sections
 LDFILE := ./doom_hot.linker
 endif
 
-OBJS += doom/src/saturn_draw.o
-game.elf: doom/src/saturn_draw.o
+OBJS += doom/src/saturn_draw.o doom/src/saturn_hw_asm.o
+game.elf: doom/src/saturn_draw.o doom/src/saturn_hw_asm.o
 
 CCFLAGS_OPT = $(filter-out -Os,$(CCFLAGS)) -O2
 
@@ -173,11 +174,30 @@ endif
 doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c $(SATURN_HW_DEPS)
 	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
 
+# Slave copy of the wall emitters (HW_SLAVE_WALLS; empty object otherwise).
+# Every global is weakened so the duplicated header globals bind to the
+# master object's definitions (saturn_hw_slave_walls.c).
+doom/src/saturn_hw_slave_walls.o: doom/src/saturn_hw_slave_walls.c $(SATURN_HW_DEPS)
+	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+	sh-elf-objcopy --weaken $@
+
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
 
+# Cold code (load time / 2D screens only) at -Os (2026-11-21): static BSS +
+# text must stay under 0x060C0000 (SGL work area); size beats speed here.
+CCFLAGS_COLD = $(filter-out -O2,$(CCFLAGS)) -Os
 doom/src/saturn_pak.o: doom/src/saturn_pak.c
-	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/src/saturn_menu.o: doom/src/saturn_menu.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/src/saturn_inter.o: doom/src/saturn_inter.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/d32xr/p_setup.o: doom/d32xr/p_setup.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
 
 doom/src/i_video.o: doom/src/i_video.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_PERF_ROWS $(DIVLUT_DEFS) -o $@
@@ -200,6 +220,8 @@ doom/src/i_wad.o: doom/src/i_wad.c
 doom/src/d32xr_stubs.o: doom/src/d32xr_stubs.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) $(DIVLUT_DEFS) -ffixed-r2 -ffixed-r3 -ffixed-r6 -ffixed-r7 -o $@
 doom/src/saturn_draw.o: doom/src/saturn_draw.s
+	$(CC) $< $(DFLAGS) -c -o $@
+doom/src/saturn_hw_asm.o: doom/src/saturn_hw_asm.s
 	$(CC) $< $(DFLAGS) -c -o $@
 
 # Replace the jo_engine_makefile's broken `$(TARGET2):` rule.

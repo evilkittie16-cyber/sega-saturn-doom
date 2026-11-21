@@ -130,6 +130,94 @@ void Z_Free2 (memzone_t *mainzone, void *ptr)
 
 #define MINFRAGMENT	64
 
+#ifdef SATURN_WIN32
+#include <stdio.h>
+#include <intrin.h>
+void Z_DumpZone(memzone_t *z, int want, void *caller);
+#define Z_FAIL_DUMP(z, s) Z_DumpZone((z), (s), _ReturnAddress())
+/* harness, env ZCHK=1: report the first zone operation that finds the block
+ * chain no longer reaching the end of the zone (a header overwritten by a
+ * buffer overrun), with the owners of the blocks around it. Found the sweep
+ * frozen-world loop writing momenta past the end of MF_STATIC mobjs. */
+#include <stdlib.h>
+static int z_chk_on = -1;
+static int Z_ChkOn(void)
+{
+	if (z_chk_on < 0)
+		z_chk_on = getenv("ZCHK") != NULL;
+	return z_chk_on;
+}
+static int z_chain_bad = 0;
+/* allocation owners: block offset -> caller (latest wins) */
+#define Z_OWN_N 16384
+static int z_own_off[Z_OWN_N], z_own_size[Z_OWN_N];
+static unsigned z_own_caller[Z_OWN_N];
+static int z_own_i = 0;
+static void Z_OwnNote(int off, int size, void *caller)
+{
+	int k;
+	if (!Z_ChkOn())
+		return;
+	k = z_own_i++ & (Z_OWN_N - 1);
+	z_own_off[k] = off;
+	z_own_size[k] = size;
+	z_own_caller[k] = (unsigned)((char *)caller - (char *)GetModuleHandleA(NULL));
+}
+static void Z_OwnPrint(int off)
+{
+	int n, k;
+	for (n = 0; n < Z_OWN_N && n < z_own_i; n++)
+	{
+		k = (z_own_i - 1 - n) & (Z_OWN_N - 1);
+		if (z_own_off[k] == off)
+		{
+			printf("[ZCHK]   block %d last allocated size %d by caller exe+0x%X\n", off, z_own_size[k], z_own_caller[k]);
+			return;
+		}
+	}
+	printf("[ZCHK]   block %d: no recorded allocation\n", off);
+}
+static memzone_t *mainzone_chk_target(void) { return mainzone; }
+static const char *z_last_op = "init";
+static unsigned z_last_caller = 0;
+static int z_last_arg = 0;
+static void Z_ChainCheck(memzone_t *z, const char *op, void *caller, int arg)
+{
+	memblock_t *b, *last = NULL;
+	unsigned c;
+	if (!Z_ChkOn() || z_chain_bad || z != mainzone)
+		return;
+	c = (unsigned)((char *)caller - (char *)GetModuleHandleA(NULL));
+	memblock_t *prev = NULL;
+	for (b = &z->blocklist; b; b = b->next)
+	{
+		prev = last;
+		last = b;
+	}
+	if ((byte *)last + last->size != (byte *)z + z->size)
+	{
+		z_chain_bad = 1;
+		printf("[ZCHK] chain short at %s(%d) caller exe+0x%X; previous op %s(%d) caller exe+0x%X; last block at %d size %d tag %d\n",
+		       op, arg, c, z_last_op, z_last_arg, z_last_caller,
+		       (int)((byte *)last - (byte *)z), last->size, last->tag);
+		if (prev)
+		{
+			printf("[ZCHK]   block before it: at %d size %d tag %d\n", (int)((byte *)prev - (byte *)z), prev->size, prev->tag);
+			Z_OwnPrint((int)((byte *)prev - (byte *)z));
+		}
+		Z_OwnPrint((int)((byte *)last - (byte *)z));
+		fflush(stdout);
+	}
+	z_last_op = op;
+	z_last_caller = c;
+	z_last_arg = arg;
+}
+#define Z_CHK(z, op, arg) Z_ChainCheck((z), (op), _ReturnAddress(), (arg))
+#else
+#define Z_FAIL_DUMP(z, s) ((void)0)
+#define Z_CHK(z, op, arg) ((void)0)
+#endif
+
 void *Z_Malloc2 (memzone_t *mainzone, int size, int tag, boolean err)
 {
 	int		extra;
@@ -139,6 +227,7 @@ void *Z_Malloc2 (memzone_t *mainzone, int size, int tag, boolean err)
 #if 0
 Z_CheckHeap (mainzone);	/* DEBUG */
 #endif
+	Z_CHK(mainzone, "Z_Malloc", size);
 
 /* */
 /* scan through the block list looking for the first free block */
@@ -192,7 +281,10 @@ backtostart:
 			if (base == start)	/* scaned all the way around the list */
 			{
 				if (err)
+				{
+					Z_FAIL_DUMP(mainzone, size);
 					I_Error("Z_Malloc: failed on %i", size);
+				}
 				return NULL;
 			}
 			continue;
@@ -224,9 +316,54 @@ backtostart:
 	mainzone->rover = base->next;	/* next allocation will start looking here */
 	if (!mainzone->rover)
 		mainzone->rover = &mainzone->blocklist;
-		
+#ifdef SATURN_WIN32
+	if (mainzone == mainzone_chk_target())
+		Z_OwnNote((int)((byte *)base - (byte *)mainzone), size, _ReturnAddress());
+	Z_CHK(mainzone, "Z_Malloc-exit", (int)((byte *)base - (byte *)mainzone));
+#endif
 	return (void *) ((byte *)base + sizeof(memblock_t));
 }
+
+#ifdef SATURN_WIN32
+/* Harness diagnostics: what the zone holds when an allocation fails. */
+void Z_DumpZone(memzone_t *z, int want, void *caller)
+{
+	memblock_t *b;
+	int freetot = 0, freemax = 0, n = 0;
+	printf("[ZDUMP] want %d caller %p (exe+0x%X, map base 0x400000) zone size %d\n", want, caller,
+	       (unsigned)((char *)caller - (char *)GetModuleHandleA(NULL)), z->size);
+	for (b = &z->blocklist; b; b = b->next)
+	{
+		if (!b->tag) { freetot += b->size; if (b->size > freemax) freemax = b->size; }
+		if (b->size >= 4096 || (b->tag && b->tag < PU_LEVEL))
+			printf("[ZDUMP] %4d off %8d size %8d tag %d\n", n, (int)((byte *)b - (byte *)z), b->size, b->tag);
+		n++;
+	}
+	printf("[ZDUMP] blocks %d free %d largest free %d\n", n, freetot, freemax);
+	fflush(stdout);
+}
+/* one line: chain length, where the chain ends, free total / largest */
+void Z_ZoneSummary(memzone_t *z, const char *where)
+{
+	memblock_t *b, *last = NULL;
+	int freetot = 0, freemax = 0, n = 0, stat = 0;
+	if (!Z_ChkOn())
+		return;
+	for (b = &z->blocklist; b; b = b->next)
+	{
+		if (!b->tag) { freetot += b->size; if (b->size > freemax) freemax = b->size; }
+		else if (b->tag < PU_LEVEL) stat += b->size;
+		if (b->next && (byte *)b->next != (byte *)b + b->size)
+			printf("[ZSUM] %s: block %d at %d size %d but next at %d\n", where, n,
+			       (int)((byte *)b - (byte *)z), b->size, (int)((byte *)b->next - (byte *)z));
+		last = b;
+		n++;
+	}
+	printf("[ZSUM] %s: blocks %d chain end %d of %d, static %d, free %d, largest %d\n", where, n,
+	       last ? (int)((byte *)last + last->size - (byte *)z) : 0, z->size, stat, freetot, freemax);
+	fflush(stdout);
+}
+#endif
 
 /* Allocate from the HIGH (back) end of a free block so temporary staging
  * buffers (like MTEX in Saturn_Pak_LevelLoad) do not split the free zone
@@ -237,6 +374,7 @@ void *Z_MallocHigh (int size, int tag)
 	int			scaniter;
 	memblock_t	*start, *rover, *new, *base;
 
+	Z_CHK(mainzone, "Z_MallocHigh", size);
 	size += sizeof(memblock_t);
 	size = (size + 3) & ~3;
 
@@ -268,6 +406,7 @@ backtostart_hi:
 			}
 			if (base == start)
 			{
+				Z_FAIL_DUMP(mainzone, size);
 				I_Error("Z_Malloc: failed on %i", size);
 				return NULL;
 			}
@@ -293,6 +432,9 @@ backtostart_hi:
 		base->size = extra;
 		base->tag = 0;
 		mainzone->rover = base;
+#ifdef SATURN_WIN32
+		Z_OwnNote((int)((byte *)new - (byte *)mainzone), size, _ReturnAddress());
+#endif
 		return (void *)((byte *)new + sizeof(memblock_t));
 	}
 
@@ -330,6 +472,7 @@ void Z_FreeTags (memzone_t *mainzone)
 	extern void	Saturn_Vgl_ResetLevelPatches (void);
 
 	Saturn_Vgl_ResetLevelPatches ();
+	Z_CHK(mainzone, "Z_FreeTags", 0);
 
 	for (block = &mainzone->blocklist ; block ; block = next)
 	{

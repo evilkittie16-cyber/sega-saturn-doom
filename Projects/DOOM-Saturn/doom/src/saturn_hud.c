@@ -1208,6 +1208,12 @@ void Saturn_HUD_Draw(void)
                         dbg[dn++] = ' ';
                         dn = hud_tiny_tag(dbg, dn, 'W', (int)(saturn_v1m_watchdog & 0xFFFFu));
                     }
+                    {
+                        /* L: adaptive detail level (saturn_hw_render.c; 0 = full detail) */
+                        extern int saturn_hw_detail_level;
+                        dbg[dn++] = ' ';
+                        dn = hud_tiny_tag(dbg, dn, 'L', saturn_hw_detail_level);
+                    }
                     (void)pf_ring_depth;
                     (void)saturn_prof_hitch_comp;
                     (void)saturn_prof_hitch_bg; (void)saturn_prof_hitch_slv; (void)saturn_prof_hitch_cull;
@@ -1217,13 +1223,14 @@ void Saturn_HUD_Draw(void)
                     if (p && p->mo)
                     {
                         extern int saturn_map;
+                        extern int saturn_episode;
                         int map_x = (int)(p->mo->x >> FRACBITS);
                         int map_y = (int)(p->mo->y >> FRACBITS);
                         int map_z = (int)(p->mo->z >> FRACBITS);
                         int map_a = (int)(((unsigned int)(p->mo->angle >> 20) * 360u) >> 12);
                         dbg[dn++] = ' ';
                         dbg[dn++] = 'E';
-                        dbg[dn++] = '1';
+                        dbg[dn++] = (char)('0' + ((saturn_episode >= 1 && saturn_episode <= 9) ? saturn_episode : 1));
                         dn = hud_tiny_tag(dbg, dn, 'M', saturn_map);
                         dbg[dn++] = ' ';
                         dn = hud_tiny_signed_tag(dbg, dn, 'X', map_x);

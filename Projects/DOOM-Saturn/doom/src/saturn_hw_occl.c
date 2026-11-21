@@ -95,8 +95,29 @@ HW_ALWAYS_INLINE int HW_IsClippedSpanOccluded(int x0, int x1)
     return HW_IsSpanOccluded(x0, x1);
 }
 
-/* 3-state span occlusion query:
- *   0 = 100% open (zero solid bits in [x0, x1]; sub-strips need no occlusion test)
+/* Compact rewrite stage C2: HW_CheckSpanOcclusion / HW_MarkSubSolidSpan in
+ * saturn_hw_asm.s (hw_asm_spanocc / hw_asm_marksub); every caller is
+ * routed to them below. */
+#ifndef HW_ASM_OCC
+#define HW_ASM_OCC (HW_ASM && !HW_ORACLE)
+#endif
+#if HW_ASM_OCC
+extern int  hw_asm_spanocc(int x0, int x1);
+extern void hw_asm_marksub(int x0, int x1);
+_Static_assert(HW_VIEW_W == 320, "hw_asm_spanocc: 320 columns");
+const void *const hw_asm_occ_ctx[11] = {
+    &hw_solid_count, hw_solid_mask, hw_mask_left, hw_mask_right,
+    hw_span_mask_lut, &hw_solid_any, &hw_solid_summary,
+    sub_solid_mask, &sub_solid_active, &sub_solid_min_w, &sub_solid_max_w
+};
+#if HW_ASM_CHECK
+#define HW_CheckSpanOcclusion HW_CheckSpanOcclusion_C
+#define HW_MarkSubSolidSpan   HW_MarkSubSolidSpan_C
+#endif
+#endif
+
+#if !HW_ASM_OCC || HW_ASM_CHECK
+/* 3-state span occlusion query: *   0 = 100% open (zero solid bits in [x0, x1]; sub-strips need no occlusion test)
  *   1 = partially occluded (some solid bits in [x0, x1])
  *   2 = 100% occluded (all bits in [x0, x1] are solid)
  */
@@ -157,6 +178,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSpanOcclusion(int x0, int x1)
 /* Defer solid span masking until subsector completion so walls never occlude flats in the same subsector */
 static HW_NOINLINE HW_HOT_O2 void HW_MarkSubSolidSpan(int x0, int x1)
 {
+    HW_ORACLE_SKIP();
     int x1_m1 = x1 - 1;
     int w0 = (int)((unsigned int)x0 >> 5);
     int b0 = x0 & 31;
@@ -196,7 +218,53 @@ static HW_NOINLINE HW_HOT_O2 void HW_MarkSubSolidSpan(int x0, int x1)
     }
     sub_solid_mask[w1] |= hw_mask_right[b1];
 }
+#endif /* !HW_ASM_OCC || HW_ASM_CHECK */
 
+#if HW_ASM_OCC
+#undef HW_CheckSpanOcclusion
+#undef HW_MarkSubSolidSpan
+#if HW_ASM_CHECK
+/* spanocc: [0] calls [1] mismatches [2] x0 [3] x1 [4] asm [5] C
+ * marksub: [0] calls [1] mismatches [2] x0 [3] x1 */
+static volatile uint32_t hw_asm_chk_spanocc[8];
+static volatile uint32_t hw_asm_chk_marksub[8];
+static HW_NOINLINE int HW_SpanOccCheck(int x0, int x1)
+{
+    int a = hw_asm_spanocc(x0, x1);
+    int c = HW_CheckSpanOcclusion_C(x0, x1);
+    hw_asm_chk_spanocc[0]++;
+    if (a != c && hw_asm_chk_spanocc[1]++ == 0)
+    {
+        hw_asm_chk_spanocc[2] = (uint32_t)x0; hw_asm_chk_spanocc[3] = (uint32_t)x1;
+        hw_asm_chk_spanocc[4] = (uint32_t)a;  hw_asm_chk_spanocc[5] = (uint32_t)c;
+    }
+    return a;
+}
+static HW_NOINLINE void HW_MarkSubCheck(int x0, int x1)
+{
+    uint32_t m0[HW_SOLID_WORDS], m1[HW_SOLID_WORDS];
+    int act0 = sub_solid_active, mn0 = sub_solid_min_w, mx0 = sub_solid_max_w;
+    memcpy(m0, sub_solid_mask, sizeof(m0));
+    hw_asm_marksub(x0, x1);
+    memcpy(m1, sub_solid_mask, sizeof(m1));
+    int act1 = sub_solid_active, mn1 = sub_solid_min_w, mx1 = sub_solid_max_w;
+    memcpy(sub_solid_mask, m0, sizeof(m0));
+    sub_solid_active = act0; sub_solid_min_w = mn0; sub_solid_max_w = mx0;
+    HW_MarkSubSolidSpan_C(x0, x1);
+    hw_asm_chk_marksub[0]++;
+    if ((memcmp(m1, sub_solid_mask, sizeof(m1)) != 0 || act1 != sub_solid_active ||
+         mn1 != sub_solid_min_w || mx1 != sub_solid_max_w) && hw_asm_chk_marksub[1]++ == 0)
+    {
+        hw_asm_chk_marksub[2] = (uint32_t)x0; hw_asm_chk_marksub[3] = (uint32_t)x1;
+    }
+}
+#define HW_CheckSpanOcclusion HW_SpanOccCheck
+#define HW_MarkSubSolidSpan   HW_MarkSubCheck
+#else
+#define HW_CheckSpanOcclusion hw_asm_spanocc
+#define HW_MarkSubSolidSpan   hw_asm_marksub
+#endif
+#endif
 typedef struct {
     int16_t sx;
     int16_t ex;
@@ -225,8 +293,15 @@ typedef struct {
 
 #define HW_NODE_PVS_WORDS     32
 #define HW_MAX_PORTAL_SPANS   32
-#define HW_MAX_AP_SECTORS     256
+/* 2026-11-21: 256 -> 512 sectors and a separate whole-level subsector limit.
+ * Ultimate DOOM has maps with up to 323 sectors (E2M7) and 956 subsectors
+ * (E4M9); at the old limits those maps skipped the per-level renderer init
+ * and indexed past several per-sector / per-subsector tables.
+ * HW_MAX_AP_SUBSECTORS stays the size of the fast static flat-info table
+ * (and the WRAM-L scratch layout); bigger maps use a PU_LEVEL table. */
+#define HW_MAX_AP_SECTORS     512
 #define HW_MAX_AP_SUBSECTORS  608
+#define HW_MAX_SUBSECTORS     1024
 #define HW_MAX_PORTAL_SEGS    336
 
 /* Subsector Flat Evaluation & LOD Bitmask Flags */
@@ -321,16 +396,80 @@ static_assert(sizeof(hw_sec_fast_t) == 16,
 static HW_ALIGN16 hw_aperture_state_t hw_aperture_state;
 static HW_ALIGN16 hw_ap_word_t hw_ap_words[HW_SOLID_WORDS];
 static HW_ALIGN16 hw_sec_fast_t hw_sec_fast[HW_MAX_AP_SECTORS];
+/* Height-aware culling (2026-11-20): per sector the highest point anything
+ * in it can be drawn, in world units (HW_SEC_ZTOP_CEIL = use the ceiling:
+ * one-sided/upper/masked walls, moving sectors). Built per level in
+ * saturn_hw_sky.c; hw_sec_dz_top = that minus viewz per frame (dz_ceil when
+ * the sector holds things). Used for sky sectors, whose ceiling is not
+ * drawn. Jo heap (BSS is at its 0x060C0000 ceiling). */
+#define HW_SEC_ZTOP_CEIL 0x7FFF
+static int16_t *hw_sec_ztop;
+static int32_t *hw_sec_dz_top;            /* published (non-NULL) only while the lists are valid */
+static int32_t *hw_sec_dz_mem;
+static const uint16_t *hw_sec_nb_first;   /* PU_LEVEL: neighbour list offsets, [s]..[s+1] */
+static const uint16_t *hw_sec_nb;         /* PU_LEVEL: two-sided neighbour sectors */
 extern uint32_t hw_wram_h_sub_flat_info[HW_MAX_AP_SUBSECTORS * 4];
+/* Per-subsector flat info: the static High-WRAM table, or a PU_LEVEL table
+ * for maps with more than HW_MAX_AP_SUBSECTORS subsectors (then
+ * hw_sub_flat_big = 1 and flat jobs go through the C submit path, since
+ * hw_asm_flatsub indexes the static table). Set in Saturn_HW_RenderPlayerView
+ * when the level's baked flats change. */
+static hw_sub_flat_info_t *hw_sub_flat_info_p = (hw_sub_flat_info_t *)hw_wram_h_sub_flat_info;
+static int hw_sub_flat_big = 0;
 extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_WRAM_L_SCRATCH ((hw_wram_l_scratch_t *)SATURN_WRAM_L_PILLARS_ADDR)
 #define HW_APERTURE       (&hw_aperture_state)
-#define HW_SUB_FLAT_INFO  ((hw_sub_flat_info_t *)hw_wram_h_sub_flat_info)
+#define HW_SUB_FLAT_INFO  hw_sub_flat_info_p
+
+/* Point HW_SUB_FLAT_INFO at a table that fits this level (once per level
+ * load, keyed on saturn_level_gen; the PU_LEVEL table dies with the level). */
+static void HW_SubFlatInfoEnsure(void)
+{
+    extern unsigned int saturn_level_gen;
+    static unsigned int gen = 0xFFFFFFFFu;
+    if (gen == saturn_level_gen)
+        return;
+    gen = saturn_level_gen;
+    if (numsubsectors > HW_MAX_AP_SUBSECTORS)
+    {
+        uintptr_t p = (uintptr_t)Z_Malloc(numsubsectors * (int)sizeof(hw_sub_flat_info_t) + 15, PU_LEVEL);
+        hw_sub_flat_info_p = (hw_sub_flat_info_t *)((p + 15u) & ~(uintptr_t)15u);
+        hw_sub_flat_big = 1;
+    }
+    else
+    {
+        hw_sub_flat_info_p = (hw_sub_flat_info_t *)hw_wram_h_sub_flat_info;
+        hw_sub_flat_big = 0;
+    }
+}
 #define HW_PORTAL_SEGS    ((hw_portal_seg_t *)hw_wram_h_portal_segs)
 #define HW_SKY_COL_BAM    (HW_WRAM_L_SCRATCH->sky_col_bam)
 
-static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
+/* HW_AP_HALF (2026-11-17, the 32X idea): the per-column window limits
+ * ytop[]/ybot[] are kept per PAIR of screen columns (index = x >> 1, 16 per
+ * 32-column word). Conservative both ways: a portal span narrows only pairs
+ * entirely inside it, and lookups skip a pair only when both of its columns
+ * are solid, so nothing visible is culled; a few hidden pieces may be drawn.
+ * The solid-column bitmask and the per-word summaries stay full resolution. */
+#ifndef HW_AP_HALF
+#define HW_AP_HALF 0
+#endif
+#if HW_AP_HALF
+#define HW_AP_PAIR_SOLID(sm, h) ((((sm) >> (((h) & 15) << 1)) & 3u) == 3u)
+#endif
+/* Compact rewrite stage C1: the whole commit below in saturn_hw_asm.s
+ * (hw_asm_commit; table layout documented there). */
+#ifndef HW_ASM_COMMIT
+#define HW_ASM_COMMIT (HW_ASM && HW_ASM_RESCAN && HW_DBG_OCCLUSION && HW_DBG_APERTURE && !HW_AP_HALF)
+#endif
+
+/* unused when hw_asm_portal (saturn_hw_walls.c) records spans itself */
+static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
 {
+#if HW_AP_1D
+    (void)sx_ex; (void)ytop; (void)ybot; (void)yt_yb_att;
+    return;
+#endif
     hw_aperture_state_t *ap = HW_APERTURE;
     int sx = sx_ex >> 16;
     int ex = (int16_t)sx_ex;
@@ -375,7 +514,42 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordPortalSpan(int sx_ex, int ytop, int y
     }
 }
 
-static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
+#if HW_ASM_SPANAP
+/* saturn_hw_asm.s; layout documented there. */
+extern int hw_asm_spanap(int sx, int ex, const void *const *ctx);
+static const void *const hw_asm_spanap_ctx[8] = {
+    hw_solid_mask, hw_ap_words, hw_aperture_state.ytop,
+    &hw_aperture_state.dirty_words, &hw_solid_summary,
+    hw_mask_left, hw_mask_right, &saturn_view_h
+};
+#if HW_ASM_CHECK
+/* Check build: run the C reference too. [0] calls, [1] mismatches,
+ * [2..5] first mismatch sx, ex, C result, asm result. */
+static int HW_GetSpanAperture_C(int sx, int ex);
+static volatile uint32_t hw_asm_chk_spanap[8];
+#endif
+HW_ALWAYS_INLINE int HW_GetSpanAperture(int sx, int ex)
+{
+    int r = hw_asm_spanap(sx, ex, hw_asm_spanap_ctx);
+#if HW_ASM_CHECK
+    int c = HW_GetSpanAperture_C(sx, ex);
+    hw_asm_chk_spanap[0]++;
+    if (r != c && hw_asm_chk_spanap[1]++ == 0)
+    {
+        hw_asm_chk_spanap[2] = (uint32_t)sx;
+        hw_asm_chk_spanap[3] = (uint32_t)ex;
+        hw_asm_chk_spanap[4] = (uint32_t)c;
+        hw_asm_chk_spanap[5] = (uint32_t)r;
+    }
+#endif
+    return r;
+}
+#define HW_SPANAP_C_NAME HW_GetSpanAperture_C
+#else
+#define HW_SPANAP_C_NAME HW_GetSpanAperture
+#endif
+#if !HW_ASM_SPANAP || HW_ASM_CHECK
+static HW_NOINLINE HW_HOT_O2 int HW_SPANAP_C_NAME(int sx, int ex)
 {
     const hw_aperture_state_t *ap = HW_APERTURE;
     int ex_m1 = ex - 1;
@@ -397,6 +571,17 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             const uint8_t *ybot = ap->ybot;
             yt_min = HW_VIEW_H;
             yb_max = 0;
+#if HW_AP_HALF
+            for (int h = sx >> 1; h <= (ex_m1 >> 1); h++)
+            {
+                if (HW_AP_PAIR_SOLID(sm, h))
+                    continue;
+                int yt = ytop[h];
+                int yb = ybot[h];
+                if (yt < yt_min) yt_min = yt;
+                if (yb > yb_max) yb_max = yb;
+            }
+#else
             uint32_t m = sm >> b0;
             for (int x = sx; x <= ex_m1; x++, m >>= 1)
             {
@@ -407,6 +592,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
                 if (yt < yt_min) yt_min = yt;
                 if (yb > yb_max) yb_max = yb;
             }
+#endif
         }
         return (yt_min >= yb_max) ? -1 : ((yt_min << 16) | (uint16_t)yb_max);
     }
@@ -451,10 +637,22 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             }
             else
             {
-                uint32_t m = hw_solid_mask[w0] >> b0;
                 const uint8_t *ytop = ap->ytop;
                 const uint8_t *ybot = ap->ybot;
                 int x_end = (w0 << 5) + 31;
+#if HW_AP_HALF
+                uint32_t sm0 = hw_solid_mask[w0];
+                for (int h = sx >> 1; h <= (x_end >> 1); h++)
+                {
+                    if (HW_AP_PAIR_SOLID(sm0, h))
+                        continue;
+                    int yt = ytop[h];
+                    int yb = ybot[h];
+                    if (yt < yt_min) yt_min = yt;
+                    if (yb > yb_max) yb_max = yb;
+                }
+#else
+                uint32_t m = hw_solid_mask[w0] >> b0;
                 for (int x = sx; x <= x_end; x++, m >>= 1)
                 {
                     if (m & 1u)
@@ -464,6 +662,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
                     if (yt < yt_min) yt_min = yt;
                     if (yb > yb_max) yb_max = yb;
                 }
+#endif
             }
         }
     }
@@ -479,10 +678,22 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
             }
             else
             {
-                uint32_t m = hw_solid_mask[w1];
                 const uint8_t *ytop = ap->ytop;
                 const uint8_t *ybot = ap->ybot;
                 int x_start = w1 << 5;
+#if HW_AP_HALF
+                uint32_t sm1 = hw_solid_mask[w1];
+                for (int h = x_start >> 1; h <= (ex_m1 >> 1); h++)
+                {
+                    if (HW_AP_PAIR_SOLID(sm1, h))
+                        continue;
+                    int yt = ytop[h];
+                    int yb = ybot[h];
+                    if (yt < yt_min) yt_min = yt;
+                    if (yb > yb_max) yb_max = yb;
+                }
+#else
+                uint32_t m = hw_solid_mask[w1];
                 for (int x = x_start; x <= ex_m1; x++, m >>= 1)
                 {
                     if (m & 1u)
@@ -492,12 +703,15 @@ static HW_NOINLINE HW_HOT_O2 int HW_GetSpanAperture(int sx, int ex)
                     if (yt < yt_min) yt_min = yt;
                     if (yb > yb_max) yb_max = yb;
                 }
+#endif
             }
         }
     }
     return (yt_min >= yb_max) ? -1 : ((yt_min << 16) | (uint16_t)yb_max);
 }
+#endif /* !HW_ASM_SPANAP || HW_ASM_CHECK */
 
+#if !HW_ASM_COMMIT || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitSubSolidMask(void)
 {
     hw_aperture_state_t *ap = HW_APERTURE;
@@ -544,14 +758,70 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitSubSolidMask(void)
     hw_solid_count = (hw_solid_words >= req_words) ? vw : 1;
     return touched_words;
 }
+#endif
 
-static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
+#if HW_ASM_RESCAN
+/* saturn_hw_asm.s; bit-identical to the C below (HW_AP_HALF=0 only). */
+extern void hw_asm_rescan(uint32_t touched, const uint32_t *solid_mask,
+                          hw_ap_word_t *ap_words, const uint8_t *ytop);
+_Static_assert(offsetof(hw_aperture_state_t, ybot) - offsetof(hw_aperture_state_t, ytop) == 352,
+               "hw_asm_rescan assumes ybot = ytop + 352");
+_Static_assert(HW_VIEW_W == 320 && HW_AP_HALF == 0, "hw_asm_rescan assumes 10x32 full-res columns");
+#if HW_ASM_CHECK
+/* Check build: C reference into a scratch copy. [0] calls, [1] mismatching
+ * calls, [2] first touched mask, [3] first bad word, [4..5] C / asm words. */
+static void HW_RescanApertureWords_C(uint32_t touched_words, hw_ap_word_t *out);
+static volatile uint32_t hw_asm_chk_rescan[8];
+#endif
+HW_ALWAYS_INLINE void HW_RescanApertureWords(uint32_t touched_words)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    ap->dirty_words |= touched_words;
+#if HW_ASM_CHECK
+    hw_ap_word_t ref[HW_SOLID_WORDS];
+    memcpy(ref, hw_ap_words, sizeof(ref));
+    HW_RescanApertureWords_C(touched_words, ref);
+#endif
+    hw_asm_rescan(touched_words, hw_solid_mask, hw_ap_words, ap->ytop);
+#if HW_ASM_CHECK
+    hw_asm_chk_rescan[0]++;
+    for (int w = 0; w < HW_SOLID_WORDS; w++)
+    {
+        if (memcmp(&ref[w], &hw_ap_words[w], sizeof(hw_ap_word_t)) != 0)
+        {
+            if (hw_asm_chk_rescan[1]++ == 0)
+            {
+                const uint32_t *c = (const uint32_t *)&ref[w];
+                const uint32_t *a = (const uint32_t *)&hw_ap_words[w];
+                hw_asm_chk_rescan[2] = touched_words;
+                hw_asm_chk_rescan[3] = (uint32_t)w;
+                hw_asm_chk_rescan[4] = c[0];
+                hw_asm_chk_rescan[5] = c[1];
+                hw_asm_chk_rescan[6] = a[0];
+                hw_asm_chk_rescan[7] = a[1];
+            }
+            break;
+        }
+    }
+#endif
+}
+#define HW_RESCAN_C_SIG static void HW_RescanApertureWords_C(uint32_t touched_words, hw_ap_word_t *out_words)
+#else
+#define HW_RESCAN_C_SIG static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
+#endif
+#if !HW_ASM_RESCAN || HW_ASM_CHECK
+HW_RESCAN_C_SIG
 {
     hw_aperture_state_t *ap = HW_APERTURE;
     const int vw = HW_VIEW_W;
     const int vh = saturn_view_h;
     const int req_words = (HW_VIEW_W + 31) >> 5;
+#if HW_ASM_RESCAN
+    hw_ap_word_t *aw_base = out_words;   /* check build: scratch copy */
+#else
+    hw_ap_word_t *aw_base = hw_ap_words;
     ap->dirty_words |= touched_words;
+#endif
     const uint8_t * __restrict ytop = ap->ytop;
     const uint8_t * __restrict ybot = ap->ybot;
 
@@ -560,7 +830,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
         uint32_t wbit = hw_bit_lut[w];
         if (!(touched_words & wbit))
             continue;
-        hw_ap_word_t *aw = &hw_ap_words[w];
+        hw_ap_word_t *aw = &aw_base[w];
         uint32_t sm = hw_solid_mask[w];
         if (sm == 0xFFFFFFFFu)
         {
@@ -570,12 +840,27 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
             aw->yb_min = 0;
             continue;
         }
+        int min_yt = vh, max_yt = 0;
+        int min_yb = vh, max_yb = 0;
+#if HW_AP_HALF
+        int h_start = w << 4;
+        int h_end = h_start + 16;
+        if (h_end > ((vw + 1) >> 1)) h_end = (vw + 1) >> 1;
+        for (int h = h_start; h < h_end; h++)
+        {
+            if (sm != 0 && HW_AP_PAIR_SOLID(sm, h))
+                continue;
+            int yt = ytop[h];
+            int yb = ybot[h];
+            if (yt < min_yt) min_yt = yt;
+            if (yt > max_yt) max_yt = yt;
+            if (yb < min_yb) min_yb = yb;
+            if (yb > max_yb) max_yb = yb;
+        }
+#else
         int x_start = w << 5;
         int x_end = x_start + 32;
         if (x_end > vw) x_end = vw;
-
-        int min_yt = vh, max_yt = 0;
-        int min_yb = vh, max_yb = 0;
         if (sm == 0)
         {
             for (int x = x_start; x < x_end; x++)
@@ -603,6 +888,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
                 if (yb > max_yb) max_yb = yb;
             }
         }
+#endif
         if (min_yt > max_yb)
         {
             min_yt = max_yt = vh;
@@ -614,6 +900,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_RescanApertureWords(uint32_t touched_words)
         aw->yb_min = (int16_t)min_yb;
     }
 }
+#endif /* !HW_ASM_RESCAN || HW_ASM_CHECK */
 
 static HW_NOINLINE HW_COLD_OS int HW_CommitPortalClosedWord(int w, uint32_t newly_closed)
 {
@@ -645,6 +932,7 @@ static HW_NOINLINE HW_COLD_OS int HW_CommitPortalClosedWord(int w, uint32_t newl
     return 0;
 }
 
+#if !HW_ASM_COMMIT || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
     int w_and_flags, const hw_portal_span_t *ps, int touch_ret)
 {
@@ -677,6 +965,27 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
     int yb_req  = yb_att + 2;
     unsigned int yb_span = (yb_req >= yb_base) ? (unsigned int)(yb_req - new_yb) : 0u;
 
+#if HW_AP_HALF
+    /* pairs fully inside [x_s, x_e) only; a closed pair closes both columns */
+    {
+        int h_s = (x_s + 1) >> 1;
+        int h_e = x_e >> 1;
+        for (int h = h_s; h < h_e; h++)
+        {
+            int yt = ytop[h];
+            int yb = ybot[h];
+            int mod = 0;
+            if (do_yt && (unsigned int)(yt - yt_req) < yt_span)  { yt = new_yt; ytop[h] = (uint8_t)new_yt; mod = 1; }
+            if (do_yb && (unsigned int)(yb - yb_base) < yb_span) { yb = new_yb; ybot[h] = (uint8_t)new_yb; mod = 1; }
+            if (mod)
+            {
+                w_mod = 1;
+                if (__builtin_expect(yt >= yb, 0))
+                    newly_closed |= 3u << ((h & 15) << 1);
+            }
+        }
+    }
+#else
     if (!do_yb)
     {
         if (yt_span > 0u)
@@ -728,6 +1037,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
             }
         }
     }
+#endif
     if (__builtin_expect(newly_closed != 0, 0))
     {
         if (HW_CommitPortalClosedWord(w, newly_closed))
@@ -791,15 +1101,25 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
                     if (is_full_word)
                     {
                         uint32_t yt4 = (uint32_t)(uint8_t)new_yt * 0x01010101u;
+#if HW_AP_HALF
+                        aliased_uint32_t *yt32 = (aliased_uint32_t *)&ytop[x_w0 >> 1];
+                        yt32[0] = yt4; yt32[1] = yt4; yt32[2] = yt4; yt32[3] = yt4;
+#else
                         aliased_uint32_t *yt32 = (aliased_uint32_t *)&ytop[x_w0];
                         yt32[0] = yt4; yt32[1] = yt4; yt32[2] = yt4; yt32[3] = yt4;
                         yt32[4] = yt4; yt32[5] = yt4; yt32[6] = yt4; yt32[7] = yt4;
+#endif
                         aw->yt_min = aw->yt_max = (int16_t)new_yt;
                     }
                     else
                     {
+#if HW_AP_HALF
+                        for (int h = (x_s + 1) >> 1; h < (x_e >> 1); h++)
+                            ytop[h] = (uint8_t)new_yt;
+#else
                         for (int x = x_s; x < x_e; x++)
                             ytop[x] = (uint8_t)new_yt;
+#endif
                         if (aw->yt_min == aw->yt_max)
                             aw->yt_max = (int16_t)new_yt;
                         else
@@ -815,15 +1135,25 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
                     if (is_full_word)
                     {
                         uint32_t yb4 = (uint32_t)(uint8_t)new_yb * 0x01010101u;
+#if HW_AP_HALF
+                        aliased_uint32_t *yb32 = (aliased_uint32_t *)&ybot[x_w0 >> 1];
+                        yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
+#else
                         aliased_uint32_t *yb32 = (aliased_uint32_t *)&ybot[x_w0];
                         yb32[0] = yb4; yb32[1] = yb4; yb32[2] = yb4; yb32[3] = yb4;
                         yb32[4] = yb4; yb32[5] = yb4; yb32[6] = yb4; yb32[7] = yb4;
+#endif
                         aw->yb_min = aw->yb_max = (int16_t)new_yb;
                     }
                     else
                     {
+#if HW_AP_HALF
+                        for (int h = (x_s + 1) >> 1; h < (x_e >> 1); h++)
+                            ybot[h] = (uint8_t)new_yb;
+#else
                         for (int x = x_s; x < x_e; x++)
                             ybot[x] = (uint8_t)new_yb;
+#endif
                         if (aw->yb_min == aw->yb_max)
                             aw->yb_min = (int16_t)new_yb;
                         else
@@ -889,8 +1219,102 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(
     }
     return touched_words;
 }
+#endif
 
-static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
+#if HW_ASM_COMMIT
+extern void hw_asm_commit(void);
+_Static_assert(offsetof(hw_aperture_state_t, aperture_active) == 2 &&
+               offsetof(hw_aperture_state_t, portal_span_count) == 3 &&
+               offsetof(hw_aperture_state_t, dirty_words) == 8 &&
+               offsetof(hw_aperture_state_t, portal_spans) == 24 &&
+               offsetof(hw_aperture_state_t, ytop) == 408 &&
+               offsetof(hw_aperture_state_t, ybot) == 760 &&
+               sizeof(hw_portal_span_t) == 8 && sizeof(hw_ap_word_t) == 8 &&
+               offsetof(hw_ap_word_t, yb_max) == 2 && offsetof(hw_ap_word_t, yt_max) == 4 &&
+               offsetof(hw_ap_word_t, yb_min) == 6 && HW_VIEW_W == 320 && HW_MAX_PORTAL_SPANS == 32,
+               "hw_asm_commit: layout");
+const void *const hw_asm_commit_ctx[15] = {
+    &hw_aperture_state, hw_solid_mask, hw_ap_words, sub_solid_mask,
+    &sub_solid_active, &sub_solid_min_w, &sub_solid_max_w, &hw_solid_any,
+    &hw_slave_dirty_words, &hw_solid_summary, &hw_solid_words, &hw_solid_count,
+    &saturn_view_h, hw_bit_lut, (const void *)HW_CommitPortalClosedWord
+};
+#if HW_ASM_CHECK
+static void HW_CommitSubsectorOcclusion_C(void);
+/* [0] calls [1] mismatches [2] first differing byte offset in the snapshot */
+static volatile uint32_t hw_asm_chk_commit[8];
+typedef struct {
+    hw_aperture_state_t ap;
+    hw_ap_word_t aw[HW_SOLID_WORDS];
+    uint32_t sm[HW_SOLID_WORDS], sub[HW_SOLID_WORDS];
+    int act, mn, mx, words, count;
+    uint32_t any, sdirty, summ;
+} hw_occl_snap_t;
+/* heap, not BSS: 3 x ~1.3 KB would push static data past 0x060C0000 */
+extern byte *I_AllocHigh(int length);
+static hw_occl_snap_t *hw_occl_snap;
+static void HW_OcclSave(hw_occl_snap_t *s)
+{
+    memcpy(&s->ap, &hw_aperture_state, sizeof(s->ap));
+    memcpy(s->aw, hw_ap_words, sizeof(s->aw));
+    memcpy(s->sm, hw_solid_mask, sizeof(s->sm));
+    memcpy(s->sub, sub_solid_mask, sizeof(s->sub));
+    s->act = sub_solid_active; s->mn = sub_solid_min_w; s->mx = sub_solid_max_w;
+    s->words = hw_solid_words; s->count = hw_solid_count;
+    s->any = hw_solid_any; s->sdirty = hw_slave_dirty_words; s->summ = hw_solid_summary;
+}
+static void HW_OcclLoad(const hw_occl_snap_t *s)
+{
+    memcpy(&hw_aperture_state, &s->ap, sizeof(s->ap));
+    memcpy(hw_ap_words, s->aw, sizeof(s->aw));
+    memcpy(hw_solid_mask, s->sm, sizeof(s->sm));
+    memcpy(sub_solid_mask, s->sub, sizeof(s->sub));
+    sub_solid_active = s->act; sub_solid_min_w = s->mn; sub_solid_max_w = s->mx;
+    hw_solid_words = s->words; hw_solid_count = s->count;
+    hw_solid_any = s->any; hw_slave_dirty_words = s->sdirty; hw_solid_summary = s->summ;
+}
+#endif
+static HW_NOINLINE void HW_CommitSubsectorOcclusion(void)
+{
+#if HW_ASM_CHECK
+    if (!hw_occl_snap)
+    {
+        hw_occl_snap = (hw_occl_snap_t *)I_AllocHigh((int)(3 * sizeof(hw_occl_snap_t)));
+        memset(hw_occl_snap, 0, 3 * sizeof(hw_occl_snap_t));
+    }
+    HW_OcclSave(&hw_occl_snap[0]);
+    hw_asm_commit();
+    HW_OcclSave(&hw_occl_snap[1]);
+    HW_OcclLoad(&hw_occl_snap[0]);
+    HW_CommitSubsectorOcclusion_C();
+    HW_OcclSave(&hw_occl_snap[2]);
+    hw_asm_chk_commit[0]++;
+    {
+        const uint8_t *a = (const uint8_t *)&hw_occl_snap[1];
+        const uint8_t *c = (const uint8_t *)&hw_occl_snap[2];
+        for (uint32_t i = 0; i < sizeof(hw_occl_snap_t); i++)
+            if (a[i] != c[i])
+            {
+                if (hw_asm_chk_commit[1]++ == 0)
+                {
+                    hw_asm_chk_commit[2] = i;
+                    hw_asm_chk_commit[3] = a[i];
+                    hw_asm_chk_commit[4] = c[i];
+                }
+                break;
+            }
+    }
+#else
+    hw_asm_commit();
+#endif
+}
+#define HW_COMMIT_C_SIG static void HW_CommitSubsectorOcclusion_C(void)
+#else
+#define HW_COMMIT_C_SIG static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
+#endif
+
+#if !HW_ASM_COMMIT || HW_ASM_CHECK
+HW_COMMIT_C_SIG
 {
 #if !HW_DBG_OCCLUSION
     sub_solid_active = 0;
@@ -917,6 +1341,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_CommitSubsectorOcclusion(void)
     if (touched_words != 0)
         HW_RescanApertureWords(touched_words);
 }
+#endif /* !HW_ASM_COMMIT || HW_ASM_CHECK */
 
 static HW_NOINLINE HW_COLD_OS void HW_UpdateNodePvsVis(const byte *pvs_row, const void *ssec_key)
 {

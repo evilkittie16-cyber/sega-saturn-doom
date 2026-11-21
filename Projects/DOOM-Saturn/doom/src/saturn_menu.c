@@ -129,6 +129,33 @@ static void menu_free_big_patches(void)
     Saturn_HW_ForceSkyRepaint();
 }
 
+/* Episode `ep` (1..4) present in the loaded IWAD? (shareware: E1 only) */
+static int menu_ep_avail(int ep)
+{
+    char n[5];
+    if (ep < 1 || ep > 4)
+        return 0;
+    n[0] = 'E'; n[1] = (char)('0' + ep); n[2] = 'M'; n[3] = '1'; n[4] = 0;
+    return W_CheckNumForName(n) >= 0;
+}
+
+/* Step a map selector across E1M1..E4M9, skipping absent episodes. */
+static void menu_step_map(int *ep, int *map, int dir)
+{
+    int tries;
+    for (tries = 0; tries < 40; tries++)
+    {
+        *map += dir;
+        if (*map > 9)      { *map = 1; if (++*ep > 4) *ep = 1; }
+        else if (*map < 1) { *map = 9; if (--*ep < 1) *ep = 4; }
+        if (menu_ep_avail(*ep))
+            return;
+    }
+    *ep = 1;
+}
+
+static int menu_start_ep = 1;
+
 int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
 {
     static const char *const main_items[4] = {
@@ -144,6 +171,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
         "M_JKILL", "M_ROUGH", "M_HURT", "M_ULTRA", "M_NMARE"
     };
     const char *epi_show[4];
+    int         epi_num[4] = { 1, 1, 1, 1 };   /* episode behind each row */
     int         n_epi = 0;
     int         state = MENU_STATE_TITLE;
     int         main_cursor = 0;
@@ -161,7 +189,10 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
     for (i = 0; i < 4; i++)
     {
         if (W_CheckNumForName(epi_maps[i]) >= 0)
+        {
+            epi_num[n_epi]    = i + 1;
             epi_show[n_epi++] = epi_names[i];
+        }
     }
     if (n_epi == 0)
     {
@@ -301,10 +332,13 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
 
             if (edges & (BT_START | BT_ATTACK | BT_SPEED))
             {
-                int chosen_ep = epi_cursor + 1;
+                int chosen_ep = epi_num[epi_cursor];
                 S_StartSound(0, sfx_pistol);
-                if (W_CheckNumForName(epi_maps[chosen_ep - 1]) < 0)
+                if (!menu_ep_avail(chosen_ep))
                     chosen_ep = 1; /* Shareware WAD fallback to Episode 1 */
+                if (chosen_ep != menu_start_ep)
+                    menu_start_map = 1;   /* Options map belonged to another episode */
+                menu_start_ep = chosen_ep;
                 episode = chosen_ep;
                 state = MENU_STATE_SKILL;
                 menu_wait_release();
@@ -379,17 +413,17 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             else
                 print_centered(18, "OPTIONS");
 
-            /* Item 0: Start Map E1M1..E1M9 */
+            /* Item 0: Start Map E1M1..E4M9 (episodes present in the IWAD) */
             line[0] = 'S'; line[1] = 'T'; line[2] = 'A'; line[3] = 'R'; line[4] = 'T';
             line[5] = ' '; line[6] = 'M'; line[7] = 'A'; line[8] = 'P'; line[9] = ':';
-            line[10] = ' '; line[11] = 'E'; line[12] = '1'; line[13] = 'M';
+            line[10] = ' '; line[11] = 'E'; line[12] = (char)('0' + menu_start_ep); line[13] = 'M';
             line[14] = (char)('0' + menu_start_map);
             line[15] = 0;
             Saturn_Print(68, 56, line);
 
             /* Item 1: Launch Selected Map Immediately */
             line[0] = 'W'; line[1] = 'A'; line[2] = 'R'; line[3] = 'P'; line[4] = ' ';
-            line[5] = 'T'; line[6] = 'O'; line[7] = ' '; line[8] = 'E'; line[9] = '1';
+            line[5] = 'T'; line[6] = 'O'; line[7] = ' '; line[8] = 'E'; line[9] = (char)('0' + menu_start_ep);
             line[10] = 'M'; line[11] = (char)('0' + menu_start_map);
             line[12] = ' '; line[13] = 'N'; line[14] = 'O'; line[15] = 'W';
             line[16] = 0;
@@ -420,19 +454,13 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
             if (opt_cursor == 0)
             {
                 if (edges & (BT_MOVELEFT | BT_STRAFELEFT))
-                {
-                    if (--menu_start_map < 1)
-                        menu_start_map = 9;
-                }
+                    menu_step_map(&menu_start_ep, &menu_start_map, -1);
                 if (edges & (BT_MOVERIGHT | BT_STRAFERIGHT | BT_ATTACK | BT_START | BT_SPEED))
-                {
-                    if (++menu_start_map > 9)
-                        menu_start_map = 1;
-                }
+                    menu_step_map(&menu_start_ep, &menu_start_map, 1);
             }
             else if (opt_cursor == 1 && (edges & (BT_START | BT_ATTACK | BT_SPEED)))
             {
-                *out_episode = 1;
+                *out_episode = menu_start_ep;
                 *out_skill   = skill_cursor;
                 saturn_map   = menu_start_map;
                 print_centered(164, "LOADING...");
@@ -511,6 +539,7 @@ int Saturn_Menu_Run(int *out_episode, int *out_skill, int *out_demo)
 /* ---- Interactive In-Game Pause Menu ---- */
 static int pause_cursor = 0;
 static int pause_warp_map = 1;
+static int pause_warp_ep  = 1;
 static int pause_bg_drawn = 0;   /* TITLEPIC background already in I_VideoBuffer */
 
 void Saturn_Pause_Init(void)
@@ -519,6 +548,7 @@ void Saturn_Pause_Init(void)
     pause_bg_drawn = 0;
     if (saturn_map >= 1 && saturn_map <= 9)
         pause_warp_map = saturn_map;
+    pause_warp_ep = (saturn_episode >= 1 && saturn_episode <= 4) ? saturn_episode : 1;
     S_StartSound(0, sfx_swtchn);
 }
 
@@ -528,15 +558,17 @@ void Saturn_Pause_Tick(int edges)
 
     menu_frame++;
 
+    extern volatile int hw_ad_mode;     /* saturn_hw_render.c: 1 = adaptive detail */
+
     if (edges & BT_MOVEUP)
     {
         if (--pause_cursor < 0)
-            pause_cursor = 5;
+            pause_cursor = 6;
         S_StartSound(0, sfx_pstop);
     }
     if (edges & BT_MOVEDOWN)
     {
-        if (++pause_cursor >= 6)
+        if (++pause_cursor >= 7)
             pause_cursor = 0;
         S_StartSound(0, sfx_pstop);
     }
@@ -545,14 +577,12 @@ void Saturn_Pause_Tick(int edges)
     {
         if (edges & (BT_MOVELEFT | BT_STRAFELEFT))
         {
-            if (--pause_warp_map < 1)
-                pause_warp_map = 9;
+            menu_step_map(&pause_warp_ep, &pause_warp_map, -1);
             S_StartSound(0, sfx_pstop);
         }
         if (edges & (BT_MOVERIGHT | BT_STRAFERIGHT))
         {
-            if (++pause_warp_map > 9)
-                pause_warp_map = 1;
+            menu_step_map(&pause_warp_ep, &pause_warp_map, 1);
             S_StartSound(0, sfx_pstop);
         }
     }
@@ -567,6 +597,11 @@ void Saturn_Pause_Tick(int edges)
         saturn_show_fps  = !saturn_quiet_hud;
         S_StartSound(0, sfx_swtchn);
     }
+    else if (pause_cursor == 5 && (edges & (BT_MOVELEFT | BT_MOVERIGHT | BT_STRAFELEFT | BT_STRAFERIGHT)))
+    {
+        hw_ad_mode = !hw_ad_mode;
+        S_StartSound(0, sfx_swtchn);
+    }
 
     if (edges & (BT_ATTACK | BT_SPEED | BT_START))
     {
@@ -578,7 +613,7 @@ void Saturn_Pause_Tick(int edges)
         }
         else if (pause_cursor == 1)
         {
-            saturn_warp_episode = (saturn_episode > 0) ? saturn_episode : 1;
+            saturn_warp_episode = pause_warp_ep;
             saturn_warp_map     = pause_warp_map;
             gamepaused          = 0;
             menu_free_big_patches();
@@ -600,6 +635,10 @@ void Saturn_Pause_Tick(int edges)
             saturn_show_fps  = !saturn_quiet_hud;
         }
         else if (pause_cursor == 5)
+        {
+            hw_ad_mode = !hw_ad_mode;
+        }
+        else if (pause_cursor == 6)
         {
             saturn_quit_to_title = 1;
             gamepaused           = 0;
@@ -644,7 +683,7 @@ void Saturn_Pause_Draw(void)
     wline[0] = 'W'; wline[1] = 'A'; wline[2] = 'R'; wline[3] = 'P';
     wline[4] = ' '; wline[5] = 'L'; wline[6] = 'E'; wline[7] = 'V';
     wline[8] = 'E'; wline[9] = 'L'; wline[10] = ':'; wline[11] = ' ';
-    wline[12] = 'E'; wline[13] = (char)('0' + (saturn_episode > 0 ? saturn_episode : 1));
+    wline[12] = 'E'; wline[13] = (char)('0' + pause_warp_ep);
     wline[14] = 'M'; wline[15] = (char)('0' + pause_warp_map);
     wline[16] = 0;
     Saturn_Print(76, 58, wline);
@@ -652,7 +691,11 @@ void Saturn_Pause_Draw(void)
     Saturn_Print(76, 76, "RESTART LEVEL");
     Saturn_Print(76, 94, saturn_wall_subdivision ? "WALL STRIPS: ON" : "WALL STRIPS: OFF");
     Saturn_Print(76, 112, (!saturn_quiet_hud || saturn_show_fps) ? "PERF HUD: ON" : "PERF HUD: OFF");
-    Saturn_Print(76, 130, "QUIT TO TITLE");
+    {
+        extern volatile int hw_ad_mode;
+        Saturn_Print(76, 130, hw_ad_mode ? "DETAIL: AUTO" : "DETAIL: FULL");
+    }
+    Saturn_Print(76, 148, "QUIT TO TITLE");
 
     draw_skull(48, 34 + pause_cursor * 18);
 }
