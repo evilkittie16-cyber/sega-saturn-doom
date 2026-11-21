@@ -7612,3 +7612,188 @@ _hw_asm_multiband:
 .Lmb_ctx2:	.long	_hw_asm_multiband_ctx
 .Lmb_dropp:	.long	_saturn_v1w_drop
 .Lmb_capt:	.long	_saturn_v1w_captured
+
+! ===================================================================
+! Stage I1: hw_asm_things(mobj_t *mo, const mobj_t *player_mo) = the
+! HW_BuildSectorThings loop (saturn_hw_sprites.c): walk a sector's thing
+! list, frustum-cull in camera space, bucket survivors per subsector.
+! Table hw_asm_things_ctx: [0] &hw_cur_pvs_row [4] &hw_viewx [8] &hw_viewy
+! [12] &hw_viewcos [16] &hw_viewsin [20] &subsectors [24] &numsubsectors
+! (short) [28] hw_sub_has_things [32] hw_sub_first_thing [36] hw_thing_pool
+! [40] &hw_thing_pool_count [44] NUMSTATES [48] HW_MAX_SUBSECTORS
+! [52] HW_FAR_Z [56] HW_THING_POOL_CAP [60] hw_bit_lut.
+! mobj_t: x 0, y 4, state 22 (short), snext 32, subsector 48, flags 60.
+! Pool entry 16 B: mo 0, cz 4, cx 8, next 12 (byte).
+! Regs: r4 mo, r5 player_mo, r8 vx, r9 vy, r10 vcos, r11 vsin,
+! r12 pvs_row, r13 subsectors, r14 ctx.
+! ===================================================================
+	.align	2
+	.global	_hw_asm_things
+_hw_asm_things:
+	tst	r4,r4
+	bt	.Lt_ret
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	mov.l	.Lt_ctx,r14
+	mov.l	@(4,r14),r0
+	mov.l	@r0,r8			! vx
+	mov.l	@(8,r14),r0
+	mov.l	@r0,r9			! vy
+	mov.l	@(12,r14),r0
+	mov.l	@r0,r10			! vcos
+	mov.l	@(16,r14),r0
+	mov.l	@r0,r11			! vsin
+	mov.l	@r14,r0
+	mov.l	@r0,r12			! pvs_row (0 = none)
+	mov.l	@(20,r14),r0
+	mov.l	@r0,r13			! subsectors
+.Lt_loop:
+	cmp/eq	r4,r5
+	bt	.Lt_next		! the player
+	mov.l	@(48,r4),r1		! subsector
+	tst	r1,r1
+	bt	.Lt_next
+	mov.l	@(60,r4),r0		! flags
+	tst	#8,r0			! MF_NOSECTOR
+	bf	.Lt_next
+	mov.w	@(22,r4),r0		! state (sign-extended)
+	tst	r0,r0
+	bt	.Lt_next
+	mov.l	@(44,r14),r2		! NUMSTATES
+	cmp/hs	r2,r0			! (unsigned)state >= NUMSTATES
+	bt	.Lt_next
+	sub	r13,r1
+	shar	r1
+	shar	r1			! msub
+	mov.l	@(24,r14),r0
+	mov.w	@r0,r0			! numsubsectors
+	cmp/hs	r0,r1
+	bt	.Lt_next
+	mov.l	@(48,r14),r0		! HW_MAX_SUBSECTORS
+	cmp/hs	r0,r1
+	bt	.Lt_next
+	tst	r12,r12
+	bt	.Lt_pvsok
+	mov	r1,r0
+	shlr2	r0
+	shlr	r0			! msub >> 3
+	mov.b	@(r0,r12),r2
+	mov	r1,r0
+	and	#7,r0
+	shll2	r0
+	mov.l	@(60,r14),r3		! hw_bit_lut (SH-2 has no shld)
+	mov.l	@(r0,r3),r3		! 1 << (msub & 7)
+	tst	r3,r2
+	bt	.Lt_next		! not in the PVS
+.Lt_pvsok:
+	mov.l	@r4,r2
+	sub	r8,r2			! dx
+	mov.l	@(4,r4),r3
+	sub	r9,r3			! dy
+	dmuls.l	r2,r10			! dx * vcos
+	sts	mach,r6
+	sts	macl,r7
+	dmuls.l	r3,r11			! dy * vsin
+	xtrct	r6,r7			! cz1
+	sts	mach,r6
+	sts	macl,r0
+	xtrct	r6,r0			! cz2
+	add	r0,r7			! cz
+	mov.l	.Lt_minz,r0		! 12 << 16
+	cmp/ge	r0,r7
+	bf	.Lt_next
+	mov.l	@(52,r14),r0		! HW_FAR_Z
+	cmp/gt	r0,r7
+	bt	.Lt_next
+	dmuls.l	r2,r11			! dx * vsin
+	sts	mach,r6
+	sts	macl,r2
+	dmuls.l	r3,r10			! dy * vcos
+	xtrct	r6,r2			! cx1
+	sts	mach,r6
+	sts	macl,r3
+	xtrct	r6,r3			! cx2
+	sub	r3,r2			! cx
+	mov	r7,r3
+	shar	r3
+	shar	r3
+	add	r7,r3
+	mov.l	.Lt_c128,r0		! 128 << 16
+	add	r0,r3			! max_cx = cz + cz/4 + 128
+	cmp/gt	r3,r2			! cx > max_cx
+	bt	.Lt_next
+	neg	r3,r3
+	cmp/ge	r3,r2			! cx >= -max_cx
+	bf	.Lt_next
+	mov.l	@(40,r14),r6
+	mov.l	@r6,r0			! pool count
+	mov.l	@(56,r14),r3		! HW_THING_POOL_CAP
+	cmp/ge	r3,r0
+	bt	.Lt_next
+	mov	r0,r3			! idx
+	add	#1,r0
+	mov.l	r0,@r6			! count = idx + 1
+	mov.l	@(36,r14),r6
+	mov	r3,r0
+	shll2	r0
+	shll2	r0
+	add	r0,r6			! &pool[idx]
+	mov.l	r4,@r6			! .mo
+	mov.l	r7,@(4,r6)		! .cz
+	mov.l	r2,@(8,r6)		! .cx
+	mov	r1,r0
+	shlr2	r0
+	shlr	r0
+	and	#0xFC,r0		! (msub >> 5) * 4
+	mov.l	@(28,r14),r7
+	add	r0,r7			! &has_things[msub >> 5]
+	mov.l	@r7,r2
+	mov	r1,r0
+	and	#31,r0
+	shll2	r0
+	mov.l	@(60,r14),r6		! hw_bit_lut
+	mov.l	@(r0,r6),r6		! sbit = 1 << (msub & 31)
+	tst	r6,r2
+	bf	.Lt_have
+	or	r6,r2
+	mov.l	r2,@r7			! mark the subsector
+	bra	.Lt_link
+	mov	#-1,r2			! next = 0xFF
+.Lt_have:
+	mov.l	@(32,r14),r6
+	mov	r1,r0
+	mov.b	@(r0,r6),r2		! next = first_thing[msub]
+.Lt_link:
+	mov.l	@(36,r14),r6
+	mov	r3,r0
+	shll2	r0
+	shll2	r0
+	add	#12,r0
+	mov.b	r2,@(r0,r6)		! pool[idx].next
+	mov.l	@(32,r14),r6
+	mov	r1,r0
+	mov.b	r3,@(r0,r6)		! first_thing[msub] = idx
+.Lt_next:
+	mov.l	@(32,r4),r4		! mo = mo->snext
+	tst	r4,r4
+	bf	.Lt_loop
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	mov.l	@r15+,r8
+.Lt_ret:
+	rts
+	nop
+
+	.align	2
+.Lt_ctx:	.long	_hw_asm_things_ctx
+.Lt_minz:	.long	0x000C0000
+.Lt_c128:	.long	0x00800000

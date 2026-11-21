@@ -159,6 +159,99 @@ static HW_NOINLINE HW_HOT_O2 void HW_BuildSectorThings(sector_t *sec)
     }
 }
 
+/* Asm stage I1 (saturn_hw_asm.s hw_asm_things): the BuildSectorThings loop.
+ * HW_ASM_CHECK runs the C version beside it from the same state and compares
+ * the whole bucket state (pool, count, subsector bits and heads). */
+#ifndef HW_ASM_THINGS
+#define HW_ASM_THINGS HW_ASM
+#endif
+#if HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+#if HW_ASM_THINGS
+extern void hw_asm_things(mobj_t *mo, const mobj_t *player_mo);
+_Static_assert(offsetof(mobj_t, x) == 0 && offsetof(mobj_t, y) == 4 && offsetof(mobj_t, state) == 22 &&
+               sizeof(((mobj_t *)0)->state) == 2 && offsetof(mobj_t, snext) == 32 &&
+               offsetof(mobj_t, subsector) == 48 && offsetof(mobj_t, flags) == 60 &&
+               sizeof(subsector_t) == 4 && sizeof(numsubsectors) == 2 && MF_NOSECTOR == 8 &&
+               sizeof(hw_thing_entry_t) == 16 && offsetof(hw_thing_entry_t, next) == 12,
+               "hw_asm_things: layout");
+const void *const hw_asm_things_ctx[16] = {
+    &hw_cur_pvs_row, &hw_viewx, &hw_viewy, &hw_viewcos, &hw_viewsin,
+    &subsectors, &numsubsectors, hw_sub_has_things, hw_sub_first_thing, hw_thing_pool,
+    &hw_thing_pool_count, (const void *)(uintptr_t)NUMSTATES, (const void *)(uintptr_t)HW_MAX_SUBSECTORS,
+    (const void *)(uintptr_t)HW_FAR_Z, (const void *)(uintptr_t)HW_THING_POOL_CAP, hw_bit_lut
+};
+#else
+const void *const hw_asm_things_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+#endif
+#if HW_ASM_THINGS && HW_ASM_CHECK && !defined(SATURN_WIN32)
+/* [0] calls [1] mismatches [2] first differing byte [3] sector thinglist */
+static volatile uint32_t hw_asm_chk_things[8];
+typedef struct {
+    hw_thing_entry_t pool[HW_THING_POOL_CAP];
+    uint32_t has[HW_MAX_SUBSECTORS / 32];
+    uint8_t  first[HW_MAX_SUBSECTORS];
+    int      count;
+} hw_things_snap_t;
+static void HW_ThingsSave(hw_things_snap_t *s)
+{
+    memcpy(s->pool, hw_thing_pool, sizeof(s->pool));
+    memcpy(s->has, hw_sub_has_things, sizeof(s->has));
+    memcpy(s->first, hw_sub_first_thing, sizeof(s->first));
+    s->count = hw_thing_pool_count;
+}
+static void HW_ThingsLoad(const hw_things_snap_t *s)
+{
+    memcpy(hw_thing_pool, s->pool, sizeof(s->pool));
+    memcpy(hw_sub_has_things, s->has, sizeof(s->has));
+    memcpy(hw_sub_first_thing, s->first, sizeof(s->first));
+    hw_thing_pool_count = s->count;
+}
+static HW_NOINLINE void HW_BuildSectorThingsSel(sector_t *sec)
+{
+    extern byte *I_AllocHigh(int length);
+    static hw_things_snap_t *s0, *s1;
+    if (!s0)
+    {
+        s0 = (hw_things_snap_t *)I_AllocHigh((int)sizeof(*s0));
+        s1 = (hw_things_snap_t *)I_AllocHigh((int)sizeof(*s1));
+    }
+    if (!s0 || !s1)
+    {
+        HW_BuildSectorThings(sec);
+        return;
+    }
+    HW_ThingsSave(s0);
+    hw_asm_things((mobj_t *)sec->thinglist, players[hw_displayplayer].mo);
+    HW_ThingsSave(s1);
+    HW_ThingsLoad(s0);
+    HW_BuildSectorThings(sec);          /* C reference result stays live */
+    HW_ThingsSave(s0);
+    hw_asm_chk_things[0]++;
+    {
+        const uint8_t *a = (const uint8_t *)s1, *c = (const uint8_t *)s0;
+        for (uint32_t i = 0; i < sizeof(*s0); i++)
+            if (a[i] != c[i])
+            {
+                /* pool entries past the count are stale either way */
+                if (i < sizeof(s0->pool) && (int)(i / sizeof(hw_thing_entry_t)) >= s0->count)
+                    continue;
+                if (hw_asm_chk_things[1]++ == 0)
+                {
+                    hw_asm_chk_things[2] = i;
+                    hw_asm_chk_things[3] = (uint32_t)(uintptr_t)sec->thinglist;
+                }
+                break;
+            }
+    }
+}
+#elif HW_ASM_THINGS && !defined(SATURN_WIN32)
+#define HW_BuildSectorThingsSel(sec) \
+    hw_asm_things((mobj_t *)(sec)->thinglist, players[hw_displayplayer].mo)
+#else
+#define HW_BuildSectorThingsSel(sec) HW_BuildSectorThings(sec)
+#endif
+
 static HW_NOINLINE HW_HOT_O2 int HW_SubsectorHasThings(sector_t *sec, uint32_t secnum, int subnum)
 {
     if (!sec->thinglist || secnum >= 512u)
@@ -168,7 +261,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_SubsectorHasThings(sector_t *sec, uint32_t s
     if (__builtin_expect(!(hw_sec_things_built[sec_word] & sec_bit), 0))
     {
         hw_sec_things_built[sec_word] |= sec_bit;
-        HW_BuildSectorThings(sec);
+        HW_BuildSectorThingsSel(sec);
     }
     return (hw_sub_has_things[(unsigned int)subnum >> 5] & hw_bit_lut[subnum & 31]) != 0;
 }
