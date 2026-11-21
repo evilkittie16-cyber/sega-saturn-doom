@@ -195,6 +195,132 @@ const void *const hw_asm_sub_ctx[1] = { 0 };   /* asm stays linked, unused */
 volatile uint8_t hw_ssmap_dbg[256];
 volatile uint8_t hw_ssmap_last[256];   /* copy of the last complete frame */
 #endif
+/* HW_TINY_SUB=N (2026-11-21 "do less work" study, off by default): a
+ * subsector whose whole screen footprint is at most N pixels skips its walls
+ * and floor job and draws one flat-colour polygon over its footprint
+ * instead (sprites still draw). The harness sweep showed 14-19 of the 40
+ * drawn courtyard subsectors cover <= 64-256 px - ~1% of the picture - yet
+ * each paid the full per-subsector cost. Footprint = the projected bbox
+ * columns x the sector's floor..ceiling at the nearest depth, cut to the
+ * aperture window: a superset of everything the subsector draws. No
+ * occlusion is recorded for it (farther geometry still renders; the
+ * polygon, delivered later as the nearer visit, covers it). */
+#ifndef HW_TINY_SUB
+#define HW_TINY_SUB 0
+#endif
+#if HW_TINY_SUB
+unsigned int saturn_hw_tiny_subs;   /* per frame (bench / HUD) */
+/* screen rectangle of a subsector; 0 = near / not small */
+static HW_NOINLINE int HW_TinyRect(int subnum, const hw_sec_fast_t *sf, int *rx0, int *ry0, int *rx1, int *ry1,
+                                   int *zb_out)
+{
+    const saturn_flat_bbox_t *fb;
+    if (!saturn_baked_flat_bboxes)
+        return 0;
+    fb = &saturn_baked_flat_bboxes[subnum];
+    int dx0 = fb->min_x - hw_cam_x, dx1 = fb->max_x - hw_cam_x;
+    int dy0 = fb->min_y - hw_cam_y, dy1 = fb->max_y - hw_cam_y;
+    int nx = hw_bbox_Nx, ny = hw_bbox_Ny;
+    int32_t cz_off = hw_frust.cz_off12, cx_off = hw_frust.cx_off12;
+    int x_cz_min = (nx >= 0) ? dx0 : dx1, y_cz_min = (ny >= 0) ? dy0 : dy1;
+    int x_cz_max = (nx >= 0) ? dx1 : dx0, y_cz_max = (ny >= 0) ? dy1 : dy0;
+    fixed_t min_cz = HW_MulsW_PairAdd(x_cz_min, nx, y_cz_min, ny, cz_off) << 4;
+    fixed_t max_cz = HW_MulsW_PairAdd(x_cz_max, nx, y_cz_max, ny, cz_off) << 4;
+    if (min_cz < (256 << FRACBITS))
+        return 0;                       /* tiny only happens far away */
+    int x_cx_min = (ny >= 0) ? dx0 : dx1, x_cx_max = (ny >= 0) ? dx1 : dx0;
+    int y_cx_min = (nx >= 0) ? dy1 : dy0, y_cx_max = (nx >= 0) ? dy0 : dy1;
+    fixed_t min_cx = HW_MulsW_PairAdd(x_cx_min, ny, y_cx_min, -nx, cx_off) << 4;
+    fixed_t max_cx = HW_MulsW_PairAdd(x_cx_max, ny, y_cx_max, -nx, cx_off) << 4;
+    int s_near = HW_FastDiv(min_cz);
+    int s_far  = HW_FastDiv(max_cz);
+    /* x extent: both cx extremes at both depths (conservative) */
+    int xa = HW_ProjX(min_cx, s_near, HW_VIEW_CX), xb = HW_ProjX(min_cx, s_far, HW_VIEW_CX);
+    int xc = HW_ProjX(max_cx, s_near, HW_VIEW_CX), xd = HW_ProjX(max_cx, s_far, HW_VIEW_CX);
+    int x0 = xa, x1 = xa;
+    if (xb < x0) x0 = xb; if (xb > x1) x1 = xb;
+    if (xc < x0) x0 = xc; if (xc > x1) x1 = xc;
+    if (xd < x0) x0 = xd; if (xd > x1) x1 = xd;
+    x0 -= 1; x1 += 1;
+    if (x0 < 0) x0 = 0;
+    if (x1 > HW_VIEW_W) x1 = HW_VIEW_W;
+    /* y extent: ceiling and floor at the nearest depth (largest) */
+    int yt = HW_ProjY(sf->dz_ceil, s_near, HW_VIEW_CY);
+    int yb = HW_ProjY(sf->dz_floor, s_near, HW_VIEW_CY);
+    {
+        int yt2 = HW_ProjY(sf->dz_ceil, s_far, HW_VIEW_CY);
+        int yb2 = HW_ProjY(sf->dz_floor, s_far, HW_VIEW_CY);
+        if (yt2 < yt) yt = yt2;
+        if (yb2 > yb) yb = yb2;
+    }
+    yt -= 1; yb += 1;
+    if (yt < 0) yt = 0;
+    if (yb > HW_VIEW_H) yb = HW_VIEW_H;
+    if (x1 <= x0 || yb <= yt)
+        return 0;
+    /* what can still show: columns not yet solid, each cut to its aperture
+     * window (nearer walls cover the rest - they are delivered later) */
+    {
+        const hw_aperture_state_t *ap = HW_APERTURE;
+        int active = ap->aperture_active;
+        int area = 0, bx0 = HW_VIEW_W, bx1 = -1, by0 = HW_VIEW_H, by1 = -1, x;
+        for (x = x0; x < x1; x++)
+        {
+            int t = yt, b = yb;
+            if (hw_solid_mask[x >> 5] & (1u << (x & 31)))
+                continue;
+            if (active)
+            {
+                if (ap->ytop[x] > t) t = ap->ytop[x];
+                if (ap->ybot[x] < b) b = ap->ybot[x];
+            }
+            if (b <= t)
+                continue;
+            area += b - t;
+            if (area > HW_TINY_SUB)
+                return 0;
+            if (x < bx0) bx0 = x;
+            if (x > bx1) bx1 = x;
+            if (t < by0) by0 = t;
+            if (b > by1) by1 = b;
+        }
+        if (bx1 < bx0)
+            return 0;               /* nothing open: the AP test let it through conservatively */
+        *rx0 = bx0; *ry0 = by0; *rx1 = bx1 + 1; *ry1 = by1;
+    }
+    {
+        unsigned int zb = (unsigned int)((min_cz + max_cz) >> 21);
+        *zb_out = (int)(zb > 127u ? 127u : zb);
+    }
+    return 1;
+}
+
+/* the fill polygon: the visible flat's most common colour, wall shading */
+static HW_NOINLINE void HW_TinyFill(const sector_t *sec, int x0, int y0, int x1, int y1, int zb)
+{
+    int pic = ((int16_t)sec->floorpic != -1) ? sec->floorpic : sec->ceilingpic;
+    uint16_t m_cnt = saturn_cmd_m_count;
+    int light_s, colr;
+    if ((int16_t)pic == -1 || m_cnt >= CMDBUF_M_CAP - 1)
+        return;
+    light_s = ((sec->lightlevel >> 4) & 15) + hw_wall_light_delta;
+    if (light_s < 0) light_s = 0;
+    if (light_s > 15) light_s = 15;
+    colr = (int)(wall_zlight_cmdcolr_LUT[light_s][light_s < 15 ? zb : 0] & 0xFF00u)
+         | (Saturn_Vdp1_FlatAvgColor(pic) & 0xFF);
+    aliased_uint32_t *c = (aliased_uint32_t *)&saturn_cmd_m[m_cnt];
+    saturn_cmd_m_count = m_cnt + 1;
+    c[0] = 0x00040000u;                              /* polygon */
+    c[1] = (0x00C0u << 16) | (uint32_t)colr;         /* no user clip */
+    c[2] = 0;
+    c[3] = ((uint32_t)x0 << 16) | (uint16_t)y0;
+    c[4] = ((uint32_t)(x1 - 1) << 16) | (uint16_t)y0;
+    c[5] = ((uint32_t)(x1 - 1) << 16) | (uint16_t)(y1 - 1);
+    c[6] = ((uint32_t)x0 << 16) | (uint16_t)(y1 - 1);
+    c[7] = 0;
+}
+#endif
+
 static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_inside,
                                                          unsigned int *sp_parts)
 {
@@ -316,6 +442,27 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     }
 #endif
 
+#if HW_TINY_SUB
+    {
+        int tx0, ty0, tx1, ty1, tzb;
+        if (HW_TinyRect(subnum, sf, &tx0, &ty0, &tx1, &ty1, &tzb))
+        {
+            sector_t *sec = &sectors[secnum];
+            saturn_hw_tiny_subs++;
+            HW_TinyFill(sec, tx0, ty0, tx1, ty1, tzb);
+            if (!HW_WALLS_ONLY && __builtin_expect(sf->has_things != 0, 0) &&
+                HW_SubsectorHasThings(sec, (uint32_t)secnum, subnum))
+                HW_RenderSubsectorSprites(sec, subnum);
+#ifndef SATURN_WIN32
+            r32[0] = ((uint32_t)m_start << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
+#else
+            ranges[visit_idx].m_start = m_start;
+            ranges[visit_idx].m_count = (uint16_t)(saturn_cmd_m_count - m_start);
+#endif
+            return;
+        }
+    }
+#endif
     if (!HW_WALLS_ONLY && (flat_flags & (int)HW_FLAT_ALLOW_BOTH))
     {
         sector_t *sec = &sectors[secnum];
@@ -1382,6 +1529,9 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     saturn_hw_prof_bg = 0;
     saturn_hw_wall_quads = 0;
     saturn_hw_flat_quads = 0;
+#if HW_TINY_SUB
+    saturn_hw_tiny_subs = 0;
+#endif
     saturn_hw_slave_timeout = 0;
     saturn_hw_prof_slave_wait = 0;
 #ifdef SATURN_BENCH
