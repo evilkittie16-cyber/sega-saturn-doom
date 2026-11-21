@@ -1177,6 +1177,46 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     saturn_hw_wall_strips += l_quads;
 }
 
+/* Asm stage J (saturn_hw_asm.s hw_asm_persp): HW_EmitWallStrips_Persp_General
+ * below, same arithmetic; the rare per-strip cases call the C helpers. */
+#ifndef HW_ASM_PERSP
+#define HW_ASM_PERSP (HW_ASM && !HW_VIS_STATS)
+#endif
+#if HW_ASM_PERSP
+extern void hw_asm_persp(hw_wall_emit_ctx_t *ctx, int s_min, int s_max);
+_Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall_emit_ctx_t, top_overlap) == 5 &&
+               offsetof(hw_wall_emit_ctx_t, bot_overlap) == 6 && offsetof(hw_wall_emit_ctx_t, ytop_min) == 12 &&
+               offsetof(hw_wall_emit_ctx_t, ybot_max) == 14 && offsetof(hw_wall_emit_ctx_t, ya0) == 16 &&
+               offsetof(hw_wall_emit_ctx_t, ya1) == 18 && offsetof(hw_wall_emit_ctx_t, yb0) == 20 &&
+               offsetof(hw_wall_emit_ctx_t, yb1) == 22 && offsetof(hw_wall_emit_ctx_t, srca) == 24 &&
+               offsetof(hw_wall_emit_ctx_t, th) == 26 && offsetof(hw_wall_emit_ctx_t, cur_v) == 30 &&
+               offsetof(hw_wall_emit_ctx_t, p0) == 40 && offsetof(hw_wall_emit_ctx_t, p1) == 44 &&
+               offsetof(hw_wall_emit_ctx_t, seg) == 48 && offsetof(hw_wall_emit_ctx_t, dz_top) == 52 &&
+               offsetof(hw_wall_emit_ctx_t, dz_bot) == 56 && offsetof(hw_wall_emit_ctx_t, tw) == 68 &&
+               offsetof(hw_wall_emit_ctx_t, srca_mono) == 70 && offsetof(hw_wall_emit_ctx_t, srca_64) == 72 &&
+               offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 && offsetof(hw_wall_emit_ctx_t, rows) == 90 &&
+               offsetof(hw_wall_emit_ctx_t, u_start) == 92 && offsetof(hw_wall_emit_ctx_t, u_span) == 96 &&
+               offsetof(hw_wall_emit_ctx_t, inv_u_span) == 100 && offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104,
+               "hw_asm_persp: ctx layout");
+_Static_assert(offsetof(hw_trans_pillar_t, cx) == 0 && offsetof(hw_trans_pillar_t, cz) == 4 &&
+               offsetof(hw_trans_pillar_t, px) == 12 && offsetof(baked_seg_t, baked_light) == 2 &&
+               sizeof(hw_wall_lod[0]) == 4 && HW_LOD_P4_CZ == 10 && sizeof(wall_zlight_cmdcolr_LUT[0]) == 256 &&
+               HW_NEAR_Z == 0x40000 && CMDBUF_M_CAP == 1280 && sizeof(vdp1_cmd_t) == 32 &&
+               sizeof(saturn_view_cy) == 4 && HW_VIEW_CX == 160 && HW_VIEW_W == 320 &&
+               sizeof(hw_wall_coord_tmp[0]) == 4, "hw_asm_persp: data layout");
+static HW_NOINLINE HW_HOT_O2 int HW_IsStripOccluded_Slow(int s_px0, int s_px1, int coal_strips);
+const void *const hw_asm_persp_ctx[16] = {
+    &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
+    &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
+    hw_wall_lod, (const void *)HW_IsStripOccluded_Slow, (const void *)HW_EmitStripQuad_Slow,
+    (const void *)HW_ModNonPow2, wall_zlight_cmdcolr_LUT, &hw_wall_light_delta, saturn_master_oclut,
+    &saturn_view_cy
+};
+#elif HW_ASM && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+const void *const hw_asm_persp_ctx[1] = { 0 };   /* asm stays linked, unused */
+#endif
+
+#if !HW_ASM_PERSP || HW_ASM_CHECK
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
 {
@@ -1429,6 +1469,61 @@ next_strip_persp:
     saturn_hw_wall_quads  += l_quads;
     saturn_hw_wall_strips += l_quads;
 }
+#endif /* !HW_ASM_PERSP || HW_ASM_CHECK */
+
+#if HW_ASM_PERSP && HW_ASM_CHECK
+/* Self-check: asm, hash its output (commands + counters + clip state), roll
+ * back, C, compare. [0] calls [1] mismatches [2] s_min [3] s_max
+ * [4] asm quads [5] C quads [6] asm hash [7] C hash */
+static volatile uint32_t hw_asm_chk_persp[8];
+static uint32_t HW_PerspHash(uint16_t m0, hw_wall_emit_ctx_t *ctx)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *p = (const uint32_t *)&saturn_cmd_m[m0];
+    const uint32_t *e = (const uint32_t *)&saturn_cmd_m[saturn_cmd_m_count];
+    for (; p < e; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ (uint32_t)saturn_cmd_m_count) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_cells) * 16777619u;
+    h = (h ^ saturn_hw_wall_quads) * 16777619u;
+    h = (h ^ saturn_hw_wall_strips) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_drop) * 16777619u;
+    h = (h ^ (uint32_t)saturn_v1w_captured) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x0) * 16777619u;
+    h = (h ^ (uint32_t)(uint16_t)ctx->last_clip_x1) * 16777619u;
+    return h;
+}
+static HW_NOINLINE void HW_PerspCheck(hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
+{
+    uint16_t m0 = saturn_cmd_m_count;
+    int16_t lc0 = ctx->last_clip_x0, lc1 = ctx->last_clip_x1;
+    int cells0 = saturn_v1w_cells, drop0 = saturn_v1w_drop, cap0 = saturn_v1w_captured;
+    unsigned int q0 = saturn_hw_wall_quads, st0 = saturn_hw_wall_strips;
+    hw_asm_persp(ctx, s_min, s_max);
+    uint32_t ha = HW_PerspHash(m0, ctx);
+    unsigned int qa = saturn_hw_wall_quads - q0;
+    saturn_cmd_m_count = m0;
+    ctx->last_clip_x0 = lc0; ctx->last_clip_x1 = lc1;
+    saturn_v1w_cells = cells0; saturn_v1w_drop = drop0; saturn_v1w_captured = cap0;
+    saturn_hw_wall_quads = q0; saturn_hw_wall_strips = st0;
+    HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+    uint32_t hc = HW_PerspHash(m0, ctx);
+    hw_asm_chk_persp[0]++;
+    if (ha != hc && hw_asm_chk_persp[1]++ == 0)
+    {
+        hw_asm_chk_persp[2] = (uint32_t)s_min;
+        hw_asm_chk_persp[3] = (uint32_t)s_max;
+        hw_asm_chk_persp[4] = qa;
+        hw_asm_chk_persp[5] = saturn_hw_wall_quads - q0;
+        hw_asm_chk_persp[6] = ha;
+        hw_asm_chk_persp[7] = hc;
+    }
+}
+#define HW_PERSPG_CALL HW_PerspCheck
+#elif HW_ASM_PERSP
+#define HW_PERSPG_CALL hw_asm_persp
+#else
+#define HW_PERSPG_CALL HW_EmitWallStrips_Persp_General
+#endif
 
 static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     hw_wall_emit_ctx_t *ctx, int s_min, int s_max)
@@ -1474,7 +1569,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
             (tw >= 64 && (ctx->srca_64 != ctx->srca || ctx->srca_mono != ctx->srca) && (((u_start + 63) & ~63) + 64 <= u_end)) ||
             (int)m_start + (s_max - s_min + 1) >= CMDBUF_M_CAP - 1, 0))
     {
-        HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+        HW_PERSPG_CALL(ctx, s_min, s_max);
         return;
     }
 
@@ -1605,7 +1700,7 @@ HW_ALWAYS_INLINE void HW_EmitWallStrips(hw_wall_emit_ctx_t *ctx)
     if (__builtin_expect(!ctx->persp_strips, 1))
         HW_LINGEN_CALL(ctx, s_min, s_max);
     else
-        HW_EmitWallStrips_Persp_General(ctx, s_min, s_max);
+        HW_PERSPG_CALL(ctx, s_min, s_max);
 #endif
 }
 

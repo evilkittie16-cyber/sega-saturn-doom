@@ -1646,6 +1646,18 @@ static void v1_copy_32_blocks(unsigned int off, const byte *src, int w, int h)
  * to v1_evict even when no command references it yet. */
 static void v1_touch(unsigned int srca)
 {
+    /* A touch only sets the entry's age to v1_age, which advances on every
+     * upload and every frame: touching the same SRCA again at the same age
+     * changes nothing, so a tiny memo skips the binary search (2026-11-21:
+     * ~52 touches per frame at the E1M1 courtyard, mostly repeats of a few
+     * flats; 0.37 ms). */
+    static uint16_t memo_srca[16];
+    static unsigned int memo_age[16];
+    unsigned int k = (srca ^ (srca >> 4)) & 15u;
+    if (memo_srca[k] == (uint16_t)srca && memo_age[k] == v1_age)
+        return;
+    memo_srca[k] = (uint16_t)srca;
+    memo_age[k] = v1_age;
     unsigned int a = srca << 3;
     int lo = 0, hi = v1_log_n - 1;
     while (lo <= hi)

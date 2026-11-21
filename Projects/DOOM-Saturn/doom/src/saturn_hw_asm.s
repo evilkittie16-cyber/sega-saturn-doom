@@ -8277,3 +8277,931 @@ _hw_asm_sprq:
 .Lsq_320:	.word	320
 .Lsq_8000:	.word	0x8000
 .Lsq_255:	.word	255
+
+! ===================================================================
+! Stage J: hw_asm_persp(ctx, s_min, s_max) = HW_EmitWallStrips_Persp_General
+! (saturn_hw_walls.c): perspective wall strips, one per 16 texels, with the
+! 4->1 coalesce, per-strip light ramp, and the C slow helpers
+! (HW_IsStripOccluded_Slow, HW_EmitStripQuad_Slow, HW_ModNonPow2).
+! Table hw_asm_persp_ctx: [0] &saturn_cmd_m [4] &saturn_cmd_m_count
+! [8] &saturn_v1w_cells [12] &saturn_hw_wall_quads [16] &saturn_hw_wall_strips
+! [20] &saturn_v1w_drop [24] &saturn_v1w_captured [28] hw_wall_coord_tmp
+! [32] hw_wall_lod [36] IsStripOccluded_Slow [40] EmitStripQuad_Slow
+! [44] HW_ModNonPow2 [48] wall_zlight_cmdcolr_LUT [52] &hw_wall_light_delta
+! [56] saturn_master_oclut [60] &saturn_view_cy.
+! Frame (88 B): [0] s_max [4] u_end [8] light_s [12] num_strips
+! [16] cur_strip_idx [20] cmd_w2_cur [24] cmd_w2_base [28] cmd_w2_step
+! [32] wrap [36] vcy_top [40] vcy_bot [44] cur_cx1 [48] cur_cz1
+! [52] step_cx1 [56] step_cz1 [60] table; per strip [64] s_px1 [68] s_yb0
+! [72] s_yb1 [76] s_cz1 [80] coal_strips [84] emit_cmd2.
+! Regs: r8 ctx, r9 s, r10 persp_flags (bit 12 = this strip's partial
+! first, temporary), r11 s_px0, r12 s_ya0, r13 s_ya1, r14 s_cz0.
+! ===================================================================
+	.align	2
+	.global	_hw_asm_persp
+_hw_asm_persp:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	add	#-88,r15
+	mov	r4,r8			! ctx
+	mov	r5,r9			! s = s_min
+	mov.l	r6,@r15			! s_max
+	mov.l	.Lp_ctx,r0
+	mov.l	r0,@(60,r15)
+	mov	#92,r0
+	mov.l	@(r0,r8),r1		! u_start
+	mov	#96,r0
+	mov.l	@(r0,r8),r2		! u_span
+	add	r1,r2
+	mov.l	r2,@(4,r15)		! u_end
+	! light_s = clamp((seg->baked_light >> 4) + hw_wall_light_delta, 0, 15)
+	mov.l	@(48,r8),r0
+	mov.b	@(2,r0),r0
+	extu.b	r0,r0
+	shlr2	r0
+	shlr2	r0
+	mov.l	@(60,r15),r3
+	mov.l	@(52,r3),r1
+	mov.l	@r1,r1
+	add	r1,r0
+	cmp/pz	r0
+	bt	1f
+	mov	#0,r0
+1:	mov	#15,r1
+	cmp/gt	r1,r0
+	bf	2f
+	mov	r1,r0
+2:	mov.l	r0,@(8,r15)
+	! const_light (bit 0)
+	mov	#1,r10
+	cmp/ge	r1,r0			! light_s >= 15
+	bt	.Lp_cl
+	shll8	r0			! row offset (128 x uint16)
+	mov.l	@(48,r3),r1
+	add	r0,r1			! row
+	mov	#127,r4
+	mov.l	@(40,r8),r2
+	mov.l	@(4,r2),r0		! p0->cz
+	shlr16	r0
+	shlr2	r0
+	shlr2	r0
+	cmp/hi	r4,r0
+	bf	3f
+	mov	r4,r0
+3:	add	r0,r0
+	mov.w	@(r0,r1),r5
+	mov.l	@(44,r8),r2
+	mov.l	@(4,r2),r0		! p1->cz
+	shlr16	r0
+	shlr2	r0
+	shlr2	r0
+	cmp/hi	r4,r0
+	bf	4f
+	mov	r4,r0
+4:	add	r0,r0
+	mov.w	@(r0,r1),r6
+	cmp/eq	r5,r6
+	movt	r10
+.Lp_cl:
+	mov.l	@(40,r8),r1
+	mov.l	@(12,r1),r11		! s_px0
+	mov.l	@(4,r1),r14		! s_cz0
+	mov.w	@(16,r8),r0
+	mov	r0,r12			! s_ya0
+	mov.w	@(18,r8),r0
+	mov	r0,r13			! s_ya1
+	mov.l	@(44,r8),r1
+	mov.l	@(12,r1),r4		! end_px
+	mov.w	@(20,r8),r0
+	mov	r0,r5			! end_ya0
+	mov.w	@(22,r8),r0
+	mov	r0,r6			! end_ya1
+	! wall_needs_clamp -> r7
+	mov.l	.Lp_500,r0
+	mov	r11,r1
+	add	r0,r1
+	mov	r0,r2
+	sub	r4,r2
+	or	r2,r1
+	mov	r13,r2
+	sub	r12,r2
+	or	r2,r1
+	mov	r6,r2
+	sub	r5,r2
+	or	r2,r1
+	mov.l	.Lp_1022,r2
+	cmp/hi	r2,r1
+	movt	r7
+	mov.l	.Lp_1024,r2
+	mov	r12,r1
+	add	r2,r1
+	mov	r5,r0
+	add	r2,r0
+	or	r0,r1
+	mov	r13,r0
+	add	r2,r0
+	or	r0,r1
+	mov	r6,r0
+	add	r2,r0
+	or	r0,r1
+	mov.l	.Lp_2047,r2
+	cmp/hi	r2,r1
+	movt	r0
+	or	r0,r7
+	! band_all_vis -> r3
+	mov	#0,r3
+	cmp/pz	r11
+	bf	.Lp_bav
+	mov.l	.Lp_320,r0
+	cmp/gt	r0,r4
+	bt	.Lp_bav
+	cmp/ge	r13,r12
+	bt	.Lp_bav
+	cmp/ge	r6,r5
+	bt	.Lp_bav
+	mov.w	@(12,r8),r0		! ytop_min
+	cmp/gt	r0,r13
+	bf	.Lp_bav
+	cmp/gt	r0,r6
+	bf	.Lp_bav
+	mov.w	@(14,r8),r0		! ybot_max
+	cmp/ge	r0,r12
+	bt	.Lp_bav
+	cmp/ge	r0,r5
+	bt	.Lp_bav
+	mov	#1,r3
+.Lp_bav:
+	! wall_slow -> r1, has_occl -> r2, partial_first -> r4, partial_last -> r5
+	mov	r10,r0
+	xor	#1,r0
+	mov	r0,r1
+	mov	r3,r0
+	xor	#1,r0
+	or	r0,r1
+	mov.b	@(2,r8),r0		! occl_state
+	tst	r0,r0
+	movt	r0
+	xor	#1,r0
+	mov	r0,r2
+	or	r2,r1
+	or	r7,r1
+	mov	#92,r0
+	mov.l	@(r0,r8),r0
+	and	#15,r0
+	tst	r0,r0
+	movt	r0
+	xor	#1,r0
+	mov	r0,r4
+	mov.l	@(4,r15),r0
+	and	#15,r0
+	tst	r0,r0
+	movt	r0
+	xor	#1,r0
+	mov	r0,r5
+	mov	#76,r0
+	mov.w	@(r0,r8),r0		! last_clip_x0
+	cmp/eq	#-1,r0
+	movt	r0
+	xor	#1,r0
+	or	r1,r0
+	or	r4,r0			! first_slow
+	shll	r0
+	or	r0,r10
+	shll2	r3
+	or	r3,r10
+	shll2	r1
+	shll	r1
+	or	r1,r10
+	shll2	r4
+	shll2	r4
+	or	r4,r10
+	shll2	r5
+	shll2	r5
+	shll	r5
+	or	r5,r10
+	shll2	r2
+	shll2	r2
+	shll2	r2
+	or	r2,r10
+	shll8	r7
+	shlr	r7
+	or	r7,r10
+	! can_coal (bit 8)
+	mov	#68,r0
+	mov.w	@(r0,r8),r1		! tw
+	mov	#64,r0
+	cmp/ge	r0,r1
+	bf	.Lp_nocoal
+	mov	r1,r0
+	and	#63,r0
+	tst	r0,r0
+	bf	.Lp_nocoal
+	mov.w	@(24,r8),r0
+	extu.w	r0,r2			! srca
+	mov	#72,r0
+	mov.w	@(r0,r8),r0
+	extu.w	r0,r0			! srca_64
+	cmp/eq	r2,r0
+	bf	.Lp_coal2
+	mov	#70,r0
+	mov.w	@(r0,r8),r0
+	extu.w	r0,r0			! srca_mono
+	cmp/eq	r2,r0
+	bt	.Lp_nocoal
+.Lp_coal2:
+	mov	#92,r0
+	mov.l	@(r0,r8),r1
+	add	#63,r1
+	mov	#-64,r0
+	and	r0,r1
+	add	#64,r1
+	mov.l	@(4,r15),r0
+	cmp/gt	r0,r1
+	bt	.Lp_nocoal
+	mov	#1,r0
+	shll8	r0
+	or	r0,r10
+.Lp_nocoal:
+	! num_strips
+	mov	#68,r0
+	mov.w	@(r0,r8),r1		! tw
+	mov	#1,r2
+	cmp/pl	r1
+	bf	.Lp_ns
+	mov	r1,r2
+	add	#15,r2
+	shar	r2
+	shar	r2
+	shar	r2
+	shar	r2
+	cmp/pl	r2
+	bt	.Lp_ns
+	mov	#1,r2
+.Lp_ns:
+	mov.l	r2,@(12,r15)
+	mov	r2,r1
+	add	#-1,r1			! mask
+	tst	r1,r2
+	bf	.Lp_npow
+	mov	r9,r0
+	bra	.Lp_idx
+	and	r1,r0
+.Lp_npow:
+	mov	r9,r4
+	mov	r2,r5
+	mov.l	@(60,r15),r0
+	mov.l	@(44,r0),r0
+	jsr	@r0			! HW_ModNonPow2(s_min, num_strips)
+	nop
+.Lp_idx:
+	mov.l	r0,@(16,r15)		! cur_strip_idx
+	! cmd words
+	mov	#90,r0
+	mov.w	@(r0,r8),r0
+	extu.b	r0,r1			! rows & 0xFF
+	mov	#2,r0
+	shll8	r0
+	or	r0,r1			! size_lo
+	mov.w	@(24,r8),r0
+	extu.w	r0,r2			! srca
+	mov.w	@(30,r8),r0		! cur_v
+	add	r0,r0
+	add	r0,r2
+	shll16	r2
+	or	r1,r2			! cmd_w2_base
+	mov.l	r2,@(24,r15)
+	mov.w	@(26,r8),r0		! th
+	mov	r0,r3
+	shll16	r3
+	shll	r3			! step = th << 17
+	mov.l	r3,@(28,r15)
+	mov.l	@(16,r15),r0
+	mul.l	r0,r3
+	sts	macl,r0
+	add	r2,r0
+	mov.l	r0,@(20,r15)		! cmd_w2_cur
+	mov.l	@(12,r15),r0
+	mul.l	r0,r3
+	sts	macl,r0
+	mov.l	r0,@(32,r15)		! wrap
+	! vcy_top / vcy_bot
+	mov.l	@(60,r15),r0
+	mov.l	@(60,r0),r0
+	mov.l	@r0,r1			! view_cy
+	mov.b	@(5,r8),r0		! top_overlap
+	extu.b	r0,r0
+	mov	r1,r2
+	sub	r0,r2
+	mov.l	r2,@(36,r15)
+	mov.b	@(6,r8),r0		! bot_overlap
+	extu.b	r0,r0
+	add	r1,r0
+	mov.l	r0,@(40,r15)
+	! strip column stepping
+	mov	#0,r0
+	mov.l	r0,@(44,r15)
+	mov.l	r0,@(48,r15)
+	mov.l	r0,@(52,r15)
+	mov.l	r0,@(56,r15)
+	mov.l	@r15,r0
+	cmp/ge	r0,r9
+	bt	.Lp_loop0
+	mov.l	@(40,r8),r1		! p0
+	mov.l	@(44,r8),r2		! p1
+	mov.l	@r2,r3
+	mov.l	@r1,r0
+	sub	r0,r3			! d_cx
+	mov.l	@(4,r2),r4
+	mov.l	@(4,r1),r0
+	sub	r0,r4			! d_cz
+	mov	#96,r0
+	mov.l	@(r0,r8),r5		! u_len
+	mov	#92,r0
+	mov.l	@(r0,r8),r0
+	and	#15,r0
+	tst	r0,r0
+	bf	.Lp_gen
+	mov	#64,r0
+	cmp/eq	r0,r5
+	bt	.Lp_sh2
+	mov	#32,r0
+	cmp/eq	r0,r5
+	bf	.Lp_gen
+	shar	r3
+	bra	.Lp_shd
+	shar	r4
+.Lp_sh2:
+	shar	r3
+	shar	r3
+	shar	r4
+	shar	r4
+.Lp_shd:
+	mov.l	r3,@(52,r15)
+	mov.l	r4,@(56,r15)
+	mov.l	@r1,r0
+	add	r3,r0
+	mov.l	r0,@(44,r15)
+	mov.l	@(4,r1),r0
+	add	r4,r0
+	bra	.Lp_loop0
+	mov.l	r0,@(48,r15)
+.Lp_gen:
+	mov	#100,r0
+	mov.l	@(r0,r8),r6		! inv_u_span
+	mov	r9,r7
+	add	#1,r7
+	shll2	r7
+	shll2	r7
+	mov	#92,r0
+	mov.l	@(r0,r8),r0
+	sub	r0,r7			! first_du
+	mul.l	r7,r6
+	sts	macl,r7
+	shlr8	r7			! first_t1
+	dmuls.l	r3,r7
+	sts	mach,r0
+	sts	macl,r5
+	xtrct	r0,r5
+	mov.l	@r1,r0
+	add	r0,r5
+	mov.l	r5,@(44,r15)		! cur_cx1
+	dmuls.l	r4,r7
+	sts	mach,r0
+	sts	macl,r5
+	xtrct	r0,r5
+	mov.l	@(4,r1),r0
+	add	r0,r5
+	mov.l	r5,@(48,r15)		! cur_cz1
+	shlr2	r6
+	shlr2	r6			! step_t1
+	dmuls.l	r3,r6
+	sts	mach,r0
+	sts	macl,r5
+	xtrct	r0,r5
+	mov.l	r5,@(52,r15)		! step_cx1
+	dmuls.l	r4,r6
+	sts	mach,r0
+	sts	macl,r5
+	xtrct	r0,r5
+	mov.l	r5,@(56,r15)		! step_cz1
+.Lp_loop0:
+	bra	.Lp_loop
+	nop
+	.align	2
+.Lp_ctx:	.long	_hw_asm_persp_ctx
+.Lp_500:	.long	500
+.Lp_1022:	.long	1022
+.Lp_1024:	.long	1024
+.Lp_2047:	.long	2047
+.Lp_320:	.long	320
+	.align	2
+.Lp_loop:
+	mov.l	@r15,r0
+	cmp/gt	r0,r9
+	bt	.Lp_done
+	mov	#0,r7			! coal_strips
+	mov.l	@(20,r15),r6		! emit_cmd2 = cmd_w2_cur
+	! 4 -> 1 coalesce
+	mov	r10,r0
+	shlr8	r0
+	tst	#1,r0
+	bt	.Lp_nc
+	mov.l	@(16,r15),r0
+	tst	#3,r0
+	bf	.Lp_nc
+	mov	r10,r0
+	tst	#16,r0
+	bf	.Lp_nc
+	mov	r9,r0
+	add	#4,r0
+	shll2	r0
+	shll2	r0
+	mov.l	@(4,r15),r1
+	cmp/gt	r1,r0
+	bt	.Lp_nc
+	cmp/pz	r11
+	bf	.Lp_nc
+	mov.l	@(60,r15),r0
+	mov.l	@(32,r0),r2
+	mov.l	@(40,r2),r2		! hw_wall_lod[HW_LOD_P4_CZ]
+	cmp/ge	r2,r14
+	bf	.Lp_nc
+	mov	r9,r0
+	add	#3,r0
+	mov.l	@r15,r1
+	cmp/ge	r1,r0
+	bt	.Lp_e3p1
+	mov.l	@(56,r15),r0
+	mov	r0,r1
+	add	r0,r0
+	add	r1,r0
+	mov.l	@(48,r15),r1
+	bra	.Lp_e3
+	add	r1,r0			! cur_cz1 + 3 * step_cz1
+.Lp_e3p1:
+	mov.l	@(44,r8),r0
+	mov.l	@(4,r0),r0		! p1->cz
+.Lp_e3:
+	cmp/ge	r2,r0
+	bf	.Lp_nc
+	mov	#4,r7
+	mov.l	@(16,r15),r1
+	shlr2	r1			! blk
+	mov.w	@(26,r8),r0
+	mov	r0,r3			! th
+	mov.w	@(24,r8),r0
+	extu.w	r0,r4			! srca
+	mov	#72,r0
+	mov.w	@(r0,r8),r0
+	extu.w	r0,r5			! srca_64
+	cmp/eq	r4,r5
+	bt	.Lp_cmono
+	shll2	r3
+	shll	r3
+	mul.l	r1,r3
+	sts	macl,r3
+	mov.w	@(30,r8),r0
+	shll2	r0
+	shll	r0
+	add	r0,r5
+	add	r3,r5
+	mov	#8,r2
+	bra	.Lp_cemit
+	shll8	r2
+.Lp_cmono:
+	mov	#70,r0
+	mov.w	@(r0,r8),r0
+	extu.w	r0,r5			! srca_mono
+	shll2	r3
+	mul.l	r1,r3
+	sts	macl,r3
+	mov.w	@(30,r8),r0
+	shll2	r0
+	add	r0,r5
+	add	r3,r5
+	mov	#4,r2
+	shll8	r2
+.Lp_cemit:
+	shll16	r5
+	or	r2,r5
+	mov	#90,r0
+	mov.w	@(r0,r8),r0
+	extu.b	r0,r0
+	or	r0,r5
+	mov	r5,r6			! emit_cmd2
+	mov.l	@(28,r15),r0
+	mov	r0,r1
+	add	r0,r0
+	add	r1,r0
+	mov.l	@(20,r15),r1
+	add	r0,r1
+	mov.l	r1,@(20,r15)		! cmd_w2_cur += 3 steps
+	mov.l	@(16,r15),r0
+	add	#3,r0
+	mov.l	r0,@(16,r15)
+	mov.l	@(52,r15),r0
+	mov	r0,r1
+	add	r0,r0
+	add	r1,r0
+	mov.l	@(44,r15),r1
+	add	r0,r1
+	mov.l	r1,@(44,r15)
+	mov.l	@(56,r15),r0
+	mov	r0,r1
+	add	r0,r0
+	add	r1,r0
+	mov.l	@(48,r15),r1
+	add	r0,r1
+	mov.l	r1,@(48,r15)
+	add	#3,r9
+.Lp_nc:
+	mov.l	@r15,r0
+	cmp/ge	r0,r9
+	bt	.Lp_last
+	mov.l	@(44,r15),r1		! s_cx1
+	mov.l	@(48,r15),r2		! s_cz1
+	mov.l	@(52,r15),r0
+	add	r1,r0
+	mov.l	r0,@(44,r15)
+	mov.l	@(56,r15),r0
+	add	r2,r0
+	mov.l	r0,@(48,r15)
+	mov.l	.Lp_nearz,r0
+	cmp/ge	r0,r2
+	bt	5f
+	mov	r0,r2
+5:	mov	r2,r0
+	shlr16	r0
+	mov.l	.Lp_2048,r3
+	cmp/hs	r3,r0
+	bf	6f
+	shlr2	r0
+	shlr	r0
+	mov.l	.Lp_1023,r4
+	cmp/hi	r4,r0
+	bf	7f
+	mov	r4,r0
+7:	add	r3,r0
+6:	shll2	r0
+	mov.l	@(60,r15),r3
+	mov.l	@(56,r3),r3
+	mov.l	@(r0,r3),r3		! scale
+	dmuls.l	r1,r3
+	sts	mach,r4
+	mov	#80,r0
+	add	r0,r4
+	add	r0,r4			! s_px1
+	mov.l	@(52,r8),r0
+	dmuls.l	r0,r3
+	sts	mach,r0
+	mov.l	@(36,r15),r5
+	sub	r0,r5			! s_yb0
+	mov.l	@(56,r8),r0
+	dmuls.l	r0,r3
+	sts	mach,r0
+	mov.l	@(40,r15),r1
+	bra	.Lp_proj
+	sub	r0,r1			! s_yb1
+.Lp_last:
+	mov.l	@(44,r8),r0
+	mov.l	@(4,r0),r2		! p1->cz
+	mov.l	@(12,r0),r4		! p1->px
+	mov.w	@(20,r8),r0
+	mov	r0,r5			! yb0
+	mov.w	@(22,r8),r0
+	mov	r0,r1			! yb1
+	mov	r10,r0
+	shlr2	r0
+	shlr2	r0
+	and	#2,r0
+	or	r0,r10			! partial_last -> cur_slow
+.Lp_proj:
+	mov	#64,r0
+	mov.l	r4,@(r0,r15)
+	mov	#68,r0
+	mov.l	r5,@(r0,r15)
+	mov	#72,r0
+	mov.l	r1,@(r0,r15)
+	mov	#76,r0
+	mov.l	r2,@(r0,r15)
+	mov	#80,r0
+	mov.l	r7,@(r0,r15)
+	mov	#84,r0
+	mov.l	r6,@(r0,r15)
+	cmp/gt	r11,r4			! s_px1 > s_px0
+	bf	.Lp_next
+	mov	#104,r0
+	mov.l	@(r0,r8),r3		! strip_cmd1
+	mov	r10,r0
+	tst	#2,r0
+	bt	.Lp_fast
+	! slow strip
+	tst	#16,r0
+	bt	8f
+	mov	#16,r0
+	shll8	r0
+	or	r0,r10			! bit 12: this strip is the partial first
+8:	mov	#-17,r0
+	and	r0,r10			! clear partial_first
+	mov	r10,r0
+	tst	#4,r0
+	bf	.Lp_occ
+	cmp/pl	r4
+	bf	.Lp_next
+	mov.l	.Lp_320l,r0
+	cmp/ge	r0,r11
+	bt	.Lp_next
+	cmp/ge	r13,r12
+	bf	9f
+	cmp/ge	r1,r5
+	bt	.Lp_next
+9:	mov.w	@(12,r8),r0		! ytop_min
+	cmp/gt	r0,r13
+	bt	10f
+	cmp/gt	r0,r1
+	bf	.Lp_next
+10:	mov.w	@(14,r8),r0		! ybot_max
+	cmp/ge	r0,r12
+	bf	.Lp_occ
+	cmp/ge	r0,r5
+	bt	.Lp_next
+.Lp_occ:
+	mov	r10,r0
+	tst	#64,r0
+	bt	.Lp_lt
+	mov	r4,r5
+	mov	r11,r4
+	mov	r7,r6
+	mov.l	@(60,r15),r0
+	mov.l	@(36,r0),r0
+	jsr	@r0			! HW_IsStripOccluded_Slow
+	nop
+	tst	r0,r0
+	bf	.Lp_next
+	mov	#104,r0
+	mov.l	@(r0,r8),r3		! strip_cmd1 (reload)
+.Lp_lt:
+	mov	r10,r0
+	tst	#1,r0
+	bf	.Lp_pq
+	mov	#76,r0
+	mov.l	@(r0,r15),r2		! s_cz1
+	mov	r14,r0
+	add	r2,r0
+	shlr16	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0			! (s_cz0 + s_cz1) >> 21
+	mov	#127,r1
+	cmp/hi	r1,r0
+	bf	11f
+	mov	r1,r0
+11:	add	r0,r0
+	mov.l	@(8,r15),r1
+	shll8	r1
+	add	r1,r0
+	mov.l	@(60,r15),r1
+	mov.l	@(48,r1),r1
+	mov.w	@(r0,r1),r0
+	extu.w	r0,r0
+	mov.l	.Lp_ff00,r1
+	and	r1,r0
+	shlr16	r3
+	shll16	r3
+	or	r0,r3			! strip_cmd1 with this strip's shade
+.Lp_pq:
+	mov	r10,r0
+	tst	#128,r0			! wall_needs_clamp
+	bf	.Lp_slowq
+	mov	#76,r0
+	mov.w	@(r0,r8),r0		! last_clip_x0
+	cmp/eq	#-1,r0
+	bf	.Lp_slowq
+	mov	#80,r0
+	mov.l	@(r0,r15),r0		! coal_strips
+	tst	r0,r0
+	bf	.Lp_fast
+	mov	r10,r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	tst	#1,r0			! partial first
+	bf	.Lp_slowq
+	mov.l	@r15,r0
+	cmp/eq	r0,r9
+	bf	.Lp_fast
+	mov	r10,r0
+	tst	#32,r0			! partial_last
+	bt	.Lp_fast
+.Lp_slowq:
+	mov	r10,r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	tst	#1,r0
+	bt	12f
+	mov	#92,r0
+	mov.l	@(r0,r8),r4		! u_lo = u_start
+	bra	13f
+	nop
+12:	mov	#80,r0
+	mov.l	@(r0,r15),r0
+	mov	r9,r4
+	tst	r0,r0
+	bt	14f
+	add	#-3,r4
+14:	shll2	r4
+	shll2	r4			! u_lo = (s - (coal ? 3 : 0)) << 4
+13:	mov.l	@r15,r0
+	cmp/eq	r0,r9
+	bf	15f
+	mov.l	@(4,r15),r5		! u_hi = u_end
+	bra	16f
+	nop
+15:	mov	r9,r5
+	add	#1,r5
+	shll2	r5
+	shll2	r5			! u_hi = (s + 1) << 4
+16:	extu.w	r4,r4
+	shll16	r5
+	or	r4,r5			! u_lo | (u_hi << 16)
+	mov.l	@(60,r15),r0
+	mov.l	@(28,r0),r1		! hw_wall_coord_tmp
+	mov.l	r11,@r1
+	mov	#64,r0
+	mov.l	@(r0,r15),r0
+	mov.l	r0,@(4,r1)
+	mov.l	r12,@(8,r1)
+	mov	#68,r0
+	mov.l	@(r0,r15),r0
+	mov.l	r0,@(12,r1)
+	mov.l	r13,@(16,r1)
+	mov	#72,r0
+	mov.l	@(r0,r15),r0
+	mov.l	r0,@(20,r1)
+	mov	r9,r4
+	mov	r3,r6
+	mov	#84,r0
+	mov.l	@(r0,r15),r7		! emit_cmd2
+	mov.l	@(60,r15),r0
+	mov.l	@(40,r0),r0
+	jsr	@r0			! HW_EmitStripQuad_Slow
+	nop
+	tst	r0,r0
+	bt	.Lp_next
+	mov	#1,r0
+	shll16	r0
+	bra	.Lp_next
+	add	r0,r10
+.Lp_fast:
+	mov.l	@(60,r15),r1
+	mov.l	@(4,r1),r2		! &saturn_cmd_m_count
+	mov.w	@r2,r0
+	extu.w	r0,r0
+	mov.l	.Lp_capm1,r4
+	cmp/ge	r4,r0
+	bt	.Lp_drop
+	mov	r0,r4
+	add	#1,r4
+	mov.w	r4,@r2
+	shll2	r0
+	shll2	r0
+	shll	r0			! m_cnt * 32
+	mov.l	@r1,r4
+	mov.l	@r4,r4			! saturn_cmd_m
+	add	r0,r4			! cmd32
+	mov	#2,r0
+	shll16	r0
+	mov.l	r0,@r4			! 0x00020000
+	mov.l	r3,@(4,r4)
+	mov	#84,r0
+	mov.l	@(r0,r15),r0
+	mov.l	r0,@(8,r4)		! emit_cmd2
+	mov	r11,r5
+	shll16	r5			! s_xa_p
+	extu.w	r12,r0
+	or	r5,r0
+	mov.l	r0,@(12,r4)
+	mov	#64,r0
+	mov.l	@(r0,r15),r6
+	shll16	r6			! s_xb_p
+	mov	#68,r0
+	mov.l	@(r0,r15),r0
+	extu.w	r0,r0
+	or	r6,r0
+	mov.l	r0,@(16,r4)
+	mov	#72,r0
+	mov.l	@(r0,r15),r0
+	extu.w	r0,r0
+	or	r6,r0
+	mov.l	r0,@(20,r4)
+	extu.w	r13,r0
+	or	r5,r0
+	mov.l	r0,@(24,r4)
+	mov	#0,r0
+	mov.l	r0,@(28,r4)
+	mov	#1,r0
+	shll16	r0
+	bra	.Lp_next
+	add	r0,r10
+.Lp_drop:
+	mov.l	@(20,r1),r2
+	mov.l	@r2,r0
+	add	#1,r0
+	mov.l	r0,@r2			! saturn_v1w_drop++
+	mov.l	@(24,r1),r2
+	mov	#1,r0
+	mov.l	r0,@r2			! saturn_v1w_captured = 1
+.Lp_next:
+	mov	r10,r0
+	tst	#2,r0
+	bt	17f
+	mov	r10,r1
+	shlr2	r1
+	mov	r1,r0
+	and	#2,r0
+	mov	r0,r1
+	mov	#-19,r0
+	and	r0,r10
+	or	r1,r10			! cur_slow = wall_slow, partial_first off
+	mov	#76,r0
+	mov.w	@(r0,r8),r0
+	cmp/eq	#-1,r0
+	bt	17f
+	mov	#2,r0
+	or	r0,r10
+17:	mov	#16,r0
+	shll8	r0
+	not	r0,r0
+	and	r0,r10			! drop the bit-12 temporary
+	mov	#64,r0
+	mov.l	@(r0,r15),r11		! s_px0 = s_px1
+	mov	#68,r0
+	mov.l	@(r0,r15),r12
+	mov	#72,r0
+	mov.l	@(r0,r15),r13
+	mov	#76,r0
+	mov.l	@(r0,r15),r14
+	mov.l	@(16,r15),r0
+	add	#1,r0
+	mov.l	@(12,r15),r1
+	cmp/ge	r1,r0
+	bf	18f
+	sub	r1,r0
+18:	mov.l	r0,@(16,r15)
+	mov.l	@(20,r15),r0
+	mov.l	@(28,r15),r1
+	add	r1,r0
+	mov.l	@(32,r15),r1
+	tst	r1,r1
+	bt	20f
+	mov.l	@(24,r15),r2
+19:	mov	r0,r3
+	sub	r2,r3
+	cmp/hs	r1,r3
+	bf	20f
+	bra	19b
+	sub	r1,r0
+20:	mov.l	r0,@(20,r15)
+	bra	.Lp_loop
+	add	#1,r9
+.Lp_done:
+	mov	r10,r0
+	shlr16	r0			! quads
+	mov.l	@(60,r15),r1
+	mov.l	@(8,r1),r2
+	mov.l	@r2,r3
+	add	r0,r3
+	mov.l	r3,@r2
+	mov.l	@(12,r1),r2
+	mov.l	@r2,r3
+	add	r0,r3
+	mov.l	r3,@r2
+	mov.l	@(16,r1),r2
+	mov.l	@r2,r3
+	add	r0,r3
+	mov.l	r3,@r2
+	add	#88,r15
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+	.align	2
+.Lp_nearz:	.long	0x00040000
+.Lp_2048:	.long	2048
+.Lp_1023:	.long	1023
+.Lp_320l:	.long	320
+.Lp_ff00:	.long	0x0000FF00
+.Lp_capm1:	.long	1279
