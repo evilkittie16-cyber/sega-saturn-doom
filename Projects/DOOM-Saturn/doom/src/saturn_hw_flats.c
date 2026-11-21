@@ -2203,6 +2203,62 @@ static HW_NOINLINE HW_HOT_O2 int HW_ChunkVisible(const saturn_flat_chunk_t *c,
 #endif
 
 /* Takes 4 register arguments (r4=is_master, r5=ipc, r6=job, r7=fctx), 0 stack arguments! */
+/* Asm stage S1 (saturn_hw_asm.s hw_asm_flatproj): ProcessJob's phase 1,
+ * transform + project every vertex of the pass once. Both CPUs run it (the
+ * master steals jobs), so all inputs travel in this per-call block. */
+/* Measured 2026-11-21 (5thPlanet, slave ms/frame, C -> asm incl. the
+ * kernel): m8 8.21 -> 8.37, p2 11.62 -> 11.78, m1a 12.51 -> 12.79,
+ * w 5.90 -> 6.02. Identical output, slightly slower: GCC keeps the per-job
+ * constants in registers, the asm reloads them per vertex. Default OFF. */
+#ifndef HW_ASM_FLATPROJ
+#define HW_ASM_FLATPROJ 0
+#endif
+typedef struct {
+    const saturn_flat_vert_t *v_ptr;    /*  0 */
+    const uint8_t *fr_ptr;              /*  4 */
+    int fr_step;                        /*  8 */
+    saturn_proj_v_t *p_ptr;             /* 12 */
+    int v_n;                            /* 16 */
+    int cam_x16, cam_y16;               /* 20 24 */
+    fixed_t vcos, vsin;                 /* 28 32 */
+    fixed_t cz_origin, cx_origin;       /* 36 40 */
+    int vcx, vcy;                       /* 44 48 */
+    fixed_t y_ceil_w, y_floor_w;        /* 52 56 */
+    const unsigned int *oclut;          /* 60 */
+    int mode;                           /* 64: 0 floor+ceiling, 1 ceiling, 2 floor */
+    hw_flat_emit_ctx_t *fctx;           /* 68 */
+    int (*slow)(int, int, hw_flat_emit_ctx_t *, saturn_proj_v_t *);   /* 72 */
+} hw_flatproj_args_t;
+/* the out-of-range vertex (C phase 1's else branch): writes cx/cz, returns
+ * the scale, or 0 when the vertex is behind the near plane */
+static HW_NOINLINE HW_COLD_OS int HW_FlatVertSlow(int dx, int dy, hw_flat_emit_ctx_t *fctx, saturn_proj_v_t *p_ptr)
+{
+    fixed_t cz, cx;
+    if (__builtin_expect((((unsigned int)dx + 262144u) | ((unsigned int)dy + 262144u)) > 524287u, 0))
+    {
+        HW_TransformFlatVert_Shifted(dx, dy, fctx, p_ptr);
+        cx = p_ptr->cx;
+        cz = p_ptr->cz;
+    }
+    else
+    {
+        ProjectPillar_2D(dx, dy, fctx->vcos, fctx->vsin, fctx->cz_origin, fctx->cx_origin, &cz, &cx);
+        p_ptr->cx = cx;
+        p_ptr->cz = cz;
+    }
+    if (cz < HW_NEAR_Z)
+        return 0;
+    return HW_SlaveFastDiv(cz);
+}
+#if HW_ASM_FLATPROJ && !defined(SATURN_WIN32)
+extern void hw_asm_flatproj(const hw_flatproj_args_t *a);
+_Static_assert(offsetof(hw_flatproj_args_t, oclut) == 60 && offsetof(hw_flatproj_args_t, mode) == 64 &&
+               offsetof(hw_flatproj_args_t, fctx) == 68 && offsetof(hw_flatproj_args_t, slow) == 72 &&
+               sizeof(saturn_flat_vert_t) == 4 && sizeof(saturn_proj_v_t) == 16 &&
+               offsetof(saturn_proj_v_t, cz) == 4 && offsetof(saturn_proj_v_t, px) == 8 &&
+               HW_NEAR_Z == 0x40000, "hw_asm_flatproj: layout");
+#endif
+
 static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     int is_master, volatile hw_slave_ipc_t *ipc,
     const volatile hw_flat_job_t *job, hw_flat_emit_ctx_t *fctx)
@@ -2539,6 +2595,26 @@ chunk_next:
     hw_fq_stats[2] += (uint32_t)(v_hi - v_lo);
 #endif
 
+#if HW_ASM_FLATPROJ && !defined(SATURN_WIN32)
+    {
+        hw_flatproj_args_t fa;
+        fa.v_ptr = verts + v_lo;
+        fa.fr_ptr = vfrac + v_lo * fr_step;
+        fa.fr_step = fr_step;
+        fa.p_ptr = proj_v;
+        fa.v_n = v_n;
+        fa.cam_x16 = cam_x16; fa.cam_y16 = cam_y16;
+        fa.vcos = vcos; fa.vsin = vsin;
+        fa.cz_origin = cz_origin; fa.cx_origin = cx_origin;
+        fa.vcx = vcx; fa.vcy = vcy;
+        fa.y_ceil_w = y_ceil_w; fa.y_floor_w = y_floor_w;
+        fa.oclut = SATURN_OCLUT;
+        fa.mode = (emit_ceil && emit_floor) ? 0 : (emit_ceil ? 1 : 2);
+        fa.fctx = fctx;
+        fa.slow = HW_FlatVertSlow;
+        hw_asm_flatproj(&fa);
+    }
+#else
     const saturn_flat_vert_t * __restrict v_ptr = verts + v_lo;
     const uint8_t * __restrict fr_ptr = vfrac + v_lo * fr_step;
     saturn_proj_v_t * __restrict p_ptr = proj_v;
@@ -2682,6 +2758,7 @@ vert_behind:
 #endif
         }
     }
+#endif /* HW_ASM_FLATPROJ */
 
     const saturn_flat_quad_idx_t * __restrict q_ptr = quads + q_lo;
     const uint16_t *quv_ptr = fctx->quv;

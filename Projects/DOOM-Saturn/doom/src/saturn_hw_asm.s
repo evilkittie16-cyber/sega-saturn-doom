@@ -9559,3 +9559,264 @@ _hw_asm_unbp:
 .Lup_320:	.long	320
 .Lup_2048:	.long	2048
 .Lup_1023:	.long	1023
+
+! ===================================================================
+! Stage S1: hw_asm_flatproj(const hw_flatproj_args_t *a) = phase 1 of
+! HW_Worker_ProcessJob (saturn_hw_flats.c): transform + project each vertex
+! of the pass once. Runs on BOTH CPUs (the master steals jobs): every input
+! is in the caller's block, no shared scratch. Block: [0] v_ptr [4] fr_ptr
+! [8] fr_step [12] p_ptr [16] v_n [20] cam_x16 [24] cam_y16 [28] vcos
+! [32] vsin [36] cz_origin [40] cx_origin [44] vcx [48] vcy [52] y_ceil_w
+! [56] y_floor_w [60] oclut [64] mode (0 both, 1 ceiling, 2 floor)
+! [68] fctx [72] slow(dx, dy, fctx, p) -> scale or 0 (behind).
+! proj vert 16 B: cx 0, cz 4, word 8 = px<<16|py_c, word 12 = py_f<<16|wy.
+! Regs: r8 block, r9 v_ptr, r10 fr_ptr, r11 p_ptr, r12 count, r13 fr_step,
+! r14 qy.
+! ===================================================================
+	.align	2
+	.global	_hw_asm_flatproj
+_hw_asm_flatproj:
+	mov.l	r8,@-r15
+	mov.l	r9,@-r15
+	mov.l	r10,@-r15
+	mov.l	r11,@-r15
+	mov.l	r12,@-r15
+	mov.l	r13,@-r15
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	mov	r4,r8
+	mov.l	@r8,r9
+	mov.l	@(4,r8),r10
+	mov.l	@(8,r8),r13
+	mov.l	@(12,r8),r11
+	mov.l	@(16,r8),r12
+	cmp/pl	r12
+	bf	.Lfp_done
+.Lfp_loop:
+	mov.w	@r9,r1			! qx
+	mov.w	@(2,r9),r0
+	mov	r0,r14			! qy
+	mov.b	@r10,r0
+	extu.b	r0,r0			! fr
+	mov	r1,r2
+	shll2	r2
+	shll2	r2
+	mov.l	@(20,r8),r3
+	sub	r3,r2
+	mov	r0,r3
+	shlr2	r3
+	shlr2	r3
+	add	r3,r2			! dx = qx*16 - cam_x16 + (fr >> 4)
+	mov	r14,r4
+	shll2	r4
+	shll2	r4
+	mov.l	@(24,r8),r3
+	sub	r3,r4
+	and	#15,r0
+	add	r0,r4			! dy = qy*16 - cam_y16 + (fr & 15)
+	mov.l	.Lfp_22400,r0
+	mov	r2,r5
+	add	r0,r5
+	mov	r4,r6
+	add	r0,r6
+	or	r6,r5
+	mov.l	.Lfp_44800,r0
+	cmp/hi	r0,r5
+	bt	.Lfp_slow
+	! ProjectPillar_2D_16
+	mov.l	@(28,r8),r5		! vcos
+	mov.l	@(32,r8),r6		! vsin
+	muls.w	r2,r6
+	sts	macl,r7			! dx * vsin
+	muls.w	r4,r5
+	sts	macl,r0			! dy * vcos
+	sub	r0,r7
+	mov.l	@(40,r8),r0
+	sub	r0,r7			! cx
+	muls.w	r2,r5
+	sts	macl,r3			! dx * vcos
+	muls.w	r4,r6
+	sts	macl,r0			! dy * vsin
+	add	r0,r3
+	mov.l	@(36,r8),r0
+	sub	r0,r3			! cz
+	mov.l	r7,@r11
+	mov.l	r3,@(4,r11)
+	mov.l	.Lfp_nearz,r0
+	cmp/ge	r0,r3
+	bf	.Lfp_behind
+	mov	r3,r0
+	shlr16	r0
+	shll2	r0
+	mov.l	@(60,r8),r1
+	bra	.Lfp_proj
+	mov.l	@(r0,r1),r1		! s = oclut[cz >> 16]
+.Lfp_slow:
+	mov	r4,r5			! dy
+	mov	r2,r4			! dx
+	mov	#68,r0
+	mov.l	@(r0,r8),r6		! fctx
+	mov	r11,r7			! p
+	mov	#72,r0
+	mov.l	@(r0,r8),r0
+	jsr	@r0			! HW_FlatVertSlow
+	nop
+	tst	r0,r0
+	bt	.Lfp_behind
+	mov	r0,r1			! s
+	mov.l	@r11,r7			! cx
+.Lfp_proj:
+	mov.l	@(44,r8),r2
+	dmuls.l	r7,r1
+	sts	mach,r0
+	add	r0,r2			! px = vcx + hi(cx * s)
+	mov	#32,r5
+	shll8	r5			! 8192
+	mov	#64,r0
+	mov.l	@(r0,r8),r0		! mode
+	tst	r0,r0
+	bf	.Lfp_single
+	mov.l	@(52,r8),r0
+	dmuls.l	r0,r1
+	sts	mach,r0
+	mov.l	@(48,r8),r3
+	sub	r0,r3			! pyc
+	mov.l	@(56,r8),r0
+	dmuls.l	r0,r1
+	sts	mach,r0
+	mov.l	@(48,r8),r4
+	sub	r0,r4			! pyf
+	mov	r2,r6
+	add	r5,r6
+	mov	r3,r0
+	add	r5,r0
+	or	r0,r6
+	mov	r4,r0
+	add	r5,r0
+	or	r0,r6
+	mov.l	.Lfp_16383,r0
+	cmp/hi	r0,r6
+	bf	.Lfp_pk2
+	mov	r2,r6			! clamp px
+	add	r5,r6
+	mov.l	.Lfp_16384,r0
+	cmp/hi	r0,r6
+	bf	1f
+	mov	r2,r6
+	shll	r6
+	subc	r6,r6
+	mov.l	.Lfp_8191,r0
+	xor	r0,r6
+	mov	r6,r2
+1:	mov	r3,r6			! clamp pyc
+	add	r5,r6
+	mov.l	.Lfp_16384,r0
+	cmp/hi	r0,r6
+	bf	2f
+	mov	r3,r6
+	shll	r6
+	subc	r6,r6
+	mov.l	.Lfp_8191,r0
+	xor	r0,r6
+	mov	r6,r3
+2:	mov	r4,r6			! clamp pyf
+	add	r5,r6
+	mov.l	.Lfp_16384,r0
+	cmp/hi	r0,r6
+	bf	.Lfp_pk2
+	mov	r4,r6
+	shll	r6
+	subc	r6,r6
+	mov.l	.Lfp_8191,r0
+	xor	r0,r6
+	mov	r6,r4
+.Lfp_pk2:
+	shll16	r2
+	extu.w	r3,r3
+	or	r3,r2
+	mov.l	r2,@(8,r11)		! px << 16 | pyc
+	shll16	r4
+	extu.w	r14,r0
+	or	r0,r4
+	bra	.Lfp_next
+	mov.l	r4,@(12,r11)		! pyf << 16 | qy
+.Lfp_single:
+	cmp/eq	#1,r0
+	bf	3f
+	bra	4f
+	mov.l	@(52,r8),r0		! ceiling height
+3:	mov.l	@(56,r8),r0		! floor height
+4:	dmuls.l	r0,r1
+	sts	mach,r0
+	mov.l	@(48,r8),r3
+	sub	r0,r3			! py
+	mov	r2,r6
+	add	r5,r6
+	mov	r3,r0
+	add	r5,r0
+	or	r0,r6
+	mov.l	.Lfp_16383,r0
+	cmp/hi	r0,r6
+	bf	.Lfp_pk1
+	mov	r2,r6			! clamp px
+	add	r5,r6
+	mov.l	.Lfp_16384,r0
+	cmp/hi	r0,r6
+	bf	5f
+	mov	r2,r6
+	shll	r6
+	subc	r6,r6
+	mov.l	.Lfp_8191,r0
+	xor	r0,r6
+	mov	r6,r2
+5:	mov	r3,r6			! clamp py
+	add	r5,r6
+	mov.l	.Lfp_16384,r0
+	cmp/hi	r0,r6
+	bf	.Lfp_pk1
+	mov	r3,r6
+	shll	r6
+	subc	r6,r6
+	mov.l	.Lfp_8191,r0
+	xor	r0,r6
+	mov	r6,r3
+.Lfp_pk1:
+	shll16	r2
+	extu.w	r3,r0
+	or	r0,r2
+	mov.l	r2,@(8,r11)		! px << 16 | py
+	shll16	r3
+	extu.w	r14,r0
+	or	r0,r3
+	bra	.Lfp_next
+	mov.l	r3,@(12,r11)		! py << 16 | qy
+.Lfp_behind:
+	mov	#1,r0
+	rotr	r0			! 0x80000000
+	mov.l	r0,@(8,r11)
+	extu.w	r14,r0
+	mov.l	r0,@(12,r11)
+.Lfp_next:
+	add	#4,r9
+	add	r13,r10
+	add	#16,r11
+	dt	r12
+	bf	.Lfp_loop
+.Lfp_done:
+	lds.l	@r15+,pr
+	mov.l	@r15+,r14
+	mov.l	@r15+,r13
+	mov.l	@r15+,r12
+	mov.l	@r15+,r11
+	mov.l	@r15+,r10
+	mov.l	@r15+,r9
+	rts
+	mov.l	@r15+,r8
+
+	.align	2
+.Lfp_22400:	.long	22400
+.Lfp_44800:	.long	44800
+.Lfp_nearz:	.long	0x00040000
+.Lfp_16383:	.long	16383
+.Lfp_16384:	.long	16384
+.Lfp_8191:	.long	8191
