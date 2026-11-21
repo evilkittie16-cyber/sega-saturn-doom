@@ -412,7 +412,318 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     }
     HW_SUBPROF_MARK(4);
 }
+
+/* HW_BATCH=N (2026-11-21 SH-2 cache study, off by default): the BSP walk
+ * queues leaves and every N runs phase A (aperture check + floor job) as one
+ * loop over the batch, then phase B (walls, sprites, occlusion commit) per
+ * subsector in order. Each phase's code then misses once per batch instead of
+ * once per subsector (offline I-cache replay: -5..-8 ms of code misses at the
+ * E1M1 courtyard). Phase A tests against the occlusion state at batch start:
+ * conservative (it may keep a subsector a fresh test would cull - more floor
+ * work, never a missing pixel); walls and sprites in phase B see the exact
+ * state, as before. Slave-less frames run unbatched (master floors share the
+ * cmd_m range). */
+#ifndef HW_BATCH
+#define HW_BATCH 0
+#endif
+#if HW_BATCH
+/* 1 = floor jobs after the batch's walls with exact per-subsector occlusion
+ * snapshots (measured worse: the slave starts late and the master steals) */
+#ifndef HW_BATCH_LATEFLATS
+#define HW_BATCH_LATEFLATS 0
+#endif
+#if HW_ORACLE || HW_SUBMAX || HW_VIS_STATS || HW_SSMAP_DBG
+#error "HW_BATCH: oracle / submax / vis-stats / ssmap paths are not batched"
+#endif
+typedef struct {
+    int16_t  subnum, flags;        /* flags < 0: culled */
+    int16_t  visit, fully;
+    int16_t  yt_att, yb_att;
+    int16_t  ytop_min, ybot_max;
+    uint8_t  ytop, ybot;
+    uint16_t m_start;
+    int16_t  res_base, res_n;      /* chunk visit slots reserved after visit */
+    int16_t  snap_count;           /* occlusion state just before this */
+    uint32_t snap_summary, snap_any; /* subsector's commit (exact) */
+    uint32_t snap[HW_SOLID_WORDS];
+} hw_batch_slot_t;
+static hw_batch_slot_t hw_batch_q[HW_BATCH];
+static int hw_batch_n;
+static uint32_t hw_batch_sent[HW_SOLID_WORDS];   /* mask the slave last got */
+#if HW_FLAT_SPLIT && HW_FLAT_CHUNKS && !defined(SATURN_WIN32)
+#define HW_BATCH_SPLIT 1
+#else
+#define HW_BATCH_SPLIT 0
+#endif
+
+/* phase A: aperture check + floor job; returns 0 when culled */
+static HW_NOINLINE HW_HOT_O2 int HW_SubPhaseA(int subnum, int fully_inside, hw_batch_slot_t *q)
+{
+    q->flags = -1;
+    if (hw_solid_count >= HW_VIEW_W || (unsigned)subnum >= (unsigned)numsubsectors)
+        return 0;
+    int secnum = subsectors[subnum].sector;
+    if ((unsigned)secnum >= HW_MAX_AP_SECTORS || saturn_visit_count >= CMDBUF_MAX_VISIT)
+        return 0;
+    hw_sec_fast_t *sf = &hw_sec_fast[secnum];
+    int flat_flags = HW_CheckSubsectorAperture(subnum, sf, fully_inside & 3);
+    if (flat_flags < 0)
+    {
+        saturn_hw_occl_culls++;
+        return 0;
+    }
+    if (sf->is_sky)
+    {
+        if (flat_flags & (int)HW_FLAT_ALLOW_CEIL)
+            saturn_hw_sky_visible = 1;
+        flat_flags &= ~(int)HW_FLAT_ALLOW_CEIL;
+    }
+    {
+        hw_aperture_state_t *ap = HW_APERTURE;
+        q->yt_att   = ap->cur_sub_yt_attach;
+        q->yb_att   = ap->cur_sub_yb_attach;
+        q->ytop     = ap->cur_sub_ytop;
+        q->ybot     = ap->cur_sub_ybot;
+        q->ytop_min = ap->cur_ytop_min;
+        q->ybot_max = ap->cur_ybot_max;
+    }
+    int visit_idx = saturn_visit_count++;
+    q->subnum  = (int16_t)subnum;
+    q->fully   = (int16_t)fully_inside;
+    q->flags   = (int16_t)flat_flags;
+    q->visit   = (int16_t)visit_idx;
+    q->m_start = saturn_cmd_m_count;
+    {
+        sub_range_t *ranges = hw_cur_sub_ranges;
+        aliased_uint32_t *r32 = (aliased_uint32_t *)&ranges[visit_idx];
+        r32[1] = 0;
+        ranges[visit_idx].subnum = (uint16_t)subnum;
+    }
+    q->res_base = 0;
+    q->res_n = -1;                 /* -1: the floor job must not split */
+#if HW_BATCH_SPLIT
+    if (!HW_WALLS_ONLY && (flat_flags & (int)HW_FLAT_ALLOW_BOTH))
+    {
+        /* chunk jobs need visit slots right after this one (delivered
+         * before it, so its walls land on top): reserve them now, as
+         * empty ranges; unused ones stay empty */
+        int n = HW_SplitChunkCount(subnum);
+        if (n >= 2 && saturn_visit_count + n < CMDBUF_MAX_VISIT - 32)
+        {
+            sub_range_t *ranges = hw_cur_sub_ranges;
+            q->res_base = (int16_t)saturn_visit_count;
+            q->res_n = (int16_t)(n - 1);
+            for (int k = 1; k < n; k++)
+            {
+                int vis = saturn_visit_count++;
+                aliased_uint32_t *r32 = (aliased_uint32_t *)&ranges[vis];
+                r32[0] = (uint32_t)saturn_cmd_m_count << 16;
+                r32[1] = 0;
+                ranges[vis].subnum = (uint16_t)subnum;
+            }
+        }
+    }
+#endif
+    return 1;
+}
+
+static inline void HW_BatchRestoreAp(const hw_batch_slot_t *q)
+{
+    hw_aperture_state_t *ap = HW_APERTURE;
+    ap->cur_sub_yt_attach = q->yt_att;
+    ap->cur_sub_yb_attach = q->yb_att;
+    ap->cur_sub_ytop      = q->ytop;
+    ap->cur_sub_ybot      = q->ybot;
+    ap->cur_ytop_min      = q->ytop_min;
+    ap->cur_ybot_max      = q->ybot_max;
+}
+
+/* phase F: the floor job (its own loop: the aperture code and the flat
+ * submit together are too big to stay cached across a batch) */
+static HW_NOINLINE HW_HOT_O2 void HW_SubPhaseFlat(const hw_batch_slot_t *q)
+{
+    int flat_flags = q->flags;
+    if (HW_WALLS_ONLY || !(flat_flags & (int)HW_FLAT_ALLOW_BOTH))
+        return;
+    int subnum = q->subnum;
+    sector_t *sec = &sectors[subsectors[subnum].sector];
+    HW_BatchRestoreAp(q);
+#if HW_BATCH_SPLIT
+    hw_split_res_next = q->res_base;
+    hw_split_res_left = q->res_n;
+#endif
+#ifndef SATURN_WIN32
+    if (__builtin_expect(saturn_slave_enabled, 1))
+        HW_SUBMIT_FLAT_JOB(q->visit, subnum, sec, flat_flags);
+    else
+#endif
+        HW_RenderSubsectorBakedFlats(q->visit, subnum, sec, flat_flags);
+#if HW_BATCH_SPLIT
+    hw_split_res_left = 0;
+#endif
+}
+
+/* Batched floor jobs go out after the batch's walls, each with the exact
+ * occlusion state phase B saw just before that subsector's commit (the
+ * slave culls hidden floor quads with it). Swaps that state in, keeps the
+ * per-job dirty-word delta right, and restores the live state after. */
+static HW_NOINLINE void HW_BatchFlats(int n)
+{
+    uint32_t live[HW_SOLID_WORDS];
+    int live_count = hw_solid_count;
+    uint32_t live_summary = hw_solid_summary, live_any = hw_solid_any;
+    int i, w;
+    for (w = 0; w < HW_SOLID_WORDS; w++)
+        live[w] = hw_solid_mask[w];
+    for (i = 0; i < n; i++)
+    {
+        const hw_batch_slot_t *q = &hw_batch_q[i];
+        if (q->flags < 0 || !(q->flags & (int)HW_FLAT_ALLOW_BOTH))
+            continue;
+        uint32_t dirty = 0;
+        for (w = 0; w < HW_SOLID_WORDS; w++)
+        {
+            hw_solid_mask[w] = q->snap[w];
+            if (q->snap[w] != hw_batch_sent[w])
+                dirty |= 1u << w;
+        }
+        hw_solid_count = q->snap_count;
+        hw_solid_summary = q->snap_summary;
+        hw_solid_any = q->snap_any;
+        hw_slave_dirty_words = dirty;
+        HW_SubPhaseFlat(q);
+        for (w = 0; w < HW_SOLID_WORDS; w++)
+            hw_batch_sent[w] = q->snap[w];
+    }
+    uint32_t dirty = 0;
+    for (w = 0; w < HW_SOLID_WORDS; w++)
+    {
+        hw_solid_mask[w] = live[w];
+        if (live[w] != hw_batch_sent[w])
+            dirty |= 1u << w;
+    }
+    hw_solid_count = live_count;
+    hw_solid_summary = live_summary;
+    hw_solid_any = live_any;
+    hw_slave_dirty_words = dirty;
+}
+
+/* phase B: walls, sprites, occlusion commit (in BSP order) */
+static HW_NOINLINE HW_HOT_O2 void HW_SubPhaseB(hw_batch_slot_t *q, int batched)
+{
+    int subnum = q->subnum;
+    int secnum = subsectors[subnum].sector;
+    hw_sec_fast_t *sf = &hw_sec_fast[secnum];
+    int visit_idx = q->visit;
+    HW_BatchRestoreAp(q);
+    uint16_t m_start = batched ? saturn_cmd_m_count : q->m_start;
+    sub_range_t *ranges = hw_cur_sub_ranges;
+    aliased_uint32_t *r32 = (aliased_uint32_t *)&ranges[visit_idx];
+#if HW_DEFER_WALLS
+    int defer_rec0 = hw_defer_nrec;
+    {
+        int ns = (saturn_baked_walls_active && (unsigned)subnum < (unsigned)saturn_baked_wall_num_subsectors)
+               ? (int)saturn_baked_wall_subsectors[subnum].num_segs : 0;
+        hw_defer_on = (hw_defer_nsub < HW_DEFER_SUB_CAP && hw_defer_nrec + ns <= HW_DEFER_REC_CAP);
+        hw_defer_need_snap = 0;
+    }
+#endif
+    HW_RenderSubsectorBakedWalls(subnum, sf);
+#if HW_V2P_PUNCH
+    if (__builtin_expect(SATURN_V2P_SKIP_FLOOR(&sectors[secnum]), 0) && HW_V2PlaneWanted(subnum))
+        HW_V2PlanePunch(subnum, sf);
+#endif
+#if HW_DEFER_WALLS
+    int defer_now = hw_defer_on;
+    uint16_t spr_m0 = saturn_cmd_m_count;
+    hw_defer_on = 0;
+#endif
+    if (!HW_WALLS_ONLY && __builtin_expect(sf->has_things != 0, 0))
+    {
+        sector_t *sec = &sectors[secnum];
+        if (HW_SubsectorHasThings(sec, (uint32_t)secnum, subnum))
+            HW_RenderSubsectorSprites(sec, subnum);
+    }
+#ifndef SATURN_WIN32
+    r32[0] = ((uint32_t)m_start << 16) | (uint16_t)(saturn_cmd_m_count - m_start);
+#else
+    ranges[visit_idx].m_start = m_start;
+    ranges[visit_idx].m_count = (uint16_t)(saturn_cmd_m_count - m_start);
+#endif
+#if HW_DEFER_WALLS
+    if (defer_now)
+        HW_DeferCloseSub(visit_idx, subnum, defer_rec0, spr_m0,
+                         (int)(saturn_cmd_m_count - spr_m0), sf->light_delta);
+#endif
+    if (HW_BATCH_LATEFLATS && batched)
+    {
+        /* exact occlusion before this commit, for its floor job */
+        for (int w = 0; w < HW_SOLID_WORDS; w++)
+            q->snap[w] = hw_solid_mask[w];
+        q->snap_count = (int16_t)hw_solid_count;
+        q->snap_summary = hw_solid_summary;
+        q->snap_any = hw_solid_any;
+    }
+    if (sub_solid_active || HW_APERTURE->portal_span_count > 0)
+        HW_CommitSubsectorOcclusion();
+}
+
+static HW_NOINLINE void HW_BatchFlush(void)
+{
+    int i, n = hw_batch_n;
+    hw_batch_n = 0;
+    for (i = 0; i < n; i++)
+        if (hw_batch_q[i].subnum >= 0 && !HW_SubPhaseA(hw_batch_q[i].subnum, hw_batch_q[i].fully, &hw_batch_q[i]))
+            hw_batch_q[i].flags = -1;
+#if HW_BATCH_LATEFLATS
+    for (i = 0; i < n; i++)
+        if (hw_batch_q[i].flags >= 0)
+            HW_SubPhaseB(&hw_batch_q[i], 1);
+    HW_BatchFlats(n);
+#else
+    for (i = 0; i < n; i++)
+        if (hw_batch_q[i].flags >= 0)
+            HW_SubPhaseFlat(&hw_batch_q[i]);
+    for (i = 0; i < n; i++)
+        if (hw_batch_q[i].flags >= 0)
+            HW_SubPhaseB(&hw_batch_q[i], 1);
+#endif
+}
+
+/* BSP leaf: queue (the walk keeps going with the batch-start state) */
+static HW_NOINLINE void HW_BatchLeaf(int subnum, int fully_inside, unsigned int *unused)
+{
+    (void)unused;
+#ifndef SATURN_WIN32
+    if (__builtin_expect(!saturn_slave_enabled, 0))
+    {
+        hw_batch_slot_t q;
+        HW_BatchFlush();
+        if (HW_SubPhaseA(subnum, fully_inside, &q))
+        {
+            HW_SubPhaseFlat(&q);
+            HW_SubPhaseB(&q, 0);
+        }
+        return;
+    }
+#endif
+    hw_batch_q[hw_batch_n].subnum = (int16_t)subnum;
+    hw_batch_q[hw_batch_n].fully  = (int16_t)fully_inside;
+    if (++hw_batch_n >= HW_BATCH)
+        HW_BatchFlush();
+}
+#undef HW_RenderSubsector
+#define HW_RenderSubsector(subnum, fully_inside) HW_BatchLeaf((subnum), (fully_inside), NULL)
+#define HW_LEAF_FN HW_BatchLeaf
+#else
+#define HW_LEAF_FN HW_RenderSubsector_Body
+#define HW_BatchFlush() ((void)0)
+#endif /* HW_BATCH */
 #endif /* HW_ASM_SUBBODY */
+#ifndef HW_LEAF_FN
+#define HW_LEAF_FN HW_RenderSubsector_Body
+#define HW_BatchFlush() ((void)0)
+#endif
 
 typedef struct {
     uint16_t bspnum;       /* must be unsigned: node_t children are uint16_t (NF_SUBSECTOR = 0x8000) */
@@ -555,7 +866,7 @@ const void *const hw_asm_bsp_ctx[21] = {
 #if HW_ASM_SUBBODY
     &nodes, hw_bsp_stack, (const void *)hw_asm_subsector,                /* 56 */
 #else
-    &nodes, hw_bsp_stack, (const void *)HW_RenderSubsector_Body,         /* 56 */
+    &nodes, hw_bsp_stack, (const void *)HW_LEAF_FN,                      /* 56 */
 #endif
     &hw_node_bboxes, &saturn_baked_flat_bboxes, &saturn_hw_bsp_abort,    /* 68 */
     (const void *)((const char *)&hw_far_cull + 0x20000000u)             /* 80: cache-through */
@@ -1211,6 +1522,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
 #else
     HW_CCR_SET(HW_CCR_WALK);
     HW_RenderBSPNode((int)numnodes - 1, pvs_row, 0);
+    HW_BatchFlush();                /* HW_BATCH: the last partial batch */
 #endif
     HW_EmitDeferredWalls();         /* pass 2: wall quads + sprites */
     HW_CCR_SET(0x01u);

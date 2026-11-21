@@ -3580,6 +3580,26 @@ static HW_NOINLINE void HW_RingFlatJob(uint32_t v_first, uint32_t q_first, uint3
 
 #endif
 #if HW_FLAT_SPLIT && HW_FLAT_CHUNKS && !defined(SATURN_WIN32)
+/* HW_BATCH (saturn_hw_render.c): floor jobs are submitted after the batch's
+ * walls, so the chunk visit slots must be reserved right after their
+ * subsector's slot when the slot is assigned; these name the reserved run
+ * for the job being submitted (left = 0: allocate at the end as before). */
+static int hw_split_res_next = 0, hw_split_res_left = 0;
+/* chunk count HW_SplitFlatJob would use for this subsector, 0 = no split */
+static inline int HW_SplitChunkCount(int subnum)
+{
+    if (!saturn_baked_flat_chunks || !saturn_baked_flat_sub_chunk ||
+        (int)HW_SUB_FLAT_INFO[subnum].q_count < HW_SPLIT_MIN_Q)
+        return 0;
+    uint32_t c0 = saturn_baked_flat_sub_chunk[subnum];
+    if (c0 == 0)
+        return 0;
+    const saturn_flat_chunk_t *ck = &saturn_baked_flat_chunks[c0];
+    int n = 1;
+    while (!(ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST) && n < 64)
+        n++;
+    return ((ck[n - 1].v_cnt & SATURN_FLAT_CHUNK_LAST) && n >= 2) ? n : 0;
+}
 /* A big chunked subsector goes out as one job per chunk, so the slave and
  * the stealing master (HW_FLAT_STEAL) can share it. Each extra chunk job
  * gets its own visit slot right after the subsector's (floor range only):
@@ -3605,13 +3625,21 @@ static int HW_SplitFlatJob(int sub_idx, int subnum, int q_count, uint32_t v_firs
         return 0;
     if (n < 2 || saturn_visit_count + n >= CMDBUF_MAX_VISIT - 32)
         return 0;
+    if (hw_split_res_left < 0 || (hw_split_res_left > 0 && hw_split_res_left < n - 1))
+        return 0;               /* no / too small a reservation: one whole job */
     uint32_t w3_base = (w3_pack & ~((0x7Fu << 25) | (0x7Fu << 17))) | HW_JOB_ONE_CHUNK;
     for (int k = 0; k < n; k++)
     {
         int vis = sub_idx;
         if (k > 0)
         {
-            vis = saturn_visit_count++;
+            if (hw_split_res_left > 0)
+            {
+                vis = hw_split_res_next++;
+                hw_split_res_left--;
+            }
+            else
+                vis = saturn_visit_count++;
             sub_range_t *ranges = hw_cur_sub_ranges;
             aliased_uint32_t *r32 = (aliased_uint32_t *)&ranges[vis];
             r32[0] = (uint32_t)saturn_cmd_m_count << 16;   /* no walls/sprites */
