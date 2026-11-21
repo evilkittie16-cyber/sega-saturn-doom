@@ -17,6 +17,8 @@
 #include "r_local.h"
 #include "saturn_vdp1.h"
 #include "saturn_hw_render.h"
+#include "saturn_cmdbuf.h"
+#include "saturn_baked_segs.h"
 #include "tester_telemetry.h"
 
 #define PANE_W      352
@@ -1183,6 +1185,119 @@ void I_FinishUpdate(void)
         }
     }
 
+    /* -sweep FILE: every listed view, any episode (2026-11-21 level audit) */
+    if (is_test == 23 && players && players[0].mo) {
+        extern const char *g_sweep_file;
+        extern int saturn_episode, saturn_map, saturn_warp_map;
+        extern subsector_t *R_PointInSubsector2(fixed_t x, fixed_t y, int node);
+        extern void Win32_RequestLevelWarp(int episode, int map);
+        static FILE *s_sw_f = NULL;
+        static int s_sw_have = 0, s_sw_step = 0, s_sw_ep, s_sw_map, s_sw_x, s_sw_y, s_sw_deg;
+        static char s_sw_tag[64];
+        if (!s_sw_f) {
+            s_sw_f = fopen(g_sweep_file, "r");
+            if (!s_sw_f) { printf("[SWEEP] cannot open %s\n", g_sweep_file); exit(1); }
+            CreateDirectoryA("sweep", NULL);
+        }
+        if (!s_sw_have) {
+            if (fscanf(s_sw_f, "%d %d %d %d %d %63s", &s_sw_ep, &s_sw_map, &s_sw_x, &s_sw_y, &s_sw_deg, s_sw_tag) != 6) {
+                printf("[SWEEP] done\n");
+                fflush(stdout);
+                exit(0);
+            }
+            s_sw_have = 1;
+            s_sw_step = 0;
+        }
+        if (saturn_warp_map == 0) {
+            if (saturn_episode != s_sw_ep || saturn_map != s_sw_map) {
+                Win32_RequestLevelWarp(s_sw_ep, s_sw_map);
+                s_sw_step = 0;
+            } else {
+                /* Frozen world for comparable frames: no monster walks up
+                 * to the camera or kills the player between views. */
+                {
+                    mobj_t *mo2;
+                    for (mo2 = mobjhead.next; mo2 != (void *)&mobjhead; mo2 = mo2->next)
+                        if (mo2 != players[0].mo) {
+                            mo2->tics = -1;
+                            mo2->momx = mo2->momy = mo2->momz = 0;
+                        }
+                    players[0].cheats |= CF_GODMODE;
+                    players[0].health = 100;
+                    players[0].mo->health = 100;
+                    players[0].playerstate = PST_LIVE;
+                }
+            }
+            if (saturn_episode == s_sw_ep && saturn_map == s_sw_map && gametic >= 8) {
+                players[0].mo->momx = players[0].mo->momy = players[0].mo->momz = 0;
+                P_UnsetThingPosition(players[0].mo);
+                players[0].mo->x = s_sw_x * FRACUNIT;
+                players[0].mo->y = s_sw_y * FRACUNIT;
+                players[0].mo->angle = (angle_t)(((unsigned long long)(unsigned)s_sw_deg << 32) / 360u);
+                {
+                    subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
+                    if (ss) {
+                        sector_t *sec = SSEC_SECTOR(ss);
+                        players[0].mo->subsector = ss;
+                        players[0].mo->floorz = sec->floorheight;
+                        players[0].mo->ceilingz = sec->ceilingheight;
+                        players[0].mo->z = sec->floorheight;
+                        players[0].viewz = sec->floorheight + 41 * FRACUNIT;
+                    }
+                }
+                Saturn_HW_ForceSkyRepaint();
+                P_SetThingPosition(players[0].mo);
+                {
+                    extern int hw_dbg_trace;   /* trace only the captured frame's render */
+                    static int s_sw_steps_t = 0;
+                    if (!s_sw_steps_t) { const char *e = getenv("SWEEP_STEPS"); s_sw_steps_t = (e && atoi(e) > 0) ? atoi(e) : 6; }
+                    hw_dbg_trace = (getenv("SWEEP_TRACE") != NULL) && (s_sw_step + 1 == s_sw_steps_t);
+                }
+                static int s_sw_steps = 0;
+                if (!s_sw_steps) {
+                    const char *e = getenv("SWEEP_STEPS");   /* settle tics per view (default 6) */
+                    s_sw_steps = (e && atoi(e) > 0) ? atoi(e) : 6;
+                }
+                if (++s_sw_step == s_sw_steps) {
+                    char fn[160];
+                    sprintf(fn, "sweep\\%s.bmp", s_sw_tag);
+                    SaveFramebufferBMP(fn, s_combined_fb, COMBINED_W, COMBINED_H);
+                    printf("[SWEEP] %s E%dM%d %d %d %d | AvgErr:%6.2f%% MaxErr:%6.2f%% >=1%%:%5.1f%% | Quads:%3d (W:%3d F:%3d Drop:%d Ref:%d) Subs:%d\n",
+                           s_sw_tag, s_sw_ep, s_sw_map, s_sw_x, s_sw_y, s_sw_deg,
+                           g_telemetry.avg_err_pct, g_telemetry.max_err_pct, g_telemetry.ratio_gte_1,
+                           g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads,
+                           g_telemetry.hud_diag.quads_dropped, g_telemetry.hud_diag.tex_refused,
+                           g_telemetry.hud_diag.subsectors);
+                    if (getenv("SWEEP_DUMP")) {
+                        /* visit list of the frame just rendered: subsector,
+                         * sector, wall (m) and flat (s) command counts */
+                        extern int saturn_visit_count;
+                        extern sub_range_t *saturn_sub_ranges;
+                        subsector_t *css = players[0].mo->subsector;
+                        printf("[SWDUMP] cam ss %d sec %d viewz %d visits %d\n",
+                               css ? (int)(css - subsectors) : -1,
+                               css ? (int)(SSEC_SECTOR(css) - sectors) : -1,
+                               players[0].viewz >> FRACBITS, saturn_visit_count);
+                        for (int vi = 0; vi < saturn_visit_count; vi++) {
+                            const sub_range_t *r = &saturn_sub_ranges[vi];
+                            int sn = r->subnum;
+                            extern int hw_dbg_visit_flags[1024];
+                            extern const uint16_t *saturn_baked_flat_q_count;
+                            extern const saturn_wl_subsector_t *saturn_baked_wall_subsectors;
+                            printf("[SWDUMP] v%d ss %d sec %d m %d s %d flags %X | baked fq %d wsegs %d\n", vi, sn,
+                                   (sn >= 0 && sn < numsubsectors) ? (int)(SSEC_SECTOR(&subsectors[sn]) - sectors) : -1,
+                                   r->m_count, r->s_count, vi < 1024 ? hw_dbg_visit_flags[vi] : -1,
+                                   saturn_baked_flat_q_count ? saturn_baked_flat_q_count[sn] : -1,
+                                   saturn_baked_wall_subsectors ? (int)saturn_baked_wall_subsectors[sn].num_segs : -1);
+                        }
+                    }
+                    fflush(stdout);
+                    s_sw_have = 0;
+                }
+            }
+        }
+    }
+
     /* -pos X Y ANG: pinned camera, per-frame texture-cache log */
     if (is_test == 22 && players && players[0].mo && gametic >= 8) {
         extern subsector_t *R_PointInSubsector2(fixed_t x, fixed_t y, int node);
@@ -1214,15 +1329,7 @@ void I_FinishUpdate(void)
             players[0].mo->x = wx * FRACUNIT;
             players[0].mo->y = wy * FRACUNIT;
         }
-        {
-            /* POS_TURN=d: turn d degrees (may be fractional) per frame */
-            static double s_turn = -1.0;
-            if (s_turn < 0.0) { const char *e = getenv("POS_TURN"); s_turn = e ? atof(e) : 0.0; }
-            double a = (double)g_pos_ang + s_turn * s_pos_step;
-            while (a < 0) a += 360.0;
-            while (a >= 360.0) a -= 360.0;
-            players[0].mo->angle = (angle_t)(a / 360.0 * 4294967296.0);
-        }
+        players[0].mo->angle = (angle_t)(((unsigned long long)g_pos_ang << 32) / 360u);
         {
             subsector_t *ss = R_PointInSubsector2(players[0].mo->x, players[0].mo->y, numnodes - 1);
             if (ss) {
@@ -1259,24 +1366,6 @@ void I_FinishUpdate(void)
                        g_vdp1_od_total_cyc ? g_vdp1_od_hidden_cyc * 100.0 / g_vdp1_od_total_cyc : 0.0);
             }
         }
-        if (getenv("POS_DUMP"))
-        {
-            char fn[64];
-            sprintf(fn, "posf_%03d.bmp", s_pos_step);
-            SaveFramebufferBMP(fn, s_combined_fb, COMBINED_W, COMBINED_H);
-        }
-        {
-            extern unsigned int saturn_warp_hits, saturn_warp_fallbacks;
-            static unsigned int lh = 0, lf = 0;
-            printf("[WARPF] hit:%u fallback:%u\n", saturn_warp_hits - lh, saturn_warp_fallbacks - lf);
-            lh = saturn_warp_hits; lf = saturn_warp_fallbacks;
-        }
-        {
-            extern unsigned int saturn_v1_warp_gens, saturn_v1_warp_miss;
-            extern unsigned int saturn_v1_warp_miss_c, saturn_v1_warp_miss_b, saturn_v1_warp_miss_a;
-            extern int v1_warp_budget; printf("[WARP] bud:%d gens:%u miss:%u (slot %u budget %u alloc %u)\n", v1_warp_budget, saturn_v1_warp_gens, saturn_v1_warp_miss,
-                   saturn_v1_warp_miss_c, saturn_v1_warp_miss_b, saturn_v1_warp_miss_a);
-        }
         printf("[POS] f%03d x%d y%d err:%.2f%% flushes+%u evict+%u(%uKB) badsrca:%u variants+%u upload:%uKB arena_free:%uKB refuse:%d quads:%d (W:%d F:%d)\n",
                s_pos_step, players[0].mo->x >> FRACBITS, players[0].mo->y >> FRACBITS,
                g_telemetry.avg_err_pct,
@@ -1295,7 +1384,7 @@ void I_FinishUpdate(void)
         s_last_ev = saturn_v1_evictions;
         s_last_evb = saturn_v1_evicted_bytes;
         (void)saturn_vdp1_bus_tex_bytes;
-        if (++s_pos_step == (g_walk_frames > 0 ? g_walk_frames + 10 : (getenv("POS_FRAMES") ? atoi(getenv("POS_FRAMES")) : 20))) {
+        if (++s_pos_step == (g_walk_frames > 0 ? g_walk_frames + 10 : 20)) {
             SaveFramebufferBMP("pos_triple.bmp", s_combined_fb, COMBINED_W, COMBINED_H);
             {
                 /* Raw VDP1 VRAM of the final frame (command words are host-endian

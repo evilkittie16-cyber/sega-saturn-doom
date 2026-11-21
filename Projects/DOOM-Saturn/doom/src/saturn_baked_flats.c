@@ -143,8 +143,13 @@ static void Saturn_BakedFlats_FindQuv(uint32_t len)
 #define cur_vert_frac   saturn_baked_flat_vfrac
 #define cur_numsubsectors saturn_baked_flat_numsubsectors
 
-#define SATURN_MAX_WRAM_H_FLAT_SUBS 608
-static __attribute__((aligned(16))) saturn_flat_bbox_t hw_wram_h_flat_bboxes[SATURN_MAX_WRAM_H_FLAT_SUBS];
+/* High-WRAM copy of the per-subsector flat bboxes, from the jo heap
+ * (2026-11-21: was 4.75 KB of static BSS for 608 subsectors; the heap copy
+ * covers 1024, i.e. every Ultimate DOOM map, and the BSS pays for the
+ * 512-sector renderer tables). Allocated on first use; without it the
+ * bboxes stay in the loaded blob. */
+#define SATURN_MAX_WRAM_H_FLAT_SUBS 1024
+static saturn_flat_bbox_t *hw_wram_h_flat_bboxes = NULL;
 
 /* Version 1 fallback support if loaded */
 static const saturn_flt_header_t    *cur_header1       = NULL;
@@ -292,7 +297,12 @@ int Saturn_BakedFlats_Parse(void *data, unsigned len)
     cur_sub_v_first   = (const uint32_t *)(cur_blob + cur_hdr2->ofs_sub_v_first);
     cur_sub_v_count   = (const uint16_t *)(cur_blob + cur_hdr2->ofs_sub_v_count);
     cur_bbox          = (const saturn_flat_bbox_t *)(cur_blob + cur_hdr2->ofs_sub_bbox);
-    if (cur_numsubsectors > 0 && cur_numsubsectors <= SATURN_MAX_WRAM_H_FLAT_SUBS)
+    if (!hw_wram_h_flat_bboxes)
+    {
+        extern byte *I_AllocHigh(int length);
+        hw_wram_h_flat_bboxes = (saturn_flat_bbox_t *)I_AllocHigh(SATURN_MAX_WRAM_H_FLAT_SUBS * (int)sizeof(saturn_flat_bbox_t));
+    }
+    if (hw_wram_h_flat_bboxes && cur_numsubsectors > 0 && cur_numsubsectors <= SATURN_MAX_WRAM_H_FLAT_SUBS)
     {
         memcpy(hw_wram_h_flat_bboxes, cur_bbox, (size_t)cur_numsubsectors * sizeof(saturn_flat_bbox_t));
         cur_bbox = hw_wram_h_flat_bboxes;

@@ -3815,6 +3815,11 @@ static HW_NOINLINE void HW_FlatSubCheck(int sub_idx, int subnum, sector_t *sec, 
     unsigned int tail0 = hw_master_job_tail;
     volatile aliased_uint32_t *real_job = HW_RING_JOB(real, tail0 & (HW_JOB_RING - 1));
     unsigned int md = saturn_hw_ring_maxdepth, rw = saturn_hw_ring_waits;
+    if (hw_sub_flat_big)
+    {
+        HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);   /* see HW_SubmitFlatJobSel */
+        return;
+    }
     HW_FlatSubSave(&s0, real, real_job, tail0);
     hw_flatsub_fell_back = 0;
     hw_asm_flatsub(sub_idx, subnum, sec, flags);
@@ -3866,7 +3871,17 @@ static void HW_SubmitFlatJob_Fallback(int sub_idx, int subnum, sector_t *sec, in
 {
     HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
 }
-#define HW_SUBMIT_FLAT_JOB hw_asm_flatsub
+/* hw_asm_flatsub indexes the static flat-info table; maps with more than
+ * HW_MAX_AP_SUBSECTORS subsectors (hw_sub_flat_big) use the C path, which
+ * reads HW_SUB_FLAT_INFO (their PU_LEVEL table). 2026-11-21. */
+static inline void HW_SubmitFlatJobSel(int sub_idx, int subnum, sector_t *sec, int flags)
+{
+    if (__builtin_expect(hw_sub_flat_big, 0))
+        HW_SubmitSlaveFlatJob(sub_idx, subnum, sec, flags);
+    else
+        hw_asm_flatsub(sub_idx, subnum, sec, flags);
+}
+#define HW_SUBMIT_FLAT_JOB HW_SubmitFlatJobSel
 #endif
 #else
 #define HW_SUBMIT_FLAT_JOB HW_SubmitSlaveFlatJob
@@ -4025,6 +4040,15 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsectorBakedFlats(int sub_idx, int 
     int floor_srca = 0, ceil_srca = 0;
     if (emit_floor) { floor_srca = HW_FastFlatSrca(sec->floorpic); if (!floor_srca) emit_floor = 0; }
     if (emit_ceil)  { ceil_srca = HW_FastFlatSrca(sec->ceilingpic); if (!ceil_srca) emit_ceil = 0; }
+#ifdef SATURN_WIN32
+    {
+        extern int hw_dbg_trace;   /* harness -sweep SWEEP_DUMP */
+        if (hw_dbg_trace)
+            printf("[FLATDBG] ss %d sec %d fpic %d cpic %d floor_srca %d ceil_srca %d emit f%d c%d q %d\n",
+                   subnum, (int)(sec - sectors), sec->floorpic, sec->ceilingpic,
+                   floor_srca, ceil_srca, emit_floor, emit_ceil, q_count);
+    }
+#endif
     if (!emit_ceil && !emit_floor) return;
 
     int v_first, q_first;

@@ -267,6 +267,7 @@ typedef struct
    fixed_t  attackrange;
    fixed_t  aimtopslope;
    fixed_t  aimbottomslope;
+   int      isattack;               // 1 = real hitscan (P_LineAttack): may trigger gun lines
 
    // output
    line_t  *shootline;

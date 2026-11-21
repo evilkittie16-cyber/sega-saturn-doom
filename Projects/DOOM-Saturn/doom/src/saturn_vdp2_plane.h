@@ -32,7 +32,14 @@ extern volatile unsigned char saturn_vdp2_rbg0_on;
  * non-animated, untagged) becomes the RBG0 plane when it carries enough of
  * the level's floor quads; VDP1 skips those floors. */
 #ifndef HW_VDP2_PLANE
+#ifdef SATURN_WIN32
+/* The Windows harness has no VDP2 rotation plane: with the plane on, those
+ * floors were skipped on VDP1 and showed garbage streaks (2026-11-21 sweep).
+ * Off there, so harness screenshots show every floor. */
+#define HW_VDP2_PLANE 0
+#else
 #define HW_VDP2_PLANE 1
+#endif
 #endif
 #define SATURN_V2P_MAX_SECTORS 1024
 extern unsigned char saturn_vdp2_plane_secmask[SATURN_V2P_MAX_SECTORS];

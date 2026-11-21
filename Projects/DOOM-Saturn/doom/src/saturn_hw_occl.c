@@ -293,8 +293,15 @@ typedef struct {
 
 #define HW_NODE_PVS_WORDS     32
 #define HW_MAX_PORTAL_SPANS   32
-#define HW_MAX_AP_SECTORS     256
+/* 2026-11-21: 256 -> 512 sectors and a separate whole-level subsector limit.
+ * Ultimate DOOM has maps with up to 323 sectors (E2M7) and 956 subsectors
+ * (E4M9); at the old limits those maps skipped the per-level renderer init
+ * and indexed past several per-sector / per-subsector tables.
+ * HW_MAX_AP_SUBSECTORS stays the size of the fast static flat-info table
+ * (and the WRAM-L scratch layout); bigger maps use a PU_LEVEL table. */
+#define HW_MAX_AP_SECTORS     512
 #define HW_MAX_AP_SUBSECTORS  608
+#define HW_MAX_SUBSECTORS     1024
 #define HW_MAX_PORTAL_SEGS    336
 
 /* Subsector Flat Evaluation & LOD Bitmask Flags */
@@ -400,12 +407,41 @@ static int16_t *hw_sec_ztop;
 static int32_t *hw_sec_dz_top;            /* published (non-NULL) only while the lists are valid */
 static int32_t *hw_sec_dz_mem;
 static const uint16_t *hw_sec_nb_first;   /* PU_LEVEL: neighbour list offsets, [s]..[s+1] */
-static const uint8_t  *hw_sec_nb;         /* PU_LEVEL: two-sided neighbour sectors */
+static const uint16_t *hw_sec_nb;         /* PU_LEVEL: two-sided neighbour sectors */
 extern uint32_t hw_wram_h_sub_flat_info[HW_MAX_AP_SUBSECTORS * 4];
+/* Per-subsector flat info: the static High-WRAM table, or a PU_LEVEL table
+ * for maps with more than HW_MAX_AP_SUBSECTORS subsectors (then
+ * hw_sub_flat_big = 1 and flat jobs go through the C submit path, since
+ * hw_asm_flatsub indexes the static table). Set in Saturn_HW_RenderPlayerView
+ * when the level's baked flats change. */
+static hw_sub_flat_info_t *hw_sub_flat_info_p = (hw_sub_flat_info_t *)hw_wram_h_sub_flat_info;
+static int hw_sub_flat_big = 0;
 extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_WRAM_L_SCRATCH ((hw_wram_l_scratch_t *)SATURN_WRAM_L_PILLARS_ADDR)
 #define HW_APERTURE       (&hw_aperture_state)
-#define HW_SUB_FLAT_INFO  ((hw_sub_flat_info_t *)hw_wram_h_sub_flat_info)
+#define HW_SUB_FLAT_INFO  hw_sub_flat_info_p
+
+/* Point HW_SUB_FLAT_INFO at a table that fits this level (once per level
+ * load, keyed on saturn_level_gen; the PU_LEVEL table dies with the level). */
+static void HW_SubFlatInfoEnsure(void)
+{
+    extern unsigned int saturn_level_gen;
+    static unsigned int gen = 0xFFFFFFFFu;
+    if (gen == saturn_level_gen)
+        return;
+    gen = saturn_level_gen;
+    if (numsubsectors > HW_MAX_AP_SUBSECTORS)
+    {
+        uintptr_t p = (uintptr_t)Z_Malloc(numsubsectors * (int)sizeof(hw_sub_flat_info_t) + 15, PU_LEVEL);
+        hw_sub_flat_info_p = (hw_sub_flat_info_t *)((p + 15u) & ~(uintptr_t)15u);
+        hw_sub_flat_big = 1;
+    }
+    else
+    {
+        hw_sub_flat_info_p = (hw_sub_flat_info_t *)hw_wram_h_sub_flat_info;
+        hw_sub_flat_big = 0;
+    }
+}
 #define HW_PORTAL_SEGS    ((hw_portal_seg_t *)hw_wram_h_portal_segs)
 #define HW_SKY_COL_BAM    (HW_WRAM_L_SCRATCH->sky_col_bam)
 

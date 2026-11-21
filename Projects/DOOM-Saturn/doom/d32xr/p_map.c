@@ -448,6 +448,7 @@ fixed_t P_AimLineAttack (lineattack_t *la, mobj_t *t1, angle_t angle, fixed_t di
 	la->attackangle = angle;
 	la->aimtopslope = 100*FRACUNIT/160;	/* can't shoot outside view angles */
 	la->aimbottomslope = -100*FRACUNIT/160;
+	la->isattack = 0;	/* aiming only: never triggers gun lines (vanilla) */
 
 	P_Shoot2 (la);
 
@@ -488,6 +489,7 @@ void P_LineAttack (lineattack_t *la, mobj_t *t1, angle_t angle, fixed_t distance
 		la->aimtopslope = slope+1;
 		la->aimbottomslope = slope-1;
 	}
+	la->isattack = 1;
 
 	P_Shoot2 (la);
 

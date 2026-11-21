@@ -93,8 +93,8 @@ typedef struct {
 
 #define HW_THING_POOL_CAP 64
 static uint32_t         hw_sec_things_built[16]; /* Up to 512 sectors */
-static uint32_t         hw_sub_has_things[24];   /* Up to 768 subsectors */
-static uint8_t          hw_sub_first_thing[768];
+static uint32_t         hw_sub_has_things[HW_MAX_SUBSECTORS / 32];   /* Up to 1024 subsectors (E4M9: 956) */
+static uint8_t          hw_sub_first_thing[HW_MAX_SUBSECTORS];
 static hw_thing_entry_t hw_thing_pool[HW_THING_POOL_CAP];
 static int              hw_thing_pool_count = 0;
 
@@ -120,7 +120,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_BuildSectorThings(sector_t *sec)
             !(mo->flags & MF_NOSECTOR) && mo->state && (unsigned)mo->state < NUMSTATES)
         {
             int msub = (int)(msub_ptr - subsectors);
-            if ((unsigned)msub < (unsigned)numsubsectors && (unsigned)msub < 768u &&
+            if ((unsigned)msub < (unsigned)numsubsectors && (unsigned)msub < (unsigned)HW_MAX_SUBSECTORS &&
                 (!pvs_row || (pvs_row[msub >> 3] & hw_bit_lut[msub & 7])))
             {
                 fixed_t dx = mo->x - vx;

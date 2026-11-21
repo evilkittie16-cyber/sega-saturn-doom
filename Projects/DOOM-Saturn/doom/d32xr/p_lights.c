@@ -284,6 +284,8 @@ void T_FireFlicker (fireflicker_t *flick)
 {
 	int	amount;
 
+	if (gametic == prevgametic)
+		return;		/* once per game tic, like the other light thinkers */
 	if (--flick->count)
 		return;
 

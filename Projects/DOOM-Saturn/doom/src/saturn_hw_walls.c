@@ -2222,7 +2222,7 @@ extern void hw_asm_portal(hw_wall_emit_ctx_t *ctx, int bsec_idx);
 _Static_assert(offsetof(hw_wall_emit_ctx_t, portal_recorded) == 0 && offsetof(hw_wall_emit_ctx_t, is_sky_ceil) == 3 &&
                offsetof(hw_wall_emit_ctx_t, sec_floor) == 36 && offsetof(hw_sec_fast_t, yt_attach) == 8 &&
                offsetof(hw_sec_fast_t, yb_attach) == 10 && offsetof(hw_aperture_state_t, cur_sub_yt_attach) == 4 &&
-               offsetof(hw_aperture_state_t, cur_sub_yb_attach) == 6 && HW_MAX_AP_SECTORS == 256,
+               offsetof(hw_aperture_state_t, cur_sub_yb_attach) == 6 && HW_MAX_AP_SECTORS == 512,
                "hw_asm_portal: layout");
 const void *const hw_asm_portal_ctx[6] = {
     hw_sec_fast, &hw_aperture_state, &saturn_view_cy, &saturn_view_h,
@@ -3768,7 +3768,7 @@ static uint8_t    *hw_v2p_segf = NULL;      /* zone (level) memory, read only fo
 static uint8_t    *hw_v2p_portf = NULL;     /* [HW_MAX_PORTAL_SEGS], same zone block */
 /* subsector has a candidate (fast RAM bitmap, tested inline by the body;
  * subsectors past the bitmap always take the call) */
-static uint8_t     hw_v2p_subbits[(HW_MAX_AP_SUBSECTORS + 7) / 8];
+static uint8_t     hw_v2p_subbits[(HW_MAX_SUBSECTORS + 7) / 8];
 static unsigned    hw_v2p_key_gen = 0xFFFFFFFFu;
 extern unsigned int saturn_level_gen;        /* g_game.c, ++ at every level load */
 
@@ -3792,7 +3792,7 @@ static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
     D_memset(blk, 0, seg_bytes + HW_MAX_PORTAL_SEGS);
     int16_t *ex = (int16_t *)(blk + seg_bytes + HW_MAX_PORTAL_SEGS);
     int16_t *ey = ex + HW_V2P_ENDS;
-#define HW_V2P_MARK_SUB(s) do { if ((unsigned)(s) < HW_MAX_AP_SUBSECTORS) \
+#define HW_V2P_MARK_SUB(s) do { if ((unsigned)(s) < HW_MAX_SUBSECTORS) \
                                     hw_v2p_subbits[(s) >> 3] |= (uint8_t)(1u << ((s) & 7)); } while (0)
 
     int ne = 0, overflow = 0;
@@ -3920,7 +3920,7 @@ HW_ALWAYS_INLINE int HW_V2PlaneWanted(int subnum)
 {
     if (__builtin_expect(hw_v2p_key_gen != saturn_level_gen, 0))
         HW_V2PlaneBuild();
-    if ((unsigned)subnum >= HW_MAX_AP_SUBSECTORS)
+    if ((unsigned)subnum >= HW_MAX_SUBSECTORS)
         return hw_v2p_segf != NULL;
     return (hw_v2p_subbits[subnum >> 3] >> (subnum & 7)) & 1;
 }

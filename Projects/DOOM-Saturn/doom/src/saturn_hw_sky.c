@@ -457,11 +457,12 @@ void Saturn_HW_RenderInit(void)
     HW_APERTURE->last_pvs_ssec = NULL;
     HW_APERTURE->last_pvs_numnodes = 0;
     HW_APERTURE->dirty_words = 0xFFFFFFFFu;
-    if (numsubsectors > 0 && numsubsectors <= HW_MAX_AP_SUBSECTORS &&
+    HW_SubFlatInfoEnsure();
+    if (numsubsectors > 0 && numsubsectors <= HW_MAX_SUBSECTORS &&
         segs && lines && sides && sectors && vertexes)
     {
-        uint8_t sec_can_move[256];
-        for (int s = 0; s < 256; s++)
+        uint8_t sec_can_move[HW_MAX_AP_SECTORS];
+        for (int s = 0; s < HW_MAX_AP_SECTORS; s++)
             sec_can_move[s] = (s < numsectors && (P_GetSectorTag(&sectors[s]) != 0 || sectors[s].specialdata != 0)) ? 1u : 0u;
         for (int l = 0; l < numlines; l++)
         {
@@ -473,7 +474,7 @@ void Saturn_HW_RenderInit(void)
                     if ((unsigned)sn < (unsigned)numsides)
                     {
                         int sec = sides[sn].sector;
-                        if ((unsigned)sec < 256u)
+                        if ((unsigned)sec < (unsigned)HW_MAX_AP_SECTORS)
                             sec_can_move[sec] = 1u;
                     }
                 }
@@ -489,7 +490,7 @@ void Saturn_HW_RenderInit(void)
                 if ((unsigned)sn0 < (unsigned)numsides && (unsigned)sn1 < (unsigned)numsides)
                 {
                     int s0 = sides[sn0].sector, s1 = sides[sn1].sector;
-                    if ((unsigned)s0 < 256u && (unsigned)s1 < 256u &&
+                    if ((unsigned)s0 < (unsigned)HW_MAX_AP_SECTORS && (unsigned)s1 < (unsigned)HW_MAX_AP_SECTORS &&
                         (sec_can_move[s0] ^ sec_can_move[s1]) &&
                         sectors[s0].floorpic == sectors[s1].floorpic)
                     {
@@ -526,7 +527,7 @@ void Saturn_HW_RenderInit(void)
             for (int s = 0; s < HW_MAX_AP_SECTORS; s++)
                 hw_sec_ztop[s] = (s < n_sec) ? 0 : (int16_t)HW_SEC_ZTOP_CEIL;
             /* pass 0 counts, pass 1 fills */
-            uint8_t *nb = NULL;
+            uint16_t *nb = NULL;    /* sector numbers can exceed 255 (E2M7: 323) */
             for (int pass = 0; pass < 2; pass++)
             {
                 uint16_t fill[1];   /* unused in pass 0 */
@@ -552,7 +553,7 @@ void Saturn_HW_RenderInit(void)
                         }
                         else if (b >= 0 && (unsigned)b < (unsigned)n_sec && !sides[sn].midtexture)
                         {
-                            nb[first[f]++] = (uint8_t)b;
+                            nb[first[f]++] = (uint16_t)b;
                         }
                     }
                 }
@@ -560,7 +561,7 @@ void Saturn_HW_RenderInit(void)
                 {
                     for (int s = 0; s < HW_MAX_AP_SECTORS; s++)
                         first[s + 1] = (uint16_t)(first[s + 1] + first[s]);
-                    nb = (uint8_t *)Z_Malloc(first[HW_MAX_AP_SECTORS] + 4, PU_LEVEL);
+                    nb = (uint16_t *)Z_Malloc((first[HW_MAX_AP_SECTORS] + 2) * (int)sizeof(uint16_t), PU_LEVEL);
                 }
             }
             /* pass 1 advanced first[s] to the end of list s: shift back */
@@ -821,7 +822,7 @@ void Saturn_HW_RenderInit(void)
 
                     /* 3b. Prune permanently zero-height static 2-sided segs whose portal aperture
                      *     is already recorded by another seg in the subsector. */
-                    if ((unsigned)fsec_idx < 256u && !sec_can_move[fsec_idx])
+                    if ((unsigned)fsec_idx < (unsigned)HW_MAX_AP_SECTORS && !sec_can_move[fsec_idx])
                     {
                         int is_fsky = ((int16_t)sectors[fsec_idx].ceilingpic == -1);
                         fixed_t f_floor = sectors[fsec_idx].floorheight;
@@ -833,7 +834,7 @@ void Saturn_HW_RenderInit(void)
                             uint8_t fl = s.flags & (uint8_t)~SEG_FLAG_PORTAL_DONE;
                             int bsec_idx = s.back_sec_idx;
                             if (!(fl & (SEG_FLAG_SOLID | SEG_FLAG_MID)) &&
-                                (unsigned)bsec_idx < 256u && !sec_can_move[bsec_idx])
+                                (unsigned)bsec_idx < (unsigned)HW_MAX_AP_SECTORS && !sec_can_move[bsec_idx])
                             {
                                 fixed_t b_floor = sectors[bsec_idx].floorheight;
                                 fixed_t b_ceil  = sectors[bsec_idx].ceilingheight;
@@ -888,7 +889,7 @@ void Saturn_HW_RenderInit(void)
                         baked_seg_t s = segs_base[i];
                         uint8_t fl = s.flags & (uint8_t)~(SEG_FLAG_PORTAL_DONE | SEG_FLAG_STATIC);
                         if (!(s.flags & SEG_FLAG_STATIC) &&
-                            (unsigned)fsec_idx < 256u && !sec_can_move[fsec_idx] &&
+                            (unsigned)fsec_idx < (unsigned)HW_MAX_AP_SECTORS && !sec_can_move[fsec_idx] &&
                             s.tex_64 > 0)
                         {
                             int th = Saturn_TexHeight(s.tex_64);
@@ -920,7 +921,7 @@ void Saturn_HW_RenderInit(void)
                                 else if (!(fl & SEG_FLAG_MID))
                                 {
                                     int bsec_idx = s.back_sec_idx;
-                                    if ((unsigned)bsec_idx < 256u && !sec_can_move[bsec_idx])
+                                    if ((unsigned)bsec_idx < (unsigned)HW_MAX_AP_SECTORS && !sec_can_move[bsec_idx])
                                     {
                                         fixed_t b_ceil  = sectors[bsec_idx].ceilingheight;
                                         fixed_t b_floor = sectors[bsec_idx].floorheight;

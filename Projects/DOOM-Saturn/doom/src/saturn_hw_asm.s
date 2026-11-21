@@ -913,8 +913,8 @@ _hw_asm_walk:
 	mov.w	@(14,r8),r0
 	mov	r0,r5			! bsec
 	extu.w	r0,r0
-	mov	#1,r1
-	shll8	r1			! 256
+	mov	#2,r1
+	shll8	r1			! 512 = HW_MAX_AP_SECTORS
 	cmp/hs	r1,r0
 	bt	.Lw_next		! bad back sector
 	shll2	r0
@@ -1031,8 +1031,8 @@ _hw_asm_walk:
 	mov.w	@(14,r8),r0
 	mov	r0,r5			! bsec
 	extu.w	r0,r0
-	mov	#1,r1
-	shll8	r1			! 256
+	mov	#2,r1
+	shll8	r1			! 512 = HW_MAX_AP_SECTORS
 	cmp/hs	r1,r0
 	bt	.Lw_m2
 	shll2	r0
@@ -4374,8 +4374,9 @@ _hw_asm_portal:
 	bt	.Lq_rts			! seg_sx >= seg_ex
 	mov	r5,r0
 	shlr8	r0
+	shlr	r0
 	tst	r0,r0
-	bf	.Lq_rts			! (unsigned)bsec >= 256
+	bf	.Lq_rts			! (unsigned)bsec >= 512 (HW_MAX_AP_SECTORS)
 	mov.l	r8,@-r15
 	mov.l	r9,@-r15
 	mov.l	r10,@-r15

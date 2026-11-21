@@ -73,7 +73,7 @@ _Static_assert(offsetof(hw_sec_fast_t, has_things) == 13, "sub4");
 _Static_assert(offsetof(hw_sec_fast_t, light_delta) == 14, "sub5");
 _Static_assert(offsetof(sub_range_t, s_start) == 4, "sub6");
 _Static_assert(offsetof(sub_range_t, subnum) == 8, "sub7");
-_Static_assert(HW_MAX_AP_SECTORS == 256, "sub8");
+_Static_assert(HW_MAX_AP_SECTORS == 512, "sub8");
 _Static_assert(CMDBUF_MAX_VISIT == 384, "sub9");
 _Static_assert(HW_FLAT_ALLOW_CEIL == 8, "sub10");
 _Static_assert(sizeof(saturn_wl_subsector_t) == 16, "sub11");
@@ -277,6 +277,23 @@ static HW_NOINLINE HW_HOT_O2 void HW_RenderSubsector_Body(int subnum, int fully_
     aliased_uint32_t *r32 = (aliased_uint32_t *)&ranges[visit_idx];
     r32[1] = 0;
     ranges[visit_idx].subnum = (uint16_t)subnum;
+#ifdef SATURN_WIN32
+    {
+        extern int hw_dbg_visit_flags[1024];   /* harness -sweep SWEEP_DUMP */
+        extern int hw_dbg_trace;
+        if (visit_idx < 1024)
+            hw_dbg_visit_flags[visit_idx] = flat_flags;
+        if (hw_dbg_trace)
+            printf("[VISDBG] v%d ss %d sec %d solid %d ap %d ytop %d ybot %d dzf %d dzc %d bbox %d..%d %d..%d\n",
+                   visit_idx, subnum, secnum, hw_solid_count, HW_APERTURE->aperture_active,
+                   HW_APERTURE->cur_sub_ytop, HW_APERTURE->cur_sub_ybot,
+                   sf->dz_floor >> FRACBITS, sf->dz_ceil >> FRACBITS,
+                   saturn_baked_flat_bboxes ? saturn_baked_flat_bboxes[subnum].min_x : 0,
+                   saturn_baked_flat_bboxes ? saturn_baked_flat_bboxes[subnum].max_x : 0,
+                   saturn_baked_flat_bboxes ? saturn_baked_flat_bboxes[subnum].min_y : 0,
+                   saturn_baked_flat_bboxes ? saturn_baked_flat_bboxes[subnum].max_y : 0);
+    }
+#endif
 
     if (!HW_WALLS_ONLY && (flat_flags & (int)HW_FLAT_ALLOW_BOTH))
     {
@@ -861,7 +878,8 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         {
             last_flat_q_ptr = saturn_baked_flat_q_count;
             HW_APERTURE->last_pvs_numnodes = -1;
-            if (saturn_baked_flat_q_count && numsubsectors > 0 && numsubsectors <= HW_MAX_AP_SUBSECTORS)
+            HW_SubFlatInfoEnsure();
+            if (saturn_baked_flat_q_count && numsubsectors > 0)
             {
                 for (int s = 0; s < numsubsectors; s++)
                 {
@@ -994,7 +1012,7 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         int sec_words = ((numsectors > 512 ? 512 : numsectors) + 31) >> 5;
         for (int i = 0; i < sec_words; i++)
             hw_sec_things_built[i] = 0;
-        int sub_words = ((numsubsectors > 768 ? 768 : numsubsectors) + 31) >> 5;
+        int sub_words = ((numsubsectors > HW_MAX_SUBSECTORS ? HW_MAX_SUBSECTORS : numsubsectors) + 31) >> 5;
         for (int i = 0; i < sub_words; i++)
             hw_sub_has_things[i] = 0;
         hw_thing_pool_count = 0;

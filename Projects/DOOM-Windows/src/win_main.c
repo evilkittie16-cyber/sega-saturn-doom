@@ -695,6 +695,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 int g_win32_test_mode = 0;
 int g_pos_x = 0, g_pos_y = 0, g_pos_ang = 0, g_pos_map = 0;   /* -pos */
+const char *g_sweep_file = NULL;                                /* -sweep */
+int hw_dbg_visit_flags[1024];                                   /* -sweep SWEEP_DUMP */
+int hw_dbg_trace = 0;                                           /* -sweep SWEEP_TRACE: renderer prints */
 int g_walk_x1 = 0, g_walk_y1 = 0, g_walk_frames = 0;          /* -walk */
 int g_pos_viewh = 41;                                          /* -viewh */
 
@@ -702,6 +705,34 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
 {
     printf("FATAL CRASH! ExceptionCode: 0x%08X at Address: %p (ExeBase=%p)\n",
            ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, GetModuleHandleA(NULL));
+    {
+        /* 2026-11-21: name the faulting module and list stack words that
+         * point into the exe (candidate return addresses; resolve them
+         * with doom_saturn_asm.map). */
+        HMODULE fm = NULL;
+        char mn[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)ep->ExceptionRecord->ExceptionAddress, &fm))
+            GetModuleFileNameA(fm, mn, sizeof(mn));
+        printf("FAULT MODULE: %s (base %p)\n", mn, (void *)fm);
+#if defined(_M_IX86)
+        {
+            unsigned char *base = (unsigned char *)GetModuleHandleA(NULL);
+            IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+            unsigned int lo = (unsigned int)(uintptr_t)base, hi = lo + nt->OptionalHeader.SizeOfImage;
+            unsigned int *sp = (unsigned int *)(uintptr_t)ep->ContextRecord->Esp;
+            int k, shown = 0;
+            printf("EIP %08X ESP %08X\n", (unsigned)ep->ContextRecord->Eip, (unsigned)ep->ContextRecord->Esp);
+            for (k = 0; k < 2048 && shown < 24; k++)
+            {
+                unsigned int v;
+                if (IsBadReadPtr(sp + k, 4)) break;
+                v = sp[k];
+                if (v >= lo && v < hi) { printf("STACK +%04X: %08X (rva %08X)\n", k * 4, v, v - lo); shown++; }
+            }
+        }
+#endif
+    }
     fflush(stdout);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -795,6 +826,15 @@ int main(int argc, char **argv)
                     saturn_map = val;
                 }
             }
+        }
+        if (strcmp(argv[i], "-sweep") == 0 && i + 1 < argc) {
+            /* -sweep FILE: lines "EP MAP X Y DEG TAG" - pin each view, log
+             * [SWEEP] error vs the DOS reference, save sweep\TAG.bmp, exit. */
+            extern const char *g_sweep_file;
+            g_sweep_file = argv[i + 1];
+            g_win32_test_mode = 23;
+            i += 1;
+            continue;
         }
         if (strcmp(argv[i], "-pos") == 0 && i + 3 < argc) {
             /* -pos X Y ANGLE_DEG: pin the camera (as the HUD prints it) and
