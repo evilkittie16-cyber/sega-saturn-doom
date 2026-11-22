@@ -4042,6 +4042,9 @@ static HW_NOINLINE HW_COLD_OS void HW_V2PlanePunch(int subnum, const hw_sec_fast
     if (!hw_v2p_segf)
         return;
     const saturn_wl_subsector_t *ss = &saturn_baked_wall_subsectors[subnum];
+    /* pillar indices index the 96-entry hw_pil_gen / local_trans_pillars */
+    if (ss->num_pillars > HW_MAX_SUBSECTOR_PILLARS)
+        return;
     const saturn_wl_pillar_t *pil = &saturn_baked_wall_pillars[ss->pillar_start];
     const baked_seg_t *seg0 = &saturn_baked_wall_segs[ss->seg_start];
     const uint8_t *f0 = &hw_v2p_segf[ss->seg_start];
@@ -4118,9 +4121,10 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
         return 1;
     }
     int num_pil = (int)ss->num_pillars;
-    if (num_pil <= 0 || num_pil > HW_MAX_SUBSECTOR_PILLARS)
-        return 0;
-
+    /* New pillar generation BEFORE the pillar-count refusal (2026-11-22):
+     * HW_V2PlanePunch runs after this even on a refusal and trusts
+     * hw_pil_gen == hw_cur_pil_gen, which otherwise still matched the
+     * previous subsector's transformed pillars. */
     uint8_t pil_gen = (uint8_t)(hw_cur_pil_gen + 1u);
     if (__builtin_expect(pil_gen == 0, 0))
     {
@@ -4130,6 +4134,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_RenderSubsectorBakedWalls(int subnum, const 
         pil_gen = 1u;
     }
     hw_cur_pil_gen = pil_gen;
+    if (num_pil <= 0 || num_pil > HW_MAX_SUBSECTOR_PILLARS)
+        return 0;
 
     const saturn_wl_pillar_t *pillars = &saturn_baked_wall_pillars[ss->pillar_start];
     hw_cur_pillars = pillars;
@@ -4856,16 +4862,19 @@ static HW_NOINLINE HW_HOT_O2 int HW_EvalSubsectorSpanSlow(int sx, int ex)
 static HW_NOINLINE HW_COLD_OS int HW_CheckPortalSubsectorStepCull(
     int subnum, const hw_sec_fast_t *sf, int s_min)
 {
-    if (!saturn_baked_wall_subsectors)
+    if (!saturn_baked_wall_subsectors ||
+        (unsigned)subnum >= (unsigned)saturn_baked_wall_num_subsectors)
         return 0;
     const saturn_wl_subsector_t *wss = &saturn_baked_wall_subsectors[subnum];
-    if (wss->max_bsec0 < 0)
+    if (wss->max_bsec0 < 0 || wss->max_bsec0 >= numsectors)
         return 0;
     const hw_aperture_state_t *ap = HW_APERTURE;
     int32_t dz_f = hw_sec_fast[wss->max_bsec0].dz_floor;
     int floor_ok = (dz_f <= sf->dz_floor) ||
                    (dz_f <= 0 && HW_ProjY(dz_f, s_min, HW_VIEW_CY) >= ap->cur_ybot_max);
     if (!floor_ok)
+        return 0;
+    if (wss->max_bsec1 >= numsectors)
         return 0;
     if (wss->max_bsec1 >= 0)
     {

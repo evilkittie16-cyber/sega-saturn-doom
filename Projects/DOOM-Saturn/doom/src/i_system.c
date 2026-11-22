@@ -258,7 +258,7 @@ void Saturn_Udec(char *out, unsigned int v)
 
 void Saturn_Udec0(char *out, unsigned int v, int width)
 {
-    char tmp[10];
+    char tmp[11];   /* Saturn_Udec writes up to 10 digits + NUL */
     int  len = 0, i;
 
     if (width < 1)

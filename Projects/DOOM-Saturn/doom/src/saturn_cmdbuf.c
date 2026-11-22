@@ -512,8 +512,17 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     const uint32_t * const vram_limit = (const uint32_t *)(SATURN_VDP1_VRAM + saturn_v1_write_limit);
     /* unchecked fast path only when every quad surely fits before the limit */
     const uint32_t fit_slots = (uint32_t)(vram_limit - (const uint32_t *)vram32) >> 3;
+    /* Flat count: saturn_hw_flat_quads, not saturn_cmd_s_count - with
+     * HW_FLAT_STEAL the master's stolen flat jobs live in cmd_s[768..)
+     * and are referenced by ranges[].s_* but are not in
+     * saturn_cmd_s_count (saturn_hw_render.c), so the old sum could pass
+     * while the copy ran past the table limit (2026-11-22). */
+    extern unsigned int saturn_hw_flat_quads;
+    uint32_t flat_q = (uint32_t)saturn_hw_flat_quads;
+    if (flat_q < (uint32_t)saturn_cmd_s_count)
+        flat_q = (uint32_t)saturn_cmd_s_count;
     if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_sw_count +
-                         (uint32_t)saturn_cmd_s_count + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
+                         flat_q + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
     {
         extern int saturn_v1w_slotdrop;
         saturn_v1w_slotdrop = 0;

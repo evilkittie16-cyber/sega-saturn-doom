@@ -229,9 +229,21 @@ int Saturn_BakedWalls_Parse(void *data, unsigned len)
         return 0;
     }
 
-    if (hdr->ofs_subsectors >= len || hdr->ofs_pillars >= len || hdr->ofs_segs >= len)
+    if (hdr->ofs_subsectors >= len || hdr->ofs_pillars >= len || hdr->ofs_segs >= len ||
+        hdr->total_size > len || hdr->ofs_segs > hdr->total_size ||
+        hdr->ofs_subsectors + (uint32_t)hdr->num_subsectors * sizeof(saturn_wl_subsector_t) > len)
     {
         saturn_wall_parse_dbg = -4;
+        return 0;
+    }
+
+    /* A stale bake (e.g. a shareware .WL with a retail WAD) must not drive
+     * the renderer: consumers index the .WL subsector table by the map's
+     * subsector number, some without a bound (2026-11-22). The legacy SEGS
+     * parser always had this check. */
+    if ((int)hdr->num_subsectors != numsubsectors)
+    {
+        saturn_wall_parse_dbg = -6;
         return 0;
     }
 

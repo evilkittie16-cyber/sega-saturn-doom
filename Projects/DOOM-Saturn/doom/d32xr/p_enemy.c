@@ -840,7 +840,7 @@ void A_Tracer (mobj_t *actor)
 	mobj_t*	th;
 	const mobjinfo_t* ainfo = &mobjinfo[actor->type];
 
-	if (gametic & 3)
+	if (worldtic & 3)
 		return;
 
 	// spawn a puff of smoke behind the rocket

@@ -302,6 +302,8 @@ void G_DoLoadLevel (void);
 */
 
 int		ticphase;
+int		worldtic;		/* counts world (thinker) tics; see P_Ticker */
+int		p_world_tick;	/* 1 while the current P_Ticker runs the world */
 
 #ifdef MARS
 #define frtc I_GetFRTCounter()
@@ -359,6 +361,26 @@ int P_Ticker (void)
 	if (gamepaused)
 		return 0;
 
+#ifdef THINKERS_30HZ
+	/* World-tic phase decided BEFORE the player pieces (2026-11-22):
+	 * player code that runs in world units (power-up countdowns, damage
+	 * floors, player mobj state tics) must step only on world tics, and
+	 * world code masks worldtic, not gametic - gametic advances every
+	 * 30Hz tic and is reset/jumped independently of world_phase, so
+	 * `gametic&3` inside the world could see only odd values for a whole
+	 * level (frozen flat animation, crushers doing no damage). */
+	{
+		static VINT	world_phase;
+
+		p_world_tick = !(world_phase++ & 1);
+		if (p_world_tick)
+			worldtic++;
+	}
+#else
+	p_world_tick = 1;
+	worldtic++;
+#endif
+
 	start = frtc;
 	for (playernum = 0, pl = players; playernum < MAXPLAYERS; playernum++, pl++)
 		if (playeringame[playernum])
@@ -381,12 +403,8 @@ int P_Ticker (void)
 	 * turning, gravity, weapons, use) are vbl-scaled, so ticking them
 	 * at 30Hz with vblsinframe=TICVBLS=2 preserves speeds while
 	 * halving input latency and smoothing motion. */
-	{
-		static VINT	world_phase;
-
-		if (world_phase++ & 1)
-			return gameaction;
-	}
+	if (!p_world_tick)
+		return gameaction;
 #endif
 
 #ifdef THINKERS_30HZ

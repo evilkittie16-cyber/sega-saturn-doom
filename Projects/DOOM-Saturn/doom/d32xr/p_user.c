@@ -189,7 +189,10 @@ void P_PlayerMobjThink (mobj_t *mobj)
 	if ( (mobj->z != mobj->floorz) || mobj->momz)
 		P_PlayerZMovement (mobj);
 	
-	if (gametic == prevgametic)
+	/* mobj state tics are world units: step only on world tics
+	 * (prevgametic is never updated on Saturn, so the old test never
+	 * fired and player states ran at twice the monster rate) */
+	if (!p_world_tick)
 		return;
 
 /* */
@@ -759,7 +762,10 @@ ticphase = 26;
 /* */
 /* counters */
 /* */
-	if (gametic != prevgametic)
+	/* INVULNTICS etc. (doomdef.h) and the damage/bonus fades are in world
+	 * (15 Hz) units: count only on world tics. The old prevgametic test
+	 * was always true at 30 Hz, so power-ups lasted half as long. */
+	if (p_world_tick)
 	{
 		if (player->powers[pw_strength])
 			player->powers[pw_strength]++;	/* strength counts up to diminish fade */

@@ -35,6 +35,30 @@ void P_Telefrag (mobj_t *thing, fixed_t x, fixed_t y)
 }
 
 
+/* Vanilla PIT_StompThing for a non-player: any other shootable thing
+ * overlapping the destination blocks the teleport. */
+static boolean P_TeleportBlocked (mobj_t *thing, fixed_t x, fixed_t y)
+{
+	mobj_t	*m;
+
+	for (m=mobjhead.next ; m != (void *)&mobjhead ; m=m->next)
+	{
+		fixed_t	blockdist, delta;
+
+		if (m == thing || !(m->flags & MF_SHOOTABLE))
+			continue;
+		blockdist = (m->radius + thing->radius)*FRACUNIT;
+		delta = m->x - x;
+		if (delta >= blockdist || delta <= -blockdist)
+			continue;
+		delta = m->y - y;
+		if (delta >= blockdist || delta <= -blockdist)
+			continue;
+		return true;
+	}
+	return false;
+}
+
 /*================================================================== */
 /* */
 /*						TELEPORTATION */
@@ -77,11 +101,23 @@ int	EV_Teleport( line_t *line,mobj_t *thing )
 			oldy = thing->y;
 			oldz = thing->z;
 			oldsubs = thing->subsector;
-			thing->flags |= MF_TELEPORT;
+			/* Vanilla P_TeleportMove semantics (2026-11-22): floor/ceiling
+			 * come from the destination sector only; lines and solid
+			 * decorations never block; the player telefrags shootables,
+			 * a monster is blocked by them (Doom 1). The old plain
+			 * P_TryMove refused on a lamp / blocking line / dropoff near
+			 * the pad AFTER P_Telefrag had already killed everything. */
+			if (thing->type != MT_PLAYER && P_TeleportBlocked (thing, m->x, m->y))
+				return 0;	/* move is blocked */
 			if (thing->type == MT_PLAYER)
 				P_Telefrag (thing, m->x, m->y);
-			flag = P_TryMove (&tm, thing, m->x, m->y);
-			thing->flags &= ~MF_TELEPORT;
+			{
+				int added = (MF_TELEPORT | MF_NOCLIP) & ~thing->flags;
+
+				thing->flags |= added;
+				flag = P_TryMove (&tm, thing, m->x, m->y);
+				thing->flags &= ~added;
+			}
 			if (!flag)
 				return 0;	/* move is blocked */
 			thing->z = thing->floorz;

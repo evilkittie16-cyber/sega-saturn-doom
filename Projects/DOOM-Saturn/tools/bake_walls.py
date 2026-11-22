@@ -453,6 +453,13 @@ def main():
         total_dsp_batches = sum(sh["num_dsp_batches"] for sh in headers)
         max_pil = max(sh["num_pillars"] for sh in headers) if headers else 0
         print(f"Baked {out_path:11s}: {len(headers):3d} ssecs, {len(pillars):5d} pillars (max {max_pil:3d}/ss, {total_dsp_batches} DSP batches <=32), {orig_segs:4d} -> {len(baked_segs):4d} baked segs ({len(blob)/1024:.1f} KB)")
+        # Runtime limit HW_MAX_SUBSECTOR_PILLARS (saturn_hw_walls.c): a bigger
+        # subsector is refused at run time and draws no walls.
+        HW_MAX_SUBSECTOR_PILLARS = 96
+        if max_pil > HW_MAX_SUBSECTOR_PILLARS:
+            bad = sum(1 for sh in headers if sh["num_pillars"] > HW_MAX_SUBSECTOR_PILLARS)
+            print(f"WARNING {out_path}: {bad} subsector(s) exceed {HW_MAX_SUBSECTOR_PILLARS} pillars "
+                  f"(max {max_pil}) - their walls will not be drawn on Saturn")
 
     print(f"Successfully baked {total_maps_baked} .WL maps to cd/")
 

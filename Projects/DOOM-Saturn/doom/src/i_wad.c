@@ -675,6 +675,13 @@ int Saturn_CartInit(void)
             {
                 cart_total_bytes         = steps[si];  /* verified extent */
                 saturn_cart_size         = steps[si];
+                /* A failed march step is hard evidence the cart is smaller
+                 * (or mirrors): the Z zone (+2..4 MB) and texture arena
+                 * gate on cart_real_bytes, which the 1008 KB policy clamp
+                 * deliberately leaves alone - but this is not that clamp.
+                 * Without it both were placed on unverified/mirrored RAM
+                 * (2026-11-22). */
+                cart_real_bytes          = (si > 0) ? steps[si - 1] : 0u;  /* last step that passed */
                 saturn_cart_rw_point     = 10 + si;
                 saturn_cart_rw_ok        = 0;
                 break;

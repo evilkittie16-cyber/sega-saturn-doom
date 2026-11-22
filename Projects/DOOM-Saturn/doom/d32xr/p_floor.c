@@ -168,7 +168,7 @@ void T_MoveFloor(floormove_t *floor)
 	
 	res = T_MovePlane(&floor->m,floor->speed,
 			floor->floordestheight,floor->crush,0,floor->direction);
-	if (!(gametic&3))
+	if (!(worldtic&3))
 		P_MoverSound(&floor->m,sfx_stnmov);
 	if (res == pastdest)
 	{

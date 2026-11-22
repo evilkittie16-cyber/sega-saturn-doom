@@ -27,7 +27,7 @@ void	T_PlatRaise(plat_t	*plat)
 					
 			if (plat->type == raiseAndChange ||
 				plat->type == raiseToNearestAndChange)
-				if (!(gametic&7))
+				if (!(worldtic&7))
 					P_MoverSound(&plat->m,sfx_stnmov);
 				
 			if (res == crushed && (!plat->crush))

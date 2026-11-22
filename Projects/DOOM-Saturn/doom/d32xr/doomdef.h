@@ -621,6 +621,8 @@ extern 	VINT 		gamemapcount;
 
 extern 	int 		gametic;
 extern 	int 		prevgametic;
+extern 	int 		worldtic;		/* world (thinker) tics, p_tick.c */
+extern 	int 		p_world_tick;	/* current P_Ticker runs the world */
 
 #define MAXDMSTARTS		10
 extern	mapthing_t	*deathmatchstarts, *deathmatch_p;

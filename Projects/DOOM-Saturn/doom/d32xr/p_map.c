@@ -273,6 +273,13 @@ void P_UseLines (player_t *player)
 
 	if (!lu.closeline->special)
 		S_StartSound (player->mo, sfx_noway);
+	else if (P_PointOnLineSide (player->mo->x, player->mo->y, lu.closeline) == 1)
+	{
+		/* vanilla P_UseSpecialLine: specials are used from the front side
+		 * only (2026-11-22: from behind, a player inside an open door
+		 * closed it on themselves, and one-way switches fired early).
+		 * Doom 1 has no back-side-usable special (124 is Doom II). */
+	}
 	else
 	{
 		extern int	saturn_cnt_usespec;	/* door diagnosis */

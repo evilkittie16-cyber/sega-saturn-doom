@@ -1295,6 +1295,23 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     static subsector_t *last_ssec = NULL;
     static const byte *last_pvs_row = NULL;
     subsector_t *ssec;
+    /* New level (2026-11-22): the zone allocates the same way every load,
+     * so `nodes` can land at the same address and the frame counters
+     * restart at 1 - per-frame/per-camera caches keyed on them could
+     * survive into the next map (old subsector/PVS row, old texture SRCA,
+     * old plane-punch spans). Drop them on every level load. */
+    {
+        extern unsigned int saturn_level_gen;
+        static unsigned int hw_cache_gen = 0xFFFFFFFFu;
+        if (hw_cache_gen != saturn_level_gen)
+        {
+            hw_cache_gen      = saturn_level_gen;
+            last_ssec         = NULL;
+            last_pvs_row      = NULL;
+            hw_wctx_tex_frame = (uint16_t)(hw_render_frame + 0x8000);
+            hw_v2p_frame      = 0xFFFFFFFFu;
+        }
+    }
     if (hw_viewx == last_ssec_vx && hw_viewy == last_ssec_vy && nodes == last_ssec_nodes && last_ssec != NULL)
     {
         ssec = last_ssec;
@@ -1613,6 +1630,19 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         ipc->view_h  = (int16_t)saturn_view_h;
         ipc->quad_count = 0;
         ipc->sky_visible = 0;
+        /* View mode change (168 <-> 192 rows): the slave's flat emitters
+         * read saturn_view_h / saturn_view_cy through its cache
+         * (HW_FlatQuadDy, HW_SliceFlatQuadV) and could keep the old values
+         * in a hot line - make it purge, same as a new level (2026-11-22). */
+        {
+            static int hw_slave_vh = -1, hw_slave_vcy = -1;
+            if (hw_slave_vh != saturn_view_h || hw_slave_vcy != saturn_view_cy)
+            {
+                hw_slave_vh  = saturn_view_h;
+                hw_slave_vcy = saturn_view_cy;
+                hw_slave_level_dirty = 1;
+            }
+        }
         if (hw_slave_level_dirty)
         {
             /* New level: tell the slave to purge stale flat-geometry L1 lines */

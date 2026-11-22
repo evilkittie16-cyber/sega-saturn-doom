@@ -105,7 +105,7 @@ extern byte *Saturn_SpritePatch(int s, int *w, int *h, int *lofs,
  * taller is refused (the quad is skipped). Width must be a multiple of
  * 8 (VDP1 SIZE.X is in 8-texel units). */
 #define V1_TEX_MAX_W     256
-#define V1_TEX_MAX_H     256
+#define V1_TEX_MAX_H     255    /* CMDSIZE rows and v1_tag_t.h are 8-bit: 256 stored as 0 */
 
 /* SGL priority call: SL_DEF.H defines slPriorityNbg0(n) etc. as
  * macros over slPriority(screen, n); the screen codes are #defines
@@ -1043,10 +1043,15 @@ static void v1_tags_try_alloc(void)
     n     = (int)numtextures + (int)numflats + (int)numsprites + V1_WARP_SLOTS;
     bytes = n * (int)sizeof(v1_tag_t);
 
-    /* Allocate in fast 32-bit WRAM-H via Jo heap; fallback to WRAM-L scratch (14,232B < 16KB) */
+    /* Allocate in fast 32-bit WRAM-H via Jo heap; fallback to the 16 KB
+     * WRAM-L scratch only when the table fits (2026-11-22: with
+     * V1_WARP_SLOTS a retail WAD needs ~20 KB and silently overran into
+     * PROJ_VERTS), else the zone (Z_Malloc I_Errors loudly if full). */
     v1_tag[0] = (v1_tag_t *)jo_malloc_with_behaviour(bytes, 0);
-    if (v1_tag[0] == NULL)
+    if (v1_tag[0] == NULL && bytes <= (int)SATURN_WRAM_L_SCRATCH_SIZE)
         v1_tag[0] = (v1_tag_t *)SATURN_WRAM_L_SCRATCH_ADDR;
+    if (v1_tag[0] == NULL)
+        v1_tag[0] = (v1_tag_t *)Z_Malloc(bytes, PU_STATIC);
 
     v1_tag[1]    = v1_tag[0];
     v1_tag_n     = n;
@@ -2389,7 +2394,11 @@ void Saturn_Vdp1Wall_Reset(void)
          * dropped. Wait (bounded, ~3 fields) until it has been drawn. */
         if (saturn_v1_manual && v1m_double)
         {
-            unsigned guard2 = 35000u;   /* x ~40 cycles = ~50 ms */
+            /* ~200 ms (was ~50 ms, 2026-11-22): current draw + the pending
+             * list can exceed 50 ms in the heavy scenes where flushes
+             * happen; timing out early let this frame's uploads overwrite
+             * textures the pending list still draws. Still bounded. */
+            unsigned guard2 = 140000u;  /* x ~40 cycles */
             while ((v1m_pending || !v1m_draw_done()) && --guard2)
             {
                 for (int w = 0; w < 32; w++)

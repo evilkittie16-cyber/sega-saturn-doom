@@ -1544,6 +1544,17 @@ void D_DoomLoop(void)
              * cannot spiral. 5 tics × 6 fps = the full 30 tics/s on
              * Kronos; real HW at 2.4 fps goes 16% → 40%. */
             {
+                /* First frame of a new level (2026-11-22): Saturn_G_InitNew
+                 * zeroes gametic, so the debt clamp below used to run a
+                 * hidden 5-tic burst (~167 ms of world time, monsters
+                 * moving) before the first picture. Start with one tic. */
+                extern volatile unsigned int saturn_load_count;
+                static unsigned int debt_level = 0xFFFFFFFFu;
+                if (saturn_load_count != debt_level)
+                {
+                    debt_level = saturn_load_count;
+                    gametic = (int)(saturn_vbl_count / TICVBLS) - 1;
+                }
                 int debt = (int)(saturn_vbl_count / TICVBLS) - gametic;
                 if (debt > 5)
                     gametic = (int)(saturn_vbl_count / TICVBLS) - 5;

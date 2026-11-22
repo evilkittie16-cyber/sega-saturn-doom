@@ -738,18 +738,18 @@ void P_PlayerInSpecialSector (player_t *player)
 	{
 		case 5:		/* HELLSLIME DAMAGE */
 			if (!player->powers[pw_ironfeet])
-				if ((gametic != prevgametic) && !(gametic&0xf))
+				if (p_world_tick && !(worldtic&0xf))
 					P_DamageMobj (player->mo, NULL, NULL, 10);
 			break;
 		case 7:		/* NUKAGE DAMAGE */
 			if (!player->powers[pw_ironfeet])
-				if ((gametic != prevgametic) && !(gametic&0xf))
+				if (p_world_tick && !(worldtic&0xf))
 					P_DamageMobj (player->mo, NULL, NULL, 5);
 			break;
 		case 16:	/* SUPER HELLSLIME DAMAGE */
 		case 4:		/* STROBE HURT */
 			if (!player->powers[pw_ironfeet] || (P_Random()<5) )
-				if ((gametic != prevgametic) && !(gametic&0xf))
+				if (p_world_tick && !(worldtic&0xf))
 					P_DamageMobj (player->mo, NULL, NULL, 20);
 			break;
 			
@@ -762,7 +762,7 @@ void P_PlayerInSpecialSector (player_t *player)
 			
 		case 11:	/* EXIT SUPER DAMAGE (E1M8 end room) — was missing: I_Error */
 			player->cheats &= ~CF_GODMODE;
-			if ((gametic != prevgametic) && !(gametic&0xf))
+			if (p_world_tick && !(worldtic&0xf))
 				P_DamageMobj (player->mo, NULL, NULL, 20);
 			if (player->health <= 10)
 				G_ExitLevel();
@@ -792,7 +792,7 @@ void P_UpdateSpecials (void)
 	/* */
 	/*	ANIMATE FLATS AND TEXTURES GLOBALY */
 	/* */
-	if (! (gametic&3) )
+	if (! (worldtic&3) )
 	{
 		for (anim = anims ; anim < lastanim ; anim++)
 		{

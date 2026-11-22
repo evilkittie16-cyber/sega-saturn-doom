@@ -214,6 +214,79 @@ static int v2_sector_eligible(sector_t *s)
     return P_GetSectorTag(s) <= 0;      /* tagged: floor / light can be moved by a trigger */
 }
 
+#if HW_VDP2_PLANE
+/* Floors that move although their own sector is untagged (2026-11-22):
+ *  - stair steps: EV_BuildStairs (specials 7, 8, 100, 127) raises the
+ *    chain of same-floorpic sectors behind the tagged start sector,
+ *    following two-sided lines whose FRONT is the previous step;
+ *  - donut rings: EV_DoDonut (special 9) raises the sector around the
+ *    tagged pillar.
+ * The plane draws its floor group at a fixed height, so such a sector in
+ * the group lost its top surface once it rose. ok[] bit 7 marks movers
+ * during the flood; they end up ineligible. */
+static void v2_exclude_untagged_movers(uint8_t *ok)
+{
+    int any = 0;
+    for (int l = 0; l < numlines; l++)
+    {
+        int sp = lines[l].special;
+        int stairs = (sp == 7 || sp == 8 || sp == 100 || sp == 127);
+        if (!stairs && sp != 9)
+            continue;
+        int tag = P_GetLineTag(&lines[l]);
+        if (tag <= 0)
+            continue;
+        for (int m = 0; m < numlines; m++)
+        {
+            int sn0 = lines[m].sidenum[0], sn1 = lines[m].sidenum[1];
+            if ((unsigned)sn0 >= (unsigned)numsides || (unsigned)sn1 >= (unsigned)numsides)
+                continue;
+            int f = sides[sn0].sector, b = sides[sn1].sector;
+            if ((unsigned)f >= (unsigned)numsectors || (unsigned)b >= (unsigned)numsectors)
+                continue;
+            if (stairs)
+            {
+                /* first step: front = tagged start, back has its floorpic */
+                if (P_GetSectorTag(&sectors[f]) == tag && sectors[b].floorpic == sectors[f].floorpic)
+                    ok[b] |= 0x80u, any = 1;
+            }
+            else
+            {
+                /* donut: any two-sided neighbour of the tagged pillar */
+                if (P_GetSectorTag(&sectors[f]) == tag)
+                    ok[b] |= 0x80u, any = 1;
+                if (P_GetSectorTag(&sectors[b]) == tag)
+                    ok[f] |= 0x80u, any = 1;
+            }
+        }
+    }
+    /* later steps: front is a marked step, back continues the floorpic */
+    for (int pass = 0; any && pass < numsectors; pass++)
+    {
+        int changed = 0;
+        for (int m = 0; m < numlines; m++)
+        {
+            int sn0 = lines[m].sidenum[0], sn1 = lines[m].sidenum[1];
+            if ((unsigned)sn0 >= (unsigned)numsides || (unsigned)sn1 >= (unsigned)numsides)
+                continue;
+            int f = sides[sn0].sector, b = sides[sn1].sector;
+            if ((unsigned)f >= (unsigned)numsectors || (unsigned)b >= (unsigned)numsectors)
+                continue;
+            if ((ok[f] & 0x80u) && !(ok[b] & 0x80u) && sectors[b].floorpic == sectors[f].floorpic)
+            {
+                ok[b] |= 0x80u;
+                changed = 1;
+            }
+        }
+        if (!changed)
+            break;
+    }
+    for (int i = 0; i < numsectors; i++)
+        if (ok[i] & 0x80u)
+            ok[i] = 0;
+}
+#endif
+
 void Saturn_VDP2_Plane_SelectForLevel(void)
 {
     static uint16_t secq[SATURN_V2P_MAX_SECTORS];
@@ -239,6 +312,7 @@ void Saturn_VDP2_Plane_SelectForLevel(void)
     }
     for (int i = 0; i < numsectors; i++)
         ok[i] = (uint8_t)v2_sector_eligible(&sectors[i]);
+    v2_exclude_untagged_movers(ok);
     /* group = same floor height, flat and light level */
     unsigned int best_q = 0;
     int best = -1;

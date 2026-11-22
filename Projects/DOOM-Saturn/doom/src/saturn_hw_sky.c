@@ -458,6 +458,15 @@ void Saturn_HW_RenderInit(void)
     HW_APERTURE->last_pvs_numnodes = 0;
     HW_APERTURE->dirty_words = 0xFFFFFFFFu;
     HW_SubFlatInfoEnsure();
+    if (numsubsectors > HW_MAX_SUBSECTORS)
+    {
+        /* The per-subsector init below is skipped: the baked .WL tables
+         * would keep raw disc values in their runtime fields (portal
+         * ranges, max_bsec, backface skip counts) -> wrong culling and
+         * missing walls (or out-of-range reads). No walls is the safe
+         * failure; Doom 1 maps stay under the cap. */
+        saturn_baked_walls_active = 0;
+    }
     if (numsubsectors > 0 && numsubsectors <= HW_MAX_SUBSECTORS &&
         segs && lines && sides && sectors && vertexes)
     {
@@ -478,6 +487,29 @@ void Saturn_HW_RenderInit(void)
                             sec_can_move[sec] = 1u;
                     }
                 }
+            }
+        }
+        /* Donuts (special 9): EV_DoDonut raises the ring around each tagged
+         * sector - untagged, no special, usually another floorpic. Mark
+         * every two-sided neighbour of a donut-tagged sector. */
+        for (int l = 0; l < numlines; l++)
+        {
+            if (lines[l].special != 9)
+                continue;
+            int dtag = P_GetLineTag(&lines[l]);
+            for (int m = 0; m < numlines; m++)
+            {
+                int sn0 = lines[m].sidenum[0], sn1 = lines[m].sidenum[1];
+                if ((unsigned)sn0 >= (unsigned)numsides || (unsigned)sn1 >= (unsigned)numsides)
+                    continue;
+                int s0 = sides[sn0].sector, s1 = sides[sn1].sector;
+                if ((unsigned)s0 >= (unsigned)HW_MAX_AP_SECTORS || (unsigned)s1 >= (unsigned)HW_MAX_AP_SECTORS ||
+                    s0 >= numsectors || s1 >= numsectors)
+                    continue;
+                if (P_GetSectorTag(&sectors[s0]) == dtag)
+                    sec_can_move[s1] = 1u;
+                if (P_GetSectorTag(&sectors[s1]) == dtag)
+                    sec_can_move[s0] = 1u;
             }
         }
         /* Propagate along same-floorpic 2-sided lines to cover untagged EV_BuildStairs steps */

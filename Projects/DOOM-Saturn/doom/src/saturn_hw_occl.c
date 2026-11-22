@@ -1352,7 +1352,12 @@ static HW_NOINLINE HW_COLD_OS void HW_UpdateNodePvsVis(const byte *pvs_row, cons
     uint32_t *vis = ap->node_pvs_vis;
     node_t *local_nodes = nodes;
     int n_nodes = numnodes;
+    /* node_pvs_vis holds HW_NODE_PVS_WORDS*32 nodes: never write past it on
+     * a bigger map (2026-11-22); nodes beyond count as visible below. */
     int n_words = (n_nodes + 31) >> 5;
+    if (n_words > HW_NODE_PVS_WORDS)
+        n_words = HW_NODE_PVS_WORDS;
+    const unsigned vis_cap = (unsigned)n_words << 5;
     for (int w = 0; w < n_words; w++)
         vis[w] = 0;
 
@@ -1374,7 +1379,7 @@ static HW_NOINLINE HW_COLD_OS void HW_UpdateNodePvsVis(const byte *pvs_row, cons
         }
         else if ((unsigned)c0 < (unsigned)n_nodes)
         {
-            v0 = (vis[c0 >> 5] & hw_bit_lut[c0 & 31]) != 0;
+            v0 = ((unsigned)c0 >= vis_cap) || (vis[c0 >> 5] & hw_bit_lut[c0 & 31]) != 0;
         }
         local_nodes[i].encbbox[0] = v0 ? (uint16_t)c0 : 0xFFFFu;
 
@@ -1394,11 +1399,11 @@ static HW_NOINLINE HW_COLD_OS void HW_UpdateNodePvsVis(const byte *pvs_row, cons
         }
         else if ((unsigned)c1 < (unsigned)n_nodes)
         {
-            v1 = (vis[c1 >> 5] & hw_bit_lut[c1 & 31]) != 0;
+            v1 = ((unsigned)c1 >= vis_cap) || (vis[c1 >> 5] & hw_bit_lut[c1 & 31]) != 0;
         }
         local_nodes[i].encbbox[1] = v1 ? (uint16_t)c1 : 0xFFFFu;
 
-        if (v0 | v1)
+        if ((v0 | v1) && (unsigned)i < vis_cap)
             vis[i >> 5] |= hw_bit_lut[i & 31];
     }
     ap->last_pvs_ssec = ssec_key;

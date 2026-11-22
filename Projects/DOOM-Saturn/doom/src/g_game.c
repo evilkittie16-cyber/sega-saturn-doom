@@ -199,6 +199,7 @@ void Saturn_G_Ticker(void)
     {
         extern void Saturn_Pause_Init(void);
         extern void Saturn_Pause_Tick(int edges);
+        static int resume_mask = 0;     /* buttons held when pause closed */
         player_t *p = &players[consoleplayer];
         /* Latched presses, taken once (2026-11-16, see saturn_pad_edges):
          * fixes both the lost press on 0-tic frames and the double edge on
@@ -228,6 +229,21 @@ void Saturn_G_Ticker(void)
         else
         {
             Saturn_Pause_Tick(edges);
+            /* Resumed (2026-11-22): the button that closed the menu (A =
+             * BT_ATTACK, B = BT_USE) is still held and P_Ticker runs this
+             * same tic - it fired the weapon / pressed use (could hit an
+             * exit switch). Swallow attack/use until they are released. */
+            if (!gamepaused)
+            {
+                resume_mask = BT_ATTACK | BT_USE;
+                p->usedown = p->attackdown = true;
+            }
+        }
+        if (resume_mask)
+        {
+            resume_mask &= p->ticbuttons;       /* released -> live again */
+            p->ticbuttons    &= ~resume_mask;
+            p->oldticbuttons &= ~resume_mask;
         }
     }
 

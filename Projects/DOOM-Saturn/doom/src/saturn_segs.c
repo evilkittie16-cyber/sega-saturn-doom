@@ -46,11 +46,17 @@ const byte *Saturn_Pvs_GetRow(fixed_t x, fixed_t y)
             const byte *src = pvs_blob + (unsigned)leaf * pvs_rowbytes;
             if (pvs_rowbytes <= sizeof(pvs_row_cache))
             {
-                if (leaf != pvs_cached_leaf || pvs_blob != pvs_cached_blob)
+                /* keyed on the level too: the next map's PU_LEVEL blob can
+                 * land at the same address (2026-11-22) */
+                extern unsigned int saturn_level_gen;
+                static unsigned int pvs_cached_gen = 0xFFFFFFFFu;
+                if (leaf != pvs_cached_leaf || pvs_blob != pvs_cached_blob ||
+                    pvs_cached_gen != saturn_level_gen)
                 {
                     D_memcpy(pvs_row_cache, src, pvs_rowbytes);
                     pvs_cached_leaf = leaf;
                     pvs_cached_blob = pvs_blob;
+                    pvs_cached_gen  = saturn_level_gen;
                 }
                 return pvs_row_cache;
             }

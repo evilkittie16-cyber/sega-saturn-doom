@@ -199,6 +199,20 @@ doom/src/saturn_inter.o: doom/src/saturn_inter.c
 doom/d32xr/p_setup.o: doom/d32xr/p_setup.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
 
+# Rarely-run game code (attract demo, teleports, switch/door activation;
+# the door/button thinkers are a few per tic at most) - cold -Os.
+doom/src/saturn_demo.o: doom/src/saturn_demo.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/d32xr/p_telept.o: doom/d32xr/p_telept.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/d32xr/p_switch.o: doom/d32xr/p_switch.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+doom/d32xr/p_doors.o: doom/d32xr/p_doors.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
 doom/src/i_video.o: doom/src/i_video.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -DSATURN_PERF_ROWS $(DIVLUT_DEFS) -o $@
 
@@ -214,8 +228,10 @@ doom/src/d_main.o: doom/src/d_main.c
 doom/src/saturn_dsp.o: doom/src/saturn_dsp.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS) -DSATURN_DSP_OFF -o $@
 
+# i_wad.c: WAD/cart/CD loading - load-time and CD-bound, so cold -Os too
+# (2026-11-22: bug-fix round needed ~1 KB back under 0x060C0000).
 doom/src/i_wad.o: doom/src/i_wad.c
-	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
 
 doom/src/d32xr_stubs.o: doom/src/d32xr_stubs.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) $(DIVLUT_DEFS) -ffixed-r2 -ffixed-r3 -ffixed-r6 -ffixed-r7 -o $@

@@ -1083,7 +1083,7 @@ void Saturn_HUD_Draw(void)
 
             if (saturn_show_perf)
             {
-                char dbg[128];
+                char dbg[160];   /* every field at its clamp reaches 128 + NUL */
                 int dn = 0;
 
                 dn = hud_tiny_tag(dbg, dn, 'R', pf_ms[1]);
