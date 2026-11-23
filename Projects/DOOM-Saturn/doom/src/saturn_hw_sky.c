@@ -406,42 +406,50 @@ void Saturn_HW_RenderInit(void)
     hw_last_sky_angle = 0xFFFFFFFFu;
     hw_last_sky_cy    = -1;
 
-    /* New level: reset VDP1 arena pages and preload all level flats (and animated frames) to both pages */
+    /* New level: reset VDP1 arena pages and preload the level's most used
+     * flats (animated flats with all their frames) as permanent pyramids.
+     * Capped (2026-11-23): preloading every flat took 283 KB of the 448 KB
+     * texture arena in retail E2M2 (52 flats); the 170 KB left could not
+     * hold one view's walls + sprites, so the cache evicted and re-uploaded
+     * ~180 KB every frame (4 FPS, stale-SRCA noise on floors). The rest
+     * upload on first use into the evictable arena. */
+#ifndef HW_FLAT_PRELOAD_MAX
+#define HW_FLAT_PRELOAD_MAX 28      /* pyramids of 5440 B: ~150 KB */
+#endif
     Saturn_Vdp1_ClearPages();
-    for (s = 0; s < numsectors; s++)
     {
-        if (sectors[s].floorpic >= 0)
+        uint16_t cnt[256];
+        const int nf = numflats < 256 ? (int)numflats : 256;
+        int left = HW_FLAT_PRELOAD_MAX;
+        const anim_t *a;
+        D_memset(cnt, 0, sizeof(cnt));
+        for (s = 0; s < numsectors; s++)
         {
-            Saturn_Vdp1_PreloadFlat(sectors[s].floorpic);
-            if (anims && lastanim)
-            {
-                const anim_t *a;
-                for (a = anims; a < lastanim; a++)
-                {
-                    if (!a->istexture && sectors[s].floorpic >= a->basepic && sectors[s].floorpic <= a->picnum)
-                    {
-                        int p;
-                        for (p = a->basepic; p <= a->picnum; p++)
-                            Saturn_Vdp1_PreloadFlat(p);
-                    }
-                }
-            }
+            if ((unsigned)sectors[s].floorpic < (unsigned)nf)
+                cnt[sectors[s].floorpic]++;
+            if ((unsigned)sectors[s].ceilingpic < (unsigned)nf)
+                cnt[sectors[s].ceilingpic]++;
         }
-        if (sectors[s].ceilingpic != -1)
+        while (left > 0)
         {
-            Saturn_Vdp1_PreloadFlat(sectors[s].ceilingpic);
-            if (anims && lastanim)
-            {
-                const anim_t *a;
-                for (a = anims; a < lastanim; a++)
+            int f, best = 0, lo, hi;
+            for (f = 1; f < nf; f++)
+                if (cnt[f] > cnt[best])
+                    best = f;
+            if (!cnt[best])
+                break;
+            lo = hi = best;                 /* an animated flat brings its whole cycle */
+            for (a = anims; anims && a < lastanim; a++)
+                if (!a->istexture && best >= a->basepic && best <= a->picnum)
                 {
-                    if (!a->istexture && sectors[s].ceilingpic >= a->basepic && sectors[s].ceilingpic <= a->picnum)
-                    {
-                        int p;
-                        for (p = a->basepic; p <= a->picnum; p++)
-                            Saturn_Vdp1_PreloadFlat(p);
-                    }
+                    lo = a->basepic;
+                    hi = a->picnum < nf ? a->picnum : nf - 1;
                 }
+            for (f = lo; f <= hi; f++)
+            {
+                Saturn_Vdp1_PreloadFlat(f);
+                cnt[f] = 0;
+                left--;
             }
         }
     }
@@ -1177,7 +1185,12 @@ int Saturn_HW_SkyLowerY(void)
 }
 int Saturn_HW_SkyLowerMode(void)
 {
-    return hw_is_sky ? 1 : 0;
+    /* 2026-11-23: while adaptive detail cuts the far plane, far floors are
+     * missing and the sky would show through the ground below the horizon
+     * (retail E3M8 courtyard: a "floating" castle); black there reads as
+     * distance darkness instead */
+    extern int saturn_hw_detail_level;
+    return (hw_is_sky && saturn_hw_detail_level == 0) ? 1 : 0;
 }
 
 /* Write the sky panorama into NBG0 page rows y0..view_h-1 (512 bytes each).

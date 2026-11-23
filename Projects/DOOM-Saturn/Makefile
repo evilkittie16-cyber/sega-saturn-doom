@@ -21,7 +21,7 @@ DIVLUT_DEFS :=
 endif
 
 # Match the demo's proven boot configuration exactly.
-JO_COMPILE_WITH_VIDEO_MODULE = 1
+JO_COMPILE_WITH_VIDEO_MODULE = 0   # 2026-11-23: unused by DOOM; 5.7 KB of the 0x060C0000 static ceiling
 JO_COMPILE_WITH_SOFTWARE_RENDERER_MODULE = 1
 JO_COMPILE_WITH_BACKUP_MODULE = 0
 JO_COMPILE_WITH_TGA_MODULE = 1
@@ -29,7 +29,7 @@ JO_COMPILE_WITH_AUDIO_MODULE = 0
 JO_COMPILE_WITH_3D_MODULE = 0
 JO_COMPILE_WITH_PSEUDO_MODE7_MODULE = 0
 JO_COMPILE_WITH_EFFECTS_MODULE = 0
-JO_COMPILE_WITH_STORYBOARD_MODULE = 1
+JO_COMPILE_WITH_STORYBOARD_MODULE = 0   # 2026-11-23: unused (1.8 KB)
 # JO_COMPILE_WITH_FAST_BUT_LESS_ACCURATE_MATH removed in Jo Engine v2026.1
 JO_DEBUG = 1
 
@@ -188,6 +188,10 @@ doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 # text must stay under 0x060C0000 (SGL work area); size beats speed here.
 CCFLAGS_COLD = $(filter-out -O2,$(CCFLAGS)) -Os
 doom/src/saturn_pak.o: doom/src/saturn_pak.c
+	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
+
+# bench tour (SATURN_BENCH builds only; empty otherwise): keeps bench builds near the ceiling
+doom/src/saturn_bench.o: doom/src/saturn_bench.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_COLD) -o $@
 
 doom/src/saturn_menu.o: doom/src/saturn_menu.c

@@ -28,8 +28,39 @@
 
 #if SATURN_BENCH
 
+/* -DBENCH_RETAIL=1 (2026-11-23): map index 1..36 = E1M1..E4M9 (retail disc);
+ * -DBENCH_MAP_FIRST=a -DBENCH_MAP_LAST=b limit the tour to indices a..b so
+ * several emulator runs can split the 36 maps. -DBENCH_FPS=1 measures the
+ * whole-frame time (saturn_prof_frame_frt, unlocked pacing, no VDP1 timing
+ * spin) over BENCH_MEASURE frames per view instead of timing the VDP1 draw. */
+#ifndef BENCH_RETAIL
+#define BENCH_RETAIL 0
+#endif
 #ifndef SATURN_BENCH_MAPS
+#if BENCH_RETAIL
+#define SATURN_BENCH_MAPS 36
+#else
 #define SATURN_BENCH_MAPS 9
+#endif
+#endif
+#ifndef BENCH_MAP_FIRST
+#define BENCH_MAP_FIRST 1
+#endif
+#ifndef BENCH_MAP_LAST
+#define BENCH_MAP_LAST SATURN_BENCH_MAPS
+#endif
+#ifndef BENCH_FPS
+#define BENCH_FPS 0
+#endif
+#ifndef BENCH_MEASURE
+#define BENCH_MEASURE (BENCH_FPS ? 2 : 1)
+#endif
+#if BENCH_RETAIL
+#define BENCH_EP_OF(i)  (((i) - 1) / 9 + 1)
+#define BENCH_MAP_OF(i) (((i) - 1) % 9 + 1)
+#else
+#define BENCH_EP_OF(i)  (BENCH_HOLD_EP)
+#define BENCH_MAP_OF(i) (i)
 #endif
 #ifndef BENCH_POS
 #ifdef BENCH_HOLD_MAP
@@ -53,7 +84,14 @@
 #else
 #define BENCH_HOLD 0
 #endif
+#ifndef BENCH_HOLD_EP
+#define BENCH_HOLD_EP 1     /* -DBENCH_HOLD_EP=3 for E3Mx (retail WAD) */
+#endif
+#if BENCH_FPS
+#define BENCH_WORST 8
+#else
 #define BENCH_WORST 4
+#endif
 
 typedef struct {
     int16_t  x, y;
@@ -61,43 +99,46 @@ typedef struct {
     uint8_t  pad;
     uint16_t subs;
     uint16_t wq, fq;
-    uint32_t render, wait, vdp1;     /* FRT ticks */
+    uint32_t render, wait, vdp1;     /* FRT ticks (vdp1 = frame span sum in BENCH_FPS) */
 } bench_rec_t;
 
 typedef struct {
     int16_t  x, y;
     uint16_t ang8;
-    uint16_t render, vdp1;           /* 0.1 ms */
+    uint16_t render, vdp1;           /* 0.1 ms (vdp1 = mean frame time in BENCH_FPS) */
+    uint16_t wait, subs, wq, fq;     /* slave wait 0.1 ms; counts */
 } bench_worst_t;
 
 typedef struct {
-    uint16_t map, views;
+    uint16_t map, views;             /* map = episode * 10 + map */
     uint16_t r_p50, r_p90, r_max;    /* master render, 0.1 ms */
-    uint16_t v_p50, v_p90, v_max;    /* VDP1 draw, 0.1 ms */
+    uint16_t v_p50, v_p90, v_max;    /* VDP1 draw (BENCH_FPS: frame time), 0.1 ms */
     uint16_t w_p50, w_p90;           /* slave wait inside render, 0.1 ms */
     uint16_t q_avg, s_avg;           /* quads (wall + flat), subsectors */
-    uint16_t over_r, over_v;         /* views with render / vdp1 > 16.7 ms */
+    uint16_t over_r, over_v;         /* views with render / vdp1 > 16.7 ms (BENCH_FPS: frame > 33.4 ms) */
     bench_worst_t worst[BENCH_WORST];
 } bench_sum_t;
 
 /* Read by 5thPlanet (sdbg `m`): keep them global and simple. */
 volatile int         saturn_bench_done = 0;
 volatile int         saturn_bench_rate = 0;      /* FRT ticks per 1/60 s */
-bench_sum_t          saturn_bench_sum[SATURN_BENCH_MAPS];
+bench_sum_t         *saturn_bench_sum;   /* jo heap, [BENCH_MAP_LAST - BENCH_MAP_FIRST + 1], index bench_map - BENCH_MAP_FIRST */
 /* Slave idle summary per map (FRT ticks): [0] sum render [1] sum slave busy
  * [2] views [3] views with render > 1/60 s [4] slave busy in those views
  * [5] render in those views [6] slow views where the slave was idle > 1/3
  * of render [7] sum slave wait (master waiting on the slave) */
-uint32_t             saturn_bench_idle[SATURN_BENCH_MAPS][8];
+uint32_t           (*saturn_bench_idle)[8];   /* jo heap, same index */
 uint32_t             saturn_hw_prof_slave_busy = 0;
-static bench_rec_t   bench_rec[BENCH_MAX_VIEWS];
+unsigned int         saturn_bench_frame_span = 0;   /* d_main.c: last whole-frame FRT span */
+static bench_rec_t  *bench_rec;                  /* jo heap: keeps bench builds' BSS small */
+static uint32_t     *bench_tmp;
 
 static int16_t       bench_pos[BENCH_POS][2];
 static int           bench_npos, bench_nviews;
 #if BENCH_HOLD
 static int           bench_map = BENCH_HOLD_MAP;
 #else
-static int           bench_map = 1;              /* level being measured */
+static int           bench_map = BENCH_MAP_FIRST; /* level being measured */
 #endif
 static int           bench_built = 0;            /* viewpoints built for bench_map */
 static int           bench_view = 0;             /* current view index */
@@ -249,6 +290,7 @@ static void bench_place_camera(int view)
     bench_rec[view].x    = bench_pos[p][0];
     bench_rec[view].y    = bench_pos[p][1];
     bench_rec[view].ang8 = (uint8_t)a;
+    bench_rec[view].vdp1 = 0;
 }
 
 static void bench_sort(uint32_t *v, int n)
@@ -265,14 +307,14 @@ static void bench_sort(uint32_t *v, int n)
 
 static void bench_summarize(void)
 {
-    static uint32_t tmp[BENCH_MAX_VIEWS];
-    bench_sum_t *s = &saturn_bench_sum[bench_map - 1];
+    uint32_t *tmp = bench_tmp;
+    bench_sum_t *s = &saturn_bench_sum[bench_map - BENCH_MAP_FIRST];
     int n = bench_nviews;
     int i, w;
     unsigned int qsum = 0, ssum = 0;
     const unsigned int frame = (unsigned int)saturn_frt_rate;   /* 1/60 s */
 
-    s->map = (uint16_t)bench_map;
+    s->map = (uint16_t)(BENCH_EP_OF(bench_map) * 10 + BENCH_MAP_OF(bench_map));
     s->views = (uint16_t)n;
     s->over_r = s->over_v = 0;
     if (n <= 0)
@@ -283,7 +325,11 @@ static void bench_summarize(void)
         qsum += bench_rec[i].wq + bench_rec[i].fq;
         ssum += bench_rec[i].subs;
         if (bench_rec[i].render > frame) s->over_r++;
+#if BENCH_FPS
+        if (bench_rec[i].vdp1 > 2u * frame + frame / 64u) s->over_v++;   /* under 30 FPS */
+#else
         if (bench_rec[i].vdp1 > frame)   s->over_v++;
+#endif
     }
     bench_sort(tmp, n);
     s->r_p50 = (uint16_t)bench_tenths(tmp[n / 2]);
@@ -310,7 +356,11 @@ static void bench_summarize(void)
         uint32_t best_v = 0;
         for (i = 0; i < n; i++)
         {
+#if BENCH_FPS
+            uint32_t v = bench_rec[i].vdp1;     /* frame time */
+#else
             uint32_t v = bench_rec[i].render > bench_rec[i].vdp1 ? bench_rec[i].render : bench_rec[i].vdp1;
+#endif
             int taken = 0, k;
             for (k = 0; k < w; k++)
                 if (s->worst[k].x == bench_rec[i].x && s->worst[k].y == bench_rec[i].y &&
@@ -329,6 +379,10 @@ static void bench_summarize(void)
         s->worst[w].ang8   = bench_rec[best].ang8;
         s->worst[w].render = (uint16_t)bench_tenths(bench_rec[best].render);
         s->worst[w].vdp1   = (uint16_t)bench_tenths(bench_rec[best].vdp1);
+        s->worst[w].wait   = (uint16_t)bench_tenths(bench_rec[best].wait);
+        s->worst[w].subs   = bench_rec[best].subs;
+        s->worst[w].wq     = bench_rec[best].wq;
+        s->worst[w].fq     = bench_rec[best].fq;
     }
 }
 
@@ -339,15 +393,43 @@ int Saturn_Bench_Step(void)
     if (saturn_bench_done)
         return 0;
     saturn_bench_rate = saturn_frt_rate;
-
-    if (saturn_map != bench_map)
+    if (!bench_rec)
     {
-        bench_built = 0;
-#ifndef BENCH_HOLD_EP
-#define BENCH_HOLD_EP 1     /* -DBENCH_HOLD_EP=3 for E3Mx (retail WAD) */
+        /* adaptive detail off (its state would carry from view to view);
+         * -DBENCH_FAR=n measures a fixed far plane of n map units */
+        extern volatile int32_t hw_ad_mode, hw_far_cull;
+#ifndef BENCH_KEEP_AD           /* -DBENCH_KEEP_AD: hold views measure the AUTO controller */
+        hw_ad_mode = 0;
 #endif
-        Saturn_WarpToLevel(BENCH_HOLD_EP, bench_map);
-        return 1;
+#ifdef BENCH_FAR
+        hw_far_cull = (int32_t)(BENCH_FAR) << 12;
+#endif
+        extern byte *I_AllocHigh(int length);
+        bench_rec = (bench_rec_t *)I_AllocHigh((int)(BENCH_MAX_VIEWS * sizeof(bench_rec_t)));
+        bench_tmp = (uint32_t *)I_AllocHigh((int)(BENCH_MAX_VIEWS * sizeof(uint32_t)));
+        saturn_bench_sum  = (bench_sum_t *)I_AllocHigh((int)((BENCH_MAP_LAST - BENCH_MAP_FIRST + 1) * sizeof(bench_sum_t)));
+        saturn_bench_idle = (uint32_t (*)[8])I_AllocHigh((int)((BENCH_MAP_LAST - BENCH_MAP_FIRST + 1) * 8 * sizeof(uint32_t)));
+        memset(saturn_bench_sum, 0, (BENCH_MAP_LAST - BENCH_MAP_FIRST + 1) * sizeof(bench_sum_t));
+        memset(saturn_bench_idle, 0, (BENCH_MAP_LAST - BENCH_MAP_FIRST + 1) * 8 * sizeof(uint32_t));
+    }
+
+    {
+        extern int saturn_episode;
+        if (saturn_map != BENCH_MAP_OF(bench_map) || saturn_episode != BENCH_EP_OF(bench_map))
+        {
+            /* first warp only after the boot level has run a while (2026-11-23):
+             * warping straight from boot showed noise flats that real play
+             * (menu, then a level) never shows */
+            static int boot_wait = 300;
+            if (boot_wait > 0)
+            {
+                boot_wait--;
+                return 0;
+            }
+            bench_built = 0;
+            Saturn_WarpToLevel(BENCH_EP_OF(bench_map), BENCH_MAP_OF(bench_map));
+            return 1;
+        }
     }
     if (!bench_built)
     {
@@ -364,11 +446,21 @@ int Saturn_Bench_Step(void)
      * VDP1 draw, then move on. */
     if (bench_measured)
     {
+#if BENCH_FPS
+        /* the frame span of the iteration that rendered the measured frame */
+        bench_rec[bench_view].vdp1 += saturn_bench_frame_span;
+        bench_measured = 0;
+        if (bench_frame < BENCH_SETTLE + BENCH_MEASURE)
+            return 0;               /* more measured frames at this view */
+        bench_rec[bench_view].vdp1 /= (uint32_t)BENCH_MEASURE;
+#else
         extern volatile unsigned int saturn_bench_vdp1_ticks;
         bench_rec[bench_view].vdp1 = saturn_bench_vdp1_ticks;   /* timed at the commit */
         bench_measured = 0;
+#endif
         bench_frame = 0;
 #if BENCH_HOLD
+        bench_rec[0].vdp1 = BENCH_FPS ? 0 : bench_rec[0].vdp1;
 #if defined(BENCH_HOLD_TURN) || defined(BENCH_HOLD_WALK)
         bench_place_camera(0);  /* turning / walking hold: next step */
 #endif
@@ -378,7 +470,7 @@ int Saturn_Bench_Step(void)
         if (bench_view >= bench_nviews)
         {
             bench_summarize();
-            if (bench_map >= SATURN_BENCH_MAPS)
+            if (bench_map >= BENCH_MAP_LAST)
             {
                 saturn_bench_done = 1;
                 return 0;
@@ -391,7 +483,7 @@ int Saturn_Bench_Step(void)
     else if (bench_nviews <= 0)
     {
         bench_summarize();
-        if (bench_map >= SATURN_BENCH_MAPS)
+        if (bench_map >= BENCH_MAP_LAST)
             saturn_bench_done = 1;
         else
             bench_map++;
@@ -413,14 +505,15 @@ void Saturn_Bench_AfterRender(unsigned int render_ticks)
         return;
     {
         bench_rec_t *r = &bench_rec[bench_view];
-        r->render = render_ticks;
+        if (bench_frame == BENCH_SETTLE + 1 || render_ticks > r->render)
+            r->render = render_ticks;       /* max over the measured frames */
         r->wait   = saturn_hw_prof_slave_wait;
         r->wq     = (uint16_t)saturn_hw_wall_quads;
         r->fq     = (uint16_t)saturn_hw_flat_quads;
         r->subs   = (uint16_t)saturn_visit_count;
         bench_measured = 1;
         {
-            uint32_t *id = saturn_bench_idle[bench_map - 1];
+            uint32_t *id = saturn_bench_idle[bench_map - BENCH_MAP_FIRST];
             uint32_t busy = saturn_hw_prof_slave_busy;
             id[0] += render_ticks;
             id[1] += busy;
@@ -435,7 +528,7 @@ void Saturn_Bench_AfterRender(unsigned int render_ticks)
                     id[6]++;
             }
         }
-#if BENCH_HOLD && defined(BENCH_HOLD_FPS)
+#if (BENCH_HOLD && defined(BENCH_HOLD_FPS)) || BENCH_FPS
         /* hold-mode FPS runs: no VDP1 timing spin, so frames pace as in play */
         if (0)
 #endif
@@ -479,12 +572,12 @@ void Saturn_Bench_DrawSummary(void)
     Saturn_ClearRect(0, 0, 320, 168, 0);
     Saturn_Print(4, 2, "BENCH  MS: P50 P90 MAX");
     Saturn_Print(4, 12, "MAP  RENDER          VDP1");
-    for (m = 0; m < SATURN_BENCH_MAPS; m++)
+    for (m = BENCH_MAP_FIRST - 1; m < BENCH_MAP_LAST && m < BENCH_MAP_FIRST - 1 + 10; m++)
     {
-        const bench_sum_t *s = &saturn_bench_sum[m];
+        const bench_sum_t *s = &saturn_bench_sum[m - (BENCH_MAP_FIRST - 1)];
         char b[64];
         int n = 0;
-        b[n++] = 'E'; b[n++] = '1'; b[n++] = 'M'; b[n++] = (char)('0' + s->map % 10u);
+        b[n++] = 'E'; b[n++] = (char)('0' + (s->map / 10u) % 10u); b[n++] = 'M'; b[n++] = (char)('0' + s->map % 10u);
         b[n++] = ' ';
         bench_put_tenths(b, &n, s->r_p50); b[n++] = ' ';
         bench_put_tenths(b, &n, s->r_p90); b[n++] = ' ';
@@ -494,7 +587,7 @@ void Saturn_Bench_DrawSummary(void)
         bench_put_tenths(b, &n, s->v_max); b[n++] = ' '; b[n++] = 'N';
         bench_put_uint(b, &n, s->views);
         b[n] = 0;
-        Saturn_Print(4, 24 + m * 15, b);
+        Saturn_Print(4, 24 + (m - (BENCH_MAP_FIRST - 1)) * 15, b);
     }
 }
 

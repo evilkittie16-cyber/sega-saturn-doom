@@ -2294,10 +2294,7 @@ _hw_asm_subap:
 	sts	macl,r1
 	add	r1,r0			! raw_min_cz
 	mov.l	r0,@(12,r15)
-	mov	#1,r1
-	shll16	r1
-	shll8	r1
-	shll2	r1			! HW_FAR_Z_UNITS << 12
+	mov.l	@(20,r6),r1		! in: far plane (o->sx = hw_sec_far[sector], 2026-11-23)
 	cmp/gt	r1,r0
 	bt	.Ls_cullE
 	add	r14,r0
@@ -4982,6 +4979,13 @@ _hw_asm_subsec:
 	add	r4,r4
 	add	r0,r4			! fb
 	mov.l	r4,@(36,r15)
+	mov.l	@(40,r7),r0		! hw_sec_fast
+	mov	r9,r1
+	sub	r0,r1			! (sf - hw_sec_fast) = secnum * 16
+	shlr2	r1			! secnum * 4
+	mov.l	@(48,r7),r0		! [48] hw_sec_far
+	mov.l	@(r0,r1),r0
+	mov.l	r0,@(20,r15)		! o->sx in: this sector's far plane (2026-11-23)
 	mov	r13,r5
 	mov	r15,r6
 	mov.l	@(16,r7),r7		! hw_asm_subap_ctx

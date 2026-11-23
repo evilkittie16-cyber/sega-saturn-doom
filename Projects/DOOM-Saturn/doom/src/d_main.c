@@ -1643,6 +1643,12 @@ void D_DoomLoop(void)
                 unsigned int frame_span = Saturn_ProfSpan(frame_f0, frame_v0);
                 extern void Saturn_HW_AdaptiveDetail(unsigned int frame_ticks, unsigned int rate);
                 saturn_prof_frame_frt = (unsigned short)frame_span;
+#if SATURN_BENCH
+                {
+                    extern unsigned int saturn_bench_frame_span;   /* saturn_bench.c (16-bit FRT field wraps > 4 fields) */
+                    saturn_bench_frame_span = frame_span;
+                }
+#endif
                 Saturn_HW_AdaptiveDetail(frame_span, (unsigned int)saturn_frt_rate);
             }
             saturn_prof_frame_vbl = (int)(saturn_vbl_count - frame_v0);

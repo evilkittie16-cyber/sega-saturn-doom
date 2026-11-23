@@ -396,6 +396,11 @@ static_assert(sizeof(hw_sec_fast_t) == 16,
 static HW_ALIGN16 hw_aperture_state_t hw_aperture_state;
 static HW_ALIGN16 hw_ap_word_t hw_ap_words[HW_SOLID_WORDS];
 static HW_ALIGN16 hw_sec_fast_t hw_sec_fast[HW_MAX_AP_SECTORS];
+/* Per-sector far plane for subsector culling, map units << 12 (2026-11-23,
+ * per frame in Saturn_HW_RenderPlayerView): the adaptive-detail far plane,
+ * or nearer for dark sectors whose walls and flats are bank 7 (COLORMAP 31,
+ * black) beyond a distance - see HW_DARK_CUT. */
+static int32_t hw_sec_far[HW_MAX_AP_SECTORS];
 /* Height-aware culling (2026-11-20): per sector the highest point anything
  * in it can be drawn, in world units (HW_SEC_ZTOP_CEIL = use the ceiling:
  * one-sided/upper/masked walls, moving sectors). Built per level in

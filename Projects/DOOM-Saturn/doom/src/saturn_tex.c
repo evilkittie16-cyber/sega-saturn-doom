@@ -773,7 +773,32 @@ int Saturn_TexHeight(int texnum)
     return textures[t].height;
 }
 
-/* Flat  itself, no animation translation (warp textures key on the
+/* 2026-11-23 guard: a hot flat's cart copy is written by the background
+ * fill queue (i_wad.c); before its entry is drained the cart bytes are
+ * garbage, and a flat used that early would be uploaded and kept as a
+ * permanent preloaded pyramid. 1 = flatpixels[f] can be read now;
+ * otherwise the lump is read through the WAD path (which streams an
+ * unfilled hot lump from CD). (The retail noise floors seen while adding
+ * this were the fill loop's queue overrun, fixed in i_wad.c.) */
+static int flat_pixels_ready(int f)
+{
+    extern flattex_t *flatpixels;
+    if (!flatpixels || !flatpixels[f].data[0])
+        return 0;
+#ifndef SATURN_WIN32
+    if (((uint32_t)flatpixels[f].data[0] & 0x07000000u) == 0x02000000u)
+    {
+        extern int Saturn_LumpResident(int lump, const unsigned char **cart_ptr_out,
+                                       unsigned int *cd_off_out);
+        const unsigned char *res_ptr;
+        unsigned int res_cd;
+        return Saturn_LumpResident(firstflat + f, &res_ptr, &res_cd);
+    }
+#endif
+    return 1;
+}
+
+/* Flat itself, no animation translation (warp textures key on the
  * translated flat, saturn_vdp1.c Saturn_Vdp1_GetWarpSrca). */
 byte *Saturn_FlatDataExact(int f)
 {
@@ -782,7 +807,7 @@ byte *Saturn_FlatDataExact(int f)
     
     if (!flat_cache[f])
     {
-        if (flatpixels && flatpixels[f].data[0]) {
+        if (flat_pixels_ready(f)) {
             byte *src = (byte *)flatpixels[f].data[0];
 #if !defined(SATURN_WIN32) && SATURN_FLAT_FASTCOPY
             /* 2026-11-18: flatpixels live in the zone = the RAM cart
@@ -834,7 +859,7 @@ byte *Saturn_FlatDataNoLoad(int flatnum)
     if (flatnum < 0 || flatnum >= numflats) return NULL;
     int f = flattranslation[flatnum];
     if (f < 0 || f >= numflats) f = flatnum;
-    if (!flat_cache[f] && flatpixels && flatpixels[f].data[0])
+    if (!flat_cache[f] && flat_pixels_ready(f))
         flat_cache[f] = (byte *)flatpixels[f].data[0];
     return flat_cache[f];
 }
@@ -986,6 +1011,10 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
     uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
     if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
     if (tex_cache) D_memset(tex_cache, 0, numtextures * sizeof(byte *));
+    /* 2026-11-23: flats cached in the tier just reset (or in the previous
+     * level's PU_LEVEL zone) would be overwritten by this level's textures:
+     * every flat shared with an earlier level drew as noise */
+    if (flat_cache) D_memset(flat_cache, 0, numflats * sizeof(byte *));
 
     for (unsigned i = 0; i < count; i++)
     {
@@ -1061,6 +1090,10 @@ int Saturn_BakedTex_Plan(const byte *blob, unsigned dirbytes, unsigned fsize,
     uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
     if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
     if (tex_cache) D_memset(tex_cache, 0, numtextures * sizeof(byte *));
+    /* 2026-11-23: flats cached in the tier just reset (or in the previous
+     * level's PU_LEVEL zone) would be overwritten by this level's textures:
+     * every flat shared with an earlier level drew as noise */
+    if (flat_cache) D_memset(flat_cache, 0, numflats * sizeof(byte *));
     int n = 0;
     for (unsigned i = 0; i < count && n < max; i++)
     {

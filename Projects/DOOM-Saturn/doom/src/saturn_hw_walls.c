@@ -4920,6 +4920,8 @@ _Static_assert(HW_NEAR_Z_UNITS == 4 && HW_FAR_Z_UNITS == 16384 && HW_VIEW_CX == 
                HW_DBG_FLAT_LOD && HW_LOD1_MIN_A == 192 && HW_LOD1_MAX_A == 240 &&
                HW_LOD1_MIN_B == 132 && HW_LOD1_MAX_B == 336,
                "hw_asm_subap constants");
+/* the far plane (map units << 12) arrives in the out struct's sx slot,
+ * o->sx = hw_sec_far[sector] (written by the asm only after the test) */
 static const void *const hw_asm_subap_ctx[11] = {
     &hw_cam_x, &hw_cam_y, &hw_frust, saturn_master_oclut, &hw_solid_count,
     &hw_aperture_state, hw_solid_mask, hw_mask_left, hw_mask_right,
@@ -4932,6 +4934,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_CheckSubsectorAperture_A(int subnum, hw_sec_
     hw_aperture_state_t *ap = HW_APERTURE;
     const saturn_flat_bbox_t *fb = saturn_baked_flat_bboxes ? &saturn_baked_flat_bboxes[subnum] : NULL;
     hw_subap_out_t o;
+    o.sx = hw_sec_far[sf - hw_sec_fast];    /* in: far plane (see hw_asm_subap_ctx) */
     int r = hw_asm_subap(fb, fully_inside, &o, hw_asm_subap_ctx);
     if (r <= 0)
     {
@@ -5042,12 +5045,13 @@ _Static_assert(sizeof(saturn_flat_bbox_t) == 8 && offsetof(hw_sec_fast_t, is_sky
                HW_FLAT_CHECK_AP == 0x100 && HW_FLAT_NEAR_OR_PSEC == 0x200 &&
                (HW_FLAT_USE_LOD1 | HW_FLAT_INSIDE_MASK) == 0x13 && HW_FLAT_ALLOW_BOTH == 12,
                "hw_asm_subsec: layout");
-const void *const hw_asm_subsec_ctx[12] = {
+const void *const hw_asm_subsec_ctx[13] = {
     &saturn_baked_flat_bboxes, &hw_aperture_state, &saturn_view_h, &saturn_view_cy,
     hw_asm_subap_ctx, &hw_psec_fast, saturn_master_oclut,
     (const void *)HW_CheckNearSubsectorFrustum, (const void *)HW_EvalSubsectorSpanSlow,
     (const void *)HW_CheckPortalSubsectorStepCull,
-    hw_sec_fast, &hw_sec_dz_top                     /* [40] [44] sky content top */
+    hw_sec_fast, &hw_sec_dz_top,                    /* [40] [44] sky content top */
+    hw_sec_far                                      /* [48] per-sector far plane (2026-11-23) */
 };
 #if HW_ASM_CHECK
 /* [0] calls [1] mismatches [2] subnum [3] C result [4] asm result
@@ -5143,7 +5147,7 @@ static HW_NOINLINE HW_HOT_O2 int HW_SUBAP_C_NAME(int subnum, hw_sec_fast_t *sf, 
     int x_cz_min = (nx >= 0) ? dx0 : dx1;
     int y_cz_min = (ny >= 0) ? dy0 : dy1;
     int32_t raw_min_cz = HW_MulsW_PairAdd(x_cz_min, nx, y_cz_min, ny, 0);
-    if (raw_min_cz > (HW_FAR_Z_UNITS << 12))
+    if (raw_min_cz > hw_sec_far[sf - hw_sec_fast])   /* adaptive / dark far plane (2026-11-23) */
         return -1;
     fixed_t true_min_cz = (raw_min_cz + cz_off) << 4;
     fixed_t min_cz = true_min_cz;

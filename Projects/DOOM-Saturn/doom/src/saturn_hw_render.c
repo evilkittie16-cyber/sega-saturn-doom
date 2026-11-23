@@ -894,12 +894,20 @@ volatile int32_t hw_far_cull = HW_FAR_Z_UNITS << 12;
  * the other 10 tour views neither change nor gain), then coarsen the wall
  * strip LOD (m1a, where distance does not help: +0.5..0.7 FPS).
  * hw_ad_mode (cache-through, pokeable): 1 adaptive, 0 off (full detail). */
-volatile int32_t hw_ad_mode = 0;   /* default DETAIL: FULL (user, 2026-11-20: the distance cut
-                                    * visibly removes far geometry, e.g. E1M8 over the low fence) */
+/* 2026-11-23 (user: "tune the LOD to get a minimum of 30 FPS everywhere,
+ * reduce the work in big scenes at a distance, keep close detail"): AUTO by
+ * default again. The far plane now also culls single subsectors (it only
+ * culled BSP nodes before, so it barely changed E4 views), the steps are
+ * finer at long range, and a step that does not pay is taken back (see
+ * Saturn_HW_AdaptiveDetail) - dense near scenes keep their far detail. */
+#ifndef HW_AD_DEFAULT
+#define HW_AD_DEFAULT 1
+#endif
+volatile int32_t hw_ad_mode = HW_AD_DEFAULT;   /* 1 AUTO, 0 FULL (pause menu DETAIL) */
 int saturn_hw_detail_level = 0;                 /* HUD */
 unsigned int saturn_hw_ad_avg = 0, saturn_hw_ad_last = 0;   /* debug: frame ticks (avg, last) */
-static const int16_t hw_ad_far[]   = { 16384, 2048, 1536, 1280, 1280, 1280 };
-static const uint8_t hw_ad_lodx[]  = {     1,    1,    1,    1,    2,    3 };
+static const int16_t hw_ad_far[]   = { 16384, 3072, 2304, 1792, 1536, 1280, 1280 };
+static const uint8_t hw_ad_lodx[]  = {     1,    1,    1,    1,    1,    1,    2 };
 #define HW_AD_LEVELS ((int)(sizeof(hw_ad_far) / sizeof(hw_ad_far[0])))
 static int hw_ad_rendered = 0;                  /* a 3D frame was drawn since the last call */
 
@@ -970,11 +978,41 @@ void Saturn_HW_AdaptiveDetail(unsigned int frame_ticks, unsigned int rate)
     avg = avg ? avg + (unsigned int)(((int)frame_ticks - (int)avg) >> 3) : frame_ticks;
     frame_ticks = avg;
     saturn_hw_ad_avg = avg;
+    /* A climb that does not pay is taken back (2026-11-23): dense NEAR
+     * geometry (retail E4M2 / E4M9: 100-200 subsectors within 1000 units)
+     * does not get faster when the far plane comes in, it only loses its
+     * distant detail. The levels climb as before; 20 frames after the top
+     * level is reached while still slow, the average must be >= 6% below
+     * the one that started the climb, else it drops straight back to full
+     * detail and no climb is tried for 3 s (doubling to 20 s while it keeps
+     * failing). Judging every single step instead stopped at the first
+     * one (3072, no gain in E4M3) although 1536 gives +70% there. */
+    static unsigned int climb_avg = 0;
+    static int top_wait = 0, up_block = 0, fail_block = 180;
+    if (up_block > 0)
+        up_block--;
+    if (top_wait > 0 && --top_wait == 0 && level == HW_AD_LEVELS - 1 && frame_ticks > slow)
+    {
+        if (frame_ticks > climb_avg - climb_avg / 16u)
+        {
+            HW_AdaptiveApply(level = 0);
+            up_block = fail_block;
+            if (fail_block < 1200)
+                fail_block *= 2;
+            slow_run = fast_run = 0;
+            return;
+        }
+        fail_block = 180;                   /* the climb paid */
+    }
     if (frame_ticks > slow)
     {
         fast_run = 0;
-        if (++slow_run >= 6 && level < HW_AD_LEVELS - 1)   /* ~ the average's lag */
+        if (++slow_run >= 6 && level < HW_AD_LEVELS - 1 && !up_block)
         {
+            if (level == 0)
+                climb_avg = frame_ticks;
+            if (level + 1 == HW_AD_LEVELS - 1)
+                top_wait = 20;
             HW_AdaptiveApply(++level);
             slow_run = 0;
             since_up = 0;
@@ -1456,7 +1494,22 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
         const fixed_t vz = hw_viewz;
         const sector_t *s_in = sectors;
         hw_sec_fast_t *s_out = hw_sec_fast;
-        for (int i = 0; i < n_ap_sec; i++, s_in++, s_out++)
+        /* Dark-sector distance cut (2026-11-23): saturn_light_lut.h shades
+         * every wall and flat of light index L <= 7 (light < 128) in
+         * bank 7 = COLORMAP 31 beyond these depths (both zlight
+         * LUTs, bucket = depth / 16, checked over all 128 buckets), so its
+         * subsectors past them only ever drew black: cull them there.
+         * Sectors with things keep the normal far plane (fullbright sprites).
+         * Measured on 9 retail worst views: +0..1 frame per 240 fields, so
+         * OFF by default (a culled dark wall also stops occluding what is
+         * behind it). -DHW_DARK_CUT=1 to try. Depths in map units. */
+#ifndef HW_DARK_CUT
+#define HW_DARK_CUT 0
+#endif
+        static const uint16_t hw_dark_far[8] = { 32, 32, 48, 64, 80, 112, 160, 320 };
+        const int32_t far_all = hw_far_cull;
+        int32_t *s_far = hw_sec_far;
+        for (int i = 0; i < n_ap_sec; i++, s_in++, s_out++, s_far++)
         {
             s_out->dz_ceil    = s_in->ceilingheight - vz;
             s_out->dz_floor   = s_in->floorheight - vz;
@@ -1464,7 +1517,18 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
             s_out->yb_attach  = 0;
             s_out->is_sky     = (uint8_t)((int16_t)s_in->ceilingpic == -1);
             s_out->has_things = (uint8_t)(s_in->thinglist != NULL);
-            s_out->light_delta = (int16_t)(HW_SecLight16(s_in->lightlevel) - (int)hw_sec_light0[i]);
+            int l16 = HW_SecLight16(s_in->lightlevel);
+            s_out->light_delta = (int16_t)(l16 - (int)hw_sec_light0[i]);
+            int32_t f = far_all;
+            /* walls carry DOOM's fake contrast (bake_walls.py: axis-aligned
+             * +-16), so they can sit one index above the sector: use L + 1 */
+            if (HW_DARK_CUT && l16 < 7 && !s_out->has_things)
+            {
+                int32_t d = (int32_t)hw_dark_far[l16 + 1] << 12;
+                if (d < f)
+                    f = d;
+            }
+            *s_far = f;
         }
         if (hw_sec_nb)
         {

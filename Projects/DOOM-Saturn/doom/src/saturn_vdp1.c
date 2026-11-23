@@ -276,6 +276,8 @@ static int           v1_log_n = 0;
 static int           v1_log_full = 0;       /* log overflowed: full flush at next Reset */
 static int           v1_want_evict = 0;     /* an upload was refused this frame */
 static unsigned int  v1_want_bytes = 0;     /* largest refused upload since the last evict */
+static unsigned short v1_pressure = 0;      /* frames left of "required uploads were refused":
+                                             * no optional wall copies meanwhile (2026-11-23) */
 static unsigned int  v1_used_bytes = 0;     /* sum of logged lengths */
 static unsigned int  v1_age = 0;
 /* v1_age at the last two frame boundaries (2026-11-16 thrash fix; v1_age
@@ -1065,6 +1067,9 @@ static void v1_tags_try_alloc(void)
 }
 
 unsigned int saturn_v1_alloc_bytes = 0;   /* cumulative texture bytes uploaded to VDP1 VRAM */
+#ifdef V1_REFUSE_DBG
+unsigned int saturn_v1_dbg_refuse[8];     /* count, bytes, tag idx, free, log_n, gap, flat0, spr0 */
+#endif
 
 static unsigned int v1_free_total(void)
 {
@@ -1144,7 +1149,21 @@ static unsigned int v1_arena_alloc(int bytes, v1_tag_t *tag)
     unsigned int off = v1_alloc_fit((unsigned int)bytes, tag, 0u);
     if (off == 0)
     {
+#ifdef V1_REFUSE_DBG
+        {
+            extern unsigned int saturn_v1_dbg_refuse[8];
+            saturn_v1_dbg_refuse[0]++;
+            saturn_v1_dbg_refuse[1] = (unsigned int)bytes;
+            saturn_v1_dbg_refuse[2] = (unsigned int)(tag - v1_tag[0]);
+            saturn_v1_dbg_refuse[3] = v1_free_total();
+            saturn_v1_dbg_refuse[4] = (unsigned int)v1_log_n;
+            { int p; saturn_v1_dbg_refuse[5] = v1_find_gap(((unsigned int)bytes + 31u) & ~31u, &p); }
+            saturn_v1_dbg_refuse[6] = (unsigned int)v1_tag_flat0;
+            saturn_v1_dbg_refuse[7] = (unsigned int)v1_tag_spr0;
+        }
+#endif
         v1_want_evict = 1;
+        v1_pressure = 300;                  /* ~5-10 s */
         if ((unsigned int)bytes > v1_want_bytes)
             v1_want_bytes = (unsigned int)bytes;
         saturn_v1w_refuse++;        /* HUD 'X': texture missing this frame */
@@ -1355,7 +1374,12 @@ static int v1_evict(unsigned int target)
         if (v1_log_prot[i] != 1)
             continue;
         t = v1_log[i].tag;
-        for (f = 0; f < 3; f++)
+        /* under a refused upload (2026-11-23) only the main copy rides
+         * along: an optional distance copy not referenced itself may go
+         * (the wall then draws its strips from srca; v1_entry_drop points
+         * the field back at srca). Retail E3M6: 100 KB of such copies sat in
+         * a 352 KB arena while a 32 KB wall was refused every frame. */
+        for (f = 0; f < (v1_want_bytes ? 1 : 3); f++)
         {
             unsigned short s = f == 0 ? t->srca : f == 1 ? t->srca_mono : t->srca_64;
             unsigned int a;
@@ -1721,6 +1745,8 @@ static void v1_copy_q_blocks(unsigned int off, const byte *src, int w, int h)
  * srca_mono / srca_64 at srca when they have none. */
 static void v1_wall_opt_copies(v1_tag_t *tag, const byte *src, int tw, int th, unsigned int reserve)
 {
+    if (v1_pressure)
+        return;     /* the view's required textures did not fit lately (see v1_evict 2b) */
     /* Optional: a failed allocation (fragmented arena) must not request an
      * eviction the way a required upload does (v1_arena_alloc): that one
      * may drop textures in use, which were re-uploaded next frame - a
@@ -2358,6 +2384,8 @@ void Saturn_Vdp1Wall_Reset(void)
     static unsigned int evict_backoff = 0;
     if (v1_frame_boundary && evict_backoff)
         evict_backoff--;
+    if (v1_frame_boundary && v1_pressure)
+        v1_pressure--;
     if (!v1_do_flush && v1_frame_boundary
         && (v1_want_evict
             || (v1_free_total() < V1_EVICT_LOWWATER && saturn_v1_alloc_bytes != evict_idle_alloc
@@ -2366,7 +2394,15 @@ void Saturn_Vdp1Wall_Reset(void)
         unsigned int free_before = v1_free_total();
         int refused = v1_want_evict;
         v1_want_evict = 0;
-        if (!v1_evict(V1_EVICT_TARGET))
+        /* free-space target (2026-11-23): at most half the arena (a fixed
+         * 128 KB dropped the textures in view of a small retail arena), and
+         * for a refused upload only what it needs plus some slack - freeing
+         * 128 KB per refusal re-uploaded that much the next frame */
+        unsigned int cap = V1_PAGE0_END - v1_page_base[0];
+        unsigned int target = V1_EVICT_TARGET < cap / 2u ? V1_EVICT_TARGET : cap / 2u;
+        if (refused && v1_want_bytes + 48u * 1024u < target)
+            target = v1_want_bytes + 48u * 1024u;
+        if (!v1_evict(target))
             v1_do_flush = 1;    /* live list fragments the whole ring */
         evict_idle_alloc = (v1_free_total() == free_before) ? saturn_v1_alloc_bytes : 0xFFFFFFFFu;
         if (!refused && v1_free_total() < free_before + V1_EVICT_MIN_GAIN)
@@ -2829,7 +2865,7 @@ void Saturn_Vdp1_WarpNewFrame(void)
     /* textures can be made this frame: the flat workers may draw the
      * one-frame placeholder for a missing one (else the row mapping) */
     saturn_warp_room = (uint8_t)(v1_tag[0] && v1_free_total() >= 2048u + V1_WARP_RESERVE);
-    saturn_v1_late_copy_armed = v1_tag[0] && v1_free_total() >= V1_LATE_COPY_RESERVE + 8u * 1024u;
+    saturn_v1_late_copy_armed = v1_tag[0] && !v1_pressure && v1_free_total() >= V1_LATE_COPY_RESERVE + 8u * 1024u;
 }
 
 int Saturn_Vdp1_GetWarpSrca(int quad, int is_ceil, int flatnum, int lv,

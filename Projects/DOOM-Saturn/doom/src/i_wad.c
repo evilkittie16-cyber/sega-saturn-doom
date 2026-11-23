@@ -2320,6 +2320,17 @@ int saturn_iwad_background_fill(void)
 
         if (fill_part_left == 0)
         {
+            /* 2026-11-23: stop at the end of the queue. Finishing the last
+             * entry mid-frame (the boot drain does) walked on into the
+             * zeroed entries behind it: head ran to 640 and past the array,
+             * its zero-size "copies" clobbered the neighbouring statics
+             * (saturn_fill_count read 188 for 108 entries), and
+             * hot_lump_filled's binary search over the garbage missed the
+             * upper hot lumps - I_ReadCDFile then streamed them from CD
+             * offset 0, the IWAD header: noise floors (retail FWATER, LAVA,
+             * GATE3, DEM1_5/6 ...) on every level after boot. */
+            if (saturn_fill_head >= saturn_fill_count)
+                break;
             nx = &saturn_fill_queue[saturn_fill_head];
             if (nx->lump_index & FILL_SYNCED)
             {
