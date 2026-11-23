@@ -577,9 +577,12 @@ static HW_NOINLINE int HW_FastWallSrca(int texnum, int *tw, int *th, int *srca_m
     if (saturn_v1_wall_tags)
     {
         unsigned short s = saturn_v1_wall_tags[t].srca;
-        if (s != 0 && s != 0xFFFFu)
+        extern int saturn_v1_wall_half_req;
+        /* a half-only copy for a near wall: v1_tex_get upgrades it */
+        if (s != 0 && s != 0xFFFFu &&
+            (!(saturn_v1_wall_tags[t].w8 & V1_TAG_HALF) || saturn_v1_wall_half_req))
         {
-            *tw = (int)saturn_v1_wall_tags[t].w8 << 3;
+            *tw = (int)V1_TAG_W8(&saturn_v1_wall_tags[t]) << 3;
             *th = (int)saturn_v1_wall_tags[t].h;
             if (srca_mono) *srca_mono = (int)saturn_v1_wall_tags[t].srca_mono;
             if (srca_64)   *srca_64   = (int)saturn_v1_wall_tags[t].srca_64;

@@ -1724,6 +1724,40 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
 #endif
     HW_SlaveWalls_BeginFrame(hw_frame_slave_enabled);   /* HW_SLAVE_WALLS */
 
+#if defined(HW_STRIP_X0) || defined(HW_STRIP_X1)
+    /* Measurement only (2026-11-23, two-CPU split study): render just the
+     * columns [HW_STRIP_X0, HW_STRIP_X1) - the rest start out solid, as the
+     * other CPU's half would be. Edges must be multiples of 32 (whole
+     * words: no aperture rescan needed). Off unless defined. */
+    {
+#ifndef HW_STRIP_X0
+#define HW_STRIP_X0 0
+#endif
+#ifndef HW_STRIP_X1
+#define HW_STRIP_X1 320
+#endif
+        _Static_assert((HW_STRIP_X0 & 31) == 0 && (HW_STRIP_X1 & 31) == 0, "HW_STRIP_X0/X1: word edges");
+        hw_aperture_state_t *ap = HW_APERTURE;
+        const int16_t vh = (int16_t)saturn_view_h;
+        for (int w = 0; w < (HW_VIEW_W >> 5); w++)
+        {
+            if ((w << 5) >= HW_STRIP_X0 && (w << 5) < HW_STRIP_X1)
+                continue;
+            uint32_t wbit = hw_bit_lut[w];
+            hw_solid_mask[w] = 0xFFFFFFFFu;
+            hw_solid_any |= wbit;
+            hw_slave_dirty_words |= wbit;
+            hw_solid_words++;
+            hw_solid_summary |= wbit;
+            hw_ap_words[w].yt_min = hw_ap_words[w].yt_max = vh;
+            hw_ap_words[w].yb_min = hw_ap_words[w].yb_max = 0;
+            ap->dirty_words |= wbit;
+            ap->aperture_active = 1;
+        }
+        hw_solid_count = (hw_solid_words >= (HW_VIEW_W >> 5)) ? HW_VIEW_W : 1;
+    }
+#endif
+
     /* Walk BSP tree and emit visible walls, flats & sprites in exact topological order */
     extern unsigned int Saturn_ProfSpan(unsigned short f0, unsigned int v0);
     extern volatile unsigned int saturn_vbl_count;

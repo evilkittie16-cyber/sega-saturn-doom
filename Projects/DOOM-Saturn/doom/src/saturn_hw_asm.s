@@ -1368,17 +1368,21 @@ _hw_asm_walk:
 	bf	.Le_gen
 	cmp/hs	r1,r2
 	bt	.Le_gen
-.Le_m16:				! base = srca + (u_start >> 4) * (th << 1)
+.Le_m16:				! base = srca + (u_start >> 4) * (th * strip_w8)
+	mov	#67,r0
+	mov.b	@(r0,r14),r1		! strip_w8 (tw in r1 is dead from here)
 	mov.w	@(26,r14),r0
-	add	r0,r0
+	mulu.w	r0,r1
+	sts	macl,r0			! th * strip_w8
 	shlr2	r2
 	shlr2	r2
 	mulu.w	r0,r2
 	mov.w	@(24,r14),r0
 	sts	macl,r2
 	add	r0,r2
+	shll2	r1
 	bra	.Le_mono
-	mov	#16,r1
+	shll	r1			! mono_tw = strip_w8 * 8 (16, or 8 half-only)
 .Le_gen:
 	! perspective candidate (C runs HW_NeedPerspectiveStrips)
 	mov	r2,r0
@@ -2806,22 +2810,26 @@ _hw_asm_lingen:
 .Ll_idx:
 	mov	r0,r3			! idx
 ! cmd_w2: base @28, step @24, wrap @32, cur @44
+	mov	#67,r0
+	mov.b	@(r0,r8),r1		! strip_w8: 2, or 1 = half-only copy (2026-11-23)
 	mov	#90,r0
 	mov.w	@(r0,r8),r0
 	extu.b	r0,r2
-	mov	#2,r1
-	shll8	r1
-	or	r1,r2			! size_lo
+	mov	r1,r0
+	shll8	r0
+	or	r0,r2			! size_lo = strip_w8 << 8 | rows
 	mov.w	@(30,r8),r0
-	add	r0,r0
+	mulu.w	r0,r1
+	sts	macl,r0			! cur_v * strip_w8
 	add	r13,r0
 	shll16	r0
 	or	r2,r0
 	mov.l	r0,@(28,r15)		! base
 	mov	r0,r2
 	mov.w	@(26,r8),r0
-	shll16	r0
-	add	r0,r0			! th << 17
+	mulu.w	r0,r1
+	sts	macl,r0
+	shll16	r0			! (th * strip_w8) << 16
 	mov.l	r0,@(24,r15)
 	mul.l	r12,r0
 	sts	macl,r1
@@ -3437,12 +3445,10 @@ _hw_asm_lingen:
 	mov.l	@(36,r15),r0		! cmd_w2_base
 	extu.b	r0,r0
 	or	r0,r1			! emit_cmd2
-	mov.w	@(26,r8),r0
-	shll	r0
-	shll16	r0
+	mov.l	@(32,r15),r0		! w2 step (frame @24, 8-byte temp below)
 	mul.l	r6,r0
 	sts	macl,r0
-	add	r0,r10			! cmd_w2_cur += (th << 17) * adv
+	add	r0,r10			! cmd_w2_cur += step * adv
 	add	#8,r15
 	mov.l	r7,@(40,r15)		! coal
 	mov.l	r1,@(44,r15)		! emit_cmd2
@@ -8566,24 +8572,27 @@ _hw_asm_persp:
 .Lp_idx:
 	mov.l	r0,@(16,r15)		! cur_strip_idx
 	! cmd words
+	mov	#67,r0
+	mov.b	@(r0,r8),r4		! strip_w8: 2, or 1 = half-only copy (2026-11-23)
 	mov	#90,r0
 	mov.w	@(r0,r8),r0
 	extu.b	r0,r1			! rows & 0xFF
-	mov	#2,r0
+	mov	r4,r0
 	shll8	r0
 	or	r0,r1			! size_lo
 	mov.w	@(24,r8),r0
 	extu.w	r0,r2			! srca
 	mov.w	@(30,r8),r0		! cur_v
-	add	r0,r0
+	mulu.w	r0,r4
+	sts	macl,r0
 	add	r0,r2
 	shll16	r2
 	or	r1,r2			! cmd_w2_base
 	mov.l	r2,@(24,r15)
 	mov.w	@(26,r8),r0		! th
-	mov	r0,r3
-	shll16	r3
-	shll	r3			! step = th << 17
+	mulu.w	r0,r4
+	sts	macl,r3
+	shll16	r3			! step = (th * strip_w8) << 16
 	mov.l	r3,@(28,r15)
 	mov.l	@(16,r15),r0
 	mul.l	r0,r3

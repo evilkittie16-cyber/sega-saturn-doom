@@ -192,6 +192,11 @@ typedef struct {
 } v1_tag_t;
 
 #define V1_TAG_BAD 0xFFFFu
+/* Wall tags (2026-11-23 distance texture LOD): w8 bit 7 = srca holds the
+ * HALF-only main copy - 8-px strips, each the even columns of a 16-texel
+ * strip (texture widths are <= 256, so w8 <= 32 never uses the bit). */
+#define V1_TAG_HALF   0x80u
+#define V1_TAG_W8(t)  ((t)->w8 & 0x7Fu)
 
 extern v1_tag_t *saturn_v1_flat_tags;
 extern v1_tag_t *saturn_v1_wall_tags;

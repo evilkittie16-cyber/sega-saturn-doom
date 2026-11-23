@@ -381,7 +381,8 @@ typedef struct {
     uint8_t                  should_subdivide;
     uint8_t                  needs_clip;
     uint8_t                  persp_strips;
-    uint8_t                  pad_b67;
+    uint8_t                  strip_w8;      /* main-copy strip width / 8: 2 = 16-px strips,
+                                             * 1 = half-only copy (V1_TAG_HALF, 2026-11-23) */
     int16_t                  tw;
     uint16_t                 srca_mono;
     uint16_t                 srca_64;
@@ -646,7 +647,7 @@ static HW_NOINLINE HW_COLD_OS int HW_TryCoalesceLinearStrip(
     int srca_64 = ctx->srca_64;
     int cur_v = ctx->cur_v;
     int u_end = u_start + ctx->u_span;
-    int strip_srca_step = th << 1;
+    int strip_srca_step = th * (int)ctx->strip_w8;
     int num_strips = (tw > 0) ? ((tw + 15) >> 4) : 1;
     int strip_mask = num_strips - 1;
     int cur_strip_idx = __builtin_expect((num_strips & strip_mask) == 0, 1)
@@ -806,10 +807,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear_General(
         ? (s_min & strip_mask)
         : HW_ModNonPow2(s_min, num_strips);
 
-    uint32_t size_lo = (2u << 8) | ((uint32_t)ctx->rows & 0xFFu);
-    uint32_t srca_v = (uint32_t)(srca + (ctx->cur_v << 1));
+    uint32_t size_lo = ((uint32_t)ctx->strip_w8 << 8) | ((uint32_t)ctx->rows & 0xFFu);
+    uint32_t srca_v = (uint32_t)(srca + (ctx->cur_v * (int)ctx->strip_w8));
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
-    uint32_t cmd_w2_step = (uint32_t)th << 17;
+    uint32_t cmd_w2_step = ((uint32_t)th * ctx->strip_w8) << 16;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
 
     int cur_px_fp = 0, step_px_fp = 0;
@@ -1068,10 +1069,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Linear(
     int cur_strip_idx = s_min & (num_strips - 1);
     int th = ctx->th;
 
-    uint32_t size_lo     = (2u << 8) | ((uint32_t)ctx->rows & 0xFFu);
-    uint32_t srca_v      = (uint32_t)(srca + (ctx->cur_v << 1));
+    uint32_t size_lo     = ((uint32_t)ctx->strip_w8 << 8) | ((uint32_t)ctx->rows & 0xFFu);
+    uint32_t srca_v      = (uint32_t)(srca + (ctx->cur_v * (int)ctx->strip_w8));
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
-    uint32_t cmd_w2_step = (uint32_t)th << 17;
+    uint32_t cmd_w2_step = ((uint32_t)th * ctx->strip_w8) << 16;
     uint32_t cmd_w2_wrap = (uint32_t)num_strips * cmd_w2_step;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
     uint32_t cmd_header1 = ctx->cmd_header1;
@@ -1279,10 +1280,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp_General(
         ? (s_min & strip_mask)
         : HW_ModNonPow2(s_min, num_strips);
 
-    uint32_t size_lo = (2u << 8) | ((uint32_t)ctx->rows & 0xFFu);
-    uint32_t srca_v = (uint32_t)(ctx->srca + (ctx->cur_v << 1));
+    uint32_t size_lo = ((uint32_t)ctx->strip_w8 << 8) | ((uint32_t)ctx->rows & 0xFFu);
+    uint32_t srca_v = (uint32_t)(ctx->srca + (ctx->cur_v * (int)ctx->strip_w8));
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
-    uint32_t cmd_w2_step = (uint32_t)th << 17;
+    uint32_t cmd_w2_step = ((uint32_t)th * ctx->strip_w8) << 16;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
 
     int vcy_top   = HW_VIEW_CY - ctx->top_overlap;
@@ -1580,10 +1581,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitWallStrips_Persp(
     int cur_strip_idx = s_min & (num_strips - 1);
     int th = ctx->th;
 
-    uint32_t size_lo     = (2u << 8) | ((uint32_t)ctx->rows & 0xFFu);
-    uint32_t srca_v      = (uint32_t)(ctx->srca + (ctx->cur_v << 1));
+    uint32_t size_lo     = ((uint32_t)ctx->strip_w8 << 8) | ((uint32_t)ctx->rows & 0xFFu);
+    uint32_t srca_v      = (uint32_t)(ctx->srca + (ctx->cur_v * (int)ctx->strip_w8));
     uint32_t cmd_w2_base = (srca_v << 16) | size_lo;
-    uint32_t cmd_w2_step = (uint32_t)th << 17;
+    uint32_t cmd_w2_step = ((uint32_t)th * ctx->strip_w8) << 16;
     uint32_t cmd_w2_wrap = (uint32_t)num_strips * cmd_w2_step;
     uint32_t cmd_w2_cur  = cmd_w2_base + (uint32_t)cur_strip_idx * cmd_w2_step;
     uint32_t cmd_header1 = ctx->cmd_header1;
@@ -1970,15 +1971,48 @@ static HW_NOINLINE HW_COLD_OS void HW_ExtrapolateMonoWallY(
     }
 }
 
+/* Distance texture LOD (2026-11-23): a wall whose nearest end is at least
+ * HW_HALF_TEX_CZ deep draws its 16-texel strips <= ~7 px wide, so the
+ * half-only main copy (8-px strips, saturn_vdp1.c v1_copy_strip_half) loses
+ * nothing there. A texture first needed by such walls is uploaded half-only
+ * (half the bytes - VDP1 VRAM ran out in retail E3M6); the first nearer wall
+ * upgrades it. -DHW_HALF_TEX=0 turns it off. */
+#ifndef HW_HALF_TEX
+#define HW_HALF_TEX 1
+#endif
+#ifndef HW_HALF_TEX_CZ
+#define HW_HALF_TEX_CZ (384 << FRACBITS)
+#endif
+HW_ALWAYS_INLINE int HW_WallTexFar(const hw_wall_emit_ctx_t *ctx)
+{
+    return HW_HALF_TEX && ctx->p0 && ctx->p1 &&
+           ctx->p0->cz >= HW_HALF_TEX_CZ && ctx->p1->cz >= HW_HALF_TEX_CZ;
+}
+
 static HW_NOINLINE HW_COLD_OS int HW_LoadWallTexCtx_Miss(int texnum, hw_wall_emit_ctx_t *ctx)
 {
+    extern int saturn_v1_wall_half_req;
     int tw = 0, th = 0, srca_mono = 0, srca_64 = 0;
+    saturn_v1_wall_half_req = HW_WallTexFar(ctx);
     int srca = HW_FastWallSrca(texnum, &tw, &th, &srca_mono, &srca_64);
+    saturn_v1_wall_half_req = 0;
     ctx->srca       = (uint16_t)srca;
     ctx->srca_mono  = (uint16_t)srca_mono;
     ctx->srca_64    = (uint16_t)srca_64;
     ctx->tw         = (int16_t)tw;
     ctx->th         = (int16_t)th;
+    ctx->strip_w8   = 2;
+    if (srca && (unsigned)texnum < (unsigned)numtextures && saturn_v1_wall_tags)
+    {
+        int t = texturetranslation ? texturetranslation[texnum] : texnum;
+        if ((unsigned)t >= (unsigned)numtextures)
+            t = texnum;
+        if ((saturn_v1_wall_tags[t].w8 & V1_TAG_HALF) && saturn_v1_wall_tags[t].srca == (unsigned short)srca)
+        {
+            ctx->strip_w8   = 1;
+            ctx->cur_tex_id = -1;   /* the next wall decides again (it may be near) */
+        }
+    }
     return srca;
 }
 
@@ -2009,8 +2043,9 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
     ctx->srca      = s;
     ctx->srca_mono = tag->srca_mono;
     ctx->srca_64   = tag->srca_64;
-    ctx->tw        = (int16_t)((int)tag->w8 << 3);
+    ctx->tw        = (int16_t)((int)(tag->w8 & 0x7Fu) << 3);
     ctx->th        = (int16_t)tag->h;
+    ctx->strip_w8  = (tag->w8 & V1_TAG_HALF) ? 1 : 2;
     return (int)s;
 }
 #else
@@ -2027,7 +2062,8 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
         {
             const v1_tag_t *tag = &saturn_v1_wall_tags[t];
             unsigned short s = tag->srca;
-            if (__builtin_expect(s != 0 && s != 0xFFFFu, 1))
+            if (__builtin_expect(s != 0 && s != 0xFFFFu, 1) &&
+                __builtin_expect(!(tag->w8 & V1_TAG_HALF), 1))
             {
                 /* no optional copies yet and VRAM has room this frame:
                  * make them now (saturn_vdp1.c, one wall per frame) */
@@ -2039,8 +2075,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_LoadWallTexCtx(int texnum, hw_wall_emit_ctx_
                 ctx->srca_64   = tag->srca_64;
                 ctx->tw        = (int16_t)((int)tag->w8 << 3);
                 ctx->th        = (int16_t)tag->h;
+                ctx->strip_w8  = 2;
                 return (int)s;
             }
+            /* half-only copies (and misses) take the slow path: a near
+             * wall upgrades the texture there */
         }
     }
     return HW_LoadWallTexCtx_Miss(texnum, ctx);
@@ -2767,8 +2806,8 @@ static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t
     }
     else if ((((u_span ^ 16) | (u_start & 15)) == 0) && (unsigned)u_start < (unsigned)tw)
     {
-        mono_base_srca = (int)ctx->srca + (int)(((unsigned)u_start >> 4) * (unsigned)((int)ctx->th << 1));
-        mono_tw = 16;
+        mono_base_srca = (int)ctx->srca + (int)(((unsigned)u_start >> 4) * (unsigned)((int)ctx->th * (int)ctx->strip_w8));
+        mono_tw = (int)ctx->strip_w8 << 3;  /* 16, or 8 for the half-only copy */
     }
     else
     {
@@ -2793,8 +2832,8 @@ static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitBakedWallQuads(hw_wall_emit_ctx_t
              (dx <= HW_LOD(HW_LOD_M16_FAR_DX) && p0->cz > HW_LOD(HW_LOD_M16_FAR_CZ))) &&
             (unsigned)u_start < (unsigned)tw)
         {
-            mono_base_srca = srca + (int)(((unsigned)u_start >> 4) * (unsigned)(th << 1));
-            mono_tw = 16;
+            mono_base_srca = srca + (int)(((unsigned)u_start >> 4) * (unsigned)(th * (int)ctx->strip_w8));
+            mono_tw = (int)ctx->strip_w8 << 3;  /* 16, or 8 for the half-only copy */
         }
         else if (tw == 32 && u_start == 0)
         {

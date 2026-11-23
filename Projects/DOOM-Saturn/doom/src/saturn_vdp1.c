@@ -1069,6 +1069,7 @@ static void v1_tags_try_alloc(void)
 unsigned int saturn_v1_alloc_bytes = 0;   /* cumulative texture bytes uploaded to VDP1 VRAM */
 #ifdef V1_REFUSE_DBG
 unsigned int saturn_v1_dbg_refuse[8];     /* count, bytes, tag idx, free, log_n, gap, flat0, spr0 */
+uint32_t saturn_v1_dbg_up[32];            /* wall uploads: frame mark << 16 | half << 15 | upgrade << 14 | tag */
 #endif
 
 static unsigned int v1_free_total(void)
@@ -1630,6 +1631,48 @@ static void v1_copy_strip_major(unsigned int off, const byte *src, int w, int h)
     }
 }
 
+/* Half-only main copy (2026-11-23 distance texture LOD): strip-major like
+ * v1_copy_strip_major, but each strip is 8 px wide and holds the even
+ * columns of its 16-texel strip, so strip s sits at off + s * 8 * h and the
+ * wall emitters address it with strip_w8 = 1 instead of 2. Lossless for
+ * walls >= ~320 units away (a 16-texel strip spans <= 8 px there). */
+static void v1_copy_strip_half(unsigned int off, const byte *src, int w, int h)
+{
+    extern uint32_t saturn_vdp1_bus_tex_bytes;
+    int num_strips = (w + 15) / 16;
+    int s;
+    saturn_vdp1_bus_tex_bytes += (uint32_t)(num_strips * 8 * h);
+    for (s = 0; s < num_strips; s++)
+    {
+        int cur_strip_w = (s == num_strips - 1) ? (w - s * 16) : 16;
+        unsigned int strip_off = off + (unsigned int)(s * (8 * h));
+#ifdef SATURN_WIN32
+        uint8_t *dst = (uint8_t *)(V1_BASE + strip_off);
+        int y, x;
+        for (y = 0; y < h; y++)
+        {
+            const byte *sr = src + y * w + s * 16;
+            for (x = 0; x < 8; x++)
+                dst[y * 8 + x] = (2 * x < cur_strip_w) ? sr[2 * x] : 0;
+        }
+#else
+        volatile unsigned short *dst = (volatile unsigned short *)(V1_BASE + strip_off);
+        int y, xw;
+        for (y = 0; y < h; y++)
+        {
+            const byte *sr = src + y * w + s * 16;
+            for (xw = 0; xw < 4; xw++)
+            {
+                int xl = xw * 4, xr = xl + 2;
+                unsigned b_l = (xl < cur_strip_w) ? (unsigned)sr[xl] : 0u;
+                unsigned b_r = (xr < cur_strip_w) ? (unsigned)sr[xr] : 0u;
+                *dst++ = (unsigned short)((b_l << 8) | b_r);
+            }
+        }
+#endif
+    }
+}
+
 /* Copies a >=64-wide wall texture as contiguous 32 x h horizontally-downsampled
  * blocks (each covering 64 world texels at 2:1 horizontal LOD) for distant
  * walls (dx <= 24 screen pixels), saving 50% VDP1 DDA steps at only 0.5x extra
@@ -1823,10 +1866,10 @@ void Saturn_Vdp1_WallLateCopy(int texnum)
         return;
     tag = &v1_tag[0][t];
     /* narrow walls (<= 16 wide) never get copies: no attempt used up */
-    if (!tag->srca || tag->srca == V1_TAG_BAD || tag->srca_mono != tag->srca || tag->w8 <= 2)
+    if (!tag->srca || tag->srca == V1_TAG_BAD || tag->srca_mono != tag->srca || V1_TAG_W8(tag) <= 2)
         return;
     saturn_v1_late_copy_armed = 0;          /* one attempt per frame */
-    if (!Saturn_TexInfo(texnum, &ti) || !ti.data || ti.w != ((int)tag->w8 << 3) ||
+    if (!Saturn_TexInfo(texnum, &ti) || !ti.data || ti.w != ((int)V1_TAG_W8(tag) << 3) ||
         ti.h != (int)tag->h)
         return;
     v1_wall_opt_copies(tag, ti.data, ti.w, ti.h, V1_LATE_COPY_RESERVE);
@@ -1834,12 +1877,18 @@ void Saturn_Vdp1_WallLateCopy(int texnum)
         saturn_v1_late_copies++;
 }
 
+/* Set by the wall emitter's texture load (saturn_hw_walls.c HW_LoadWallTexCtx)
+ * around a lookup for a wall that is far enough for the half-only copy. */
+int          saturn_v1_wall_half_req = 0;
+unsigned int saturn_v1_half_uploads = 0;    /* counter: half-only main copies made */
+
 static int v1_tex_get(int texnum, int *w, int *h)
 {
     v1_tag_t   *tag;
     const byte *src;
     int         tw, th;
     unsigned    off;
+    int         upgrade = 0;
 
     v1_tags_try_alloc();
     if (v1_tag[v1_tex_page] == NULL)
@@ -1884,10 +1933,14 @@ static int v1_tex_get(int texnum, int *w, int *h)
         {
             if (tag->srca == V1_TAG_BAD)
                 return 0;
-            v1_touch(tag->srca);
-            *w = (int)tag->w8 << 3;
-            *h = (int)tag->h;
-            return (int)tag->srca;
+            if (!(tag->w8 & V1_TAG_HALF) || saturn_v1_wall_half_req)
+            {
+                v1_touch(tag->srca);
+                *w = (int)V1_TAG_W8(tag) << 3;
+                *h = (int)tag->h;
+                return (int)tag->srca;
+            }
+            upgrade = 1;    /* half-only copy and a near wall wants full resolution */
         }
         if (!Saturn_TexInfo(texnum, &ti)
             || ti.data == NULL || ti.w < 8 || ti.h < 8
@@ -1905,15 +1958,57 @@ static int v1_tex_get(int texnum, int *w, int *h)
     extern int saturn_wall_subdivision;
     if (texnum > 0 && saturn_wall_subdivision && tw > 16)
     {
-        int strip_bytes = ((tw + 15) / 16) * 16 * th;
+        /* distance texture LOD (2026-11-23): a wall first needed only far
+         * away gets the half-only main copy (8-px strips, half the bytes);
+         * the first near wall upgrades it to full resolution, keeping the
+         * optional distance copies. The old half entry is left to age out
+         * of the arena (nothing points at it once the tag moves on). */
+        int half = saturn_v1_wall_half_req && !upgrade && tw >= 32;
+        int strip_bytes = ((tw + 15) / 16) * (half ? 8 : 16) * th;
+        unsigned short old_srca = tag->srca;
+        unsigned short keep_mono = (upgrade && tag->srca_mono != old_srca) ? tag->srca_mono : 0;
+        unsigned short keep_64   = (upgrade && tag->srca_64 != old_srca) ? tag->srca_64 : 0;
         unsigned int off_strip = v1_arena_alloc(strip_bytes, tag);
         if (off_strip == 0)
-            return 0;
-        v1_copy_strip_major(off_strip, src, tw, th);
+        {
+            if (!upgrade)
+                return 0;
+            *w = (int)V1_TAG_W8(tag) << 3;  /* no room: keep drawing the half copy */
+            *h = (int)tag->h;
+            return (int)old_srca;
+        }
+        if (half)
+            v1_copy_strip_half(off_strip, src, tw, th);
+        else
+            v1_copy_strip_major(off_strip, src, tw, th);
         tag->srca = (unsigned short)(off_strip / 8u);
-        tag->srca_mono = tag->srca;
-        tag->srca_64   = tag->srca;
-        v1_wall_opt_copies(tag, src, tw, th, V1_OPT_RESERVE);
+        if (keep_mono)
+        {
+            tag->srca_mono = keep_mono;
+            tag->srca_64   = keep_64 ? keep_64 : tag->srca;
+        }
+        else
+        {
+            tag->srca_mono = tag->srca;
+            tag->srca_64   = keep_64 ? keep_64 : tag->srca;
+            v1_wall_opt_copies(tag, src, tw, th, V1_OPT_RESERVE);
+        }
+        tag->w8 = (unsigned char)((tw >> 3) | (half ? V1_TAG_HALF : 0u));
+        tag->h  = (unsigned char)th;
+#ifdef V1_REFUSE_DBG
+        {
+            extern uint32_t saturn_v1_dbg_up[32];
+            static unsigned int n;
+            saturn_v1_dbg_up[n++ & 31] = ((uint32_t)(v1_age & 0xFFFF) << 16) |
+                                         ((uint32_t)half << 15) | ((uint32_t)upgrade << 14) |
+                                         (uint32_t)((tag - v1_tag[v1_tex_page]) & 0x3FFF);
+        }
+#endif
+        if (half)
+            saturn_v1_half_uploads++;
+        *w = tw;
+        *h = th;
+        return (int)tag->srca;
     }
     else if (texnum < 0 && tw == 64 && th == 64)
     {
@@ -2402,7 +2497,12 @@ void Saturn_Vdp1Wall_Reset(void)
         unsigned int target = V1_EVICT_TARGET < cap / 2u ? V1_EVICT_TARGET : cap / 2u;
         if (refused && v1_want_bytes + 48u * 1024u < target)
             target = v1_want_bytes + 48u * 1024u;
-        if (!v1_evict(target))
+        /* only a refused upload may escalate to a full flush (2026-11-23):
+         * a low-water eviction that freed little in a view whose working
+         * set fills the arena "failed", flushed everything, re-uploaded
+         * it all and filled the arena again - every frame (retail E3M6,
+         * 14 textures + copies per frame, no refusal ever) */
+        if (!v1_evict(target) && refused)
             v1_do_flush = 1;    /* live list fragments the whole ring */
         evict_idle_alloc = (v1_free_total() == free_before) ? saturn_v1_alloc_bytes : 0xFFFFFFFFu;
         if (!refused && v1_free_total() < free_before + V1_EVICT_MIN_GAIN)
