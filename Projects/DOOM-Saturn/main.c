@@ -49,42 +49,20 @@ static void boot_report(void)
 
     if (Saturn_CartPresent())
     {
-        if (saturn_cart_id_seen == 0x5C)
-        {
-            if (saturn_cart_rw_ok)
-                boot_report_line(28, "CART-4MB-RW-OK");
-            else if (saturn_cart_rw_point == 1) boot_report_line(28, "CART-4MB-RW-FAIL-1");
-            else if (saturn_cart_rw_point == 2) boot_report_line(28, "CART-4MB-RW-FAIL-2");
-            else if (saturn_cart_rw_point == 3) boot_report_line(28, "CART-4MB-RW-FAIL-3");
-            else if (saturn_cart_rw_point == 4) boot_report_line(28, "CART-4MB-RW-FAIL-4");
-            else if (saturn_cart_rw_point == 5) boot_report_line(28, "CART-4MB-RW-FAIL-5");
-            else if (saturn_cart_rw_point == 6) boot_report_line(28, "CART-4MB-RW-FAIL-6");
-            else if (saturn_cart_rw_point == 7) boot_report_line(28, "CART-4MB-RW-FAIL-7");
-            else if (saturn_cart_rw_point == 8) boot_report_line(28, "CART-4MB-RW-FAIL-8");
-            else if (saturn_cart_rw_point == 9) boot_report_line(28, "CART-4MB-RW-FAIL-9");
-            else boot_report_line(28, "CART-4MB-RW-FAIL");
-        }
-        else if (saturn_cart_id_seen == 0x5A)
-        {
-            if (saturn_cart_rw_ok)
-                boot_report_line(28, "CART-1MB-RW-OK");
-            else if (saturn_cart_rw_point == 1) boot_report_line(28, "CART-1MB-RW-FAIL-1");
-            else if (saturn_cart_rw_point == 2) boot_report_line(28, "CART-1MB-RW-FAIL-2");
-            else if (saturn_cart_rw_point == 3) boot_report_line(28, "CART-1MB-RW-FAIL-3");
-            else if (saturn_cart_rw_point == 7) boot_report_line(28, "CART-1MB-RW-FAIL-7");
-            else if (saturn_cart_rw_point == 8) boot_report_line(28, "CART-1MB-RW-FAIL-8");
-            else if (saturn_cart_rw_point == 9) boot_report_line(28, "CART-1MB-RW-FAIL-9");
-            else boot_report_line(28, "CART-1MB-RW-FAIL");
-        }
+        /* the cart is in use; rw_ok = 0 here means the size march cut it
+         * down (10-12: stopped answering, 20-22: mirrors), see i_wad.h */
+        const char *kind = (saturn_cart_id_seen == 0x5C) ? "4MB-" :
+                           (saturn_cart_id_seen == 0x5A) ? "1MB-" : "";
+        char        line[32];
+
+        if (saturn_cart_rw_ok)
+            Saturn_Format(line, (int)sizeof(line), "CART-%sRW-OK", kind);
         else
-            boot_report_line(28, saturn_cart_rw_ok ? "CART-RW-OK"
-                                                   : "CART-RW-FAIL");
-        if (saturn_cart_base_addr == 0x22400000u)
-            boot_report_line(60, "BASE-22400000");
-        else if (saturn_cart_base_addr == 0x42400000u)
-            boot_report_line(60, "BASE-42400000");
-        else
-            boot_report_line(60, "BASE-NONE");
+            Saturn_Format(line, (int)sizeof(line), "CART-%sSIZE-%d-%dK", kind,
+                          saturn_cart_rw_point, (int)(saturn_cart_size >> 10));
+        boot_report_line(28, line);
+        boot_report_line(60, (saturn_cart_base_addr == 0x22400000u) ? "BASE-22400000"
+                                                                    : "BASE-NONE");
         boot_report_line(44, "CART-WAD-MODE");
     }
     else if (saturn_cart_probe_failed)

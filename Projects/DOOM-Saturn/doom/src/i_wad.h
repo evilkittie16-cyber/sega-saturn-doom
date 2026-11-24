@@ -76,8 +76,9 @@ unsigned char *Saturn_ZoneBase(int *size);
 extern unsigned char saturn_cart_id_seen;   /* raw ID: low byte of the word at 0x24FFFFFE */
 extern int           saturn_cart_rw_ok;     /* every write/verify passed */
 extern int           saturn_cart_rw_point; /* 0 = passed; 1-3 = 16-bit probe, 7-9 = 32-bit
-                                            * probe, 10-12 = size march at 512K/1M/2M
-                                            * (see Saturn_CartInit) */
+                                            * probe, 10-12 = size march at 512K/1M/2M,
+                                            * 20-22 = RAM mirrors from 512K/1M/2M (cart
+                                            * kept at that size; see Saturn_CartInit) */
 extern unsigned int  saturn_cart_base_addr;  /* 0x22400000 when the cart answered, 0 otherwise */
 extern int           saturn_cart_probe_failed; /* cart seen but not writable — CD-stream mode */
 extern unsigned int  saturn_cart_size;       /* usable cart bytes for the hot-lump fill (0 = none;

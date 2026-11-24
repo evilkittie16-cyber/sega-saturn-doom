@@ -194,10 +194,10 @@ static int saturn_fill_boot_mode = 0;
 #define CART_INIT_ADDR     ((volatile unsigned short *)0x257EFFFE)
 #define A_BUS_SET_REG      ((volatile unsigned long  *)0x25FE00B0)
 #define A_BUS_REF_REG      ((volatile unsigned long  *)0x25FE00B8)
-/* NOTE: despite the name, 0x22400000 is the SH-2 CACHE-THROUGH address of
- * the cart (0x2xxxxxxx); the cached view is 0x02400000. There is no cart
- * mirror at 0x42400000: 0x4xxxxxxx is the SH-2 associative purge area. */
-#define CART_RAM_CACHED    0x22400000UL   /* cache-through cart address */
+/* 0x22400000 is the SH-2 CACHE-THROUGH address of the cart (0x2xxxxxxx);
+ * the cached view is 0x02400000. There is no cart mirror at 0x42400000:
+ * 0x4xxxxxxx is the SH-2 associative purge area. (Was CART_RAM_CACHED.) */
+#define CART_RAM_UNC       0x22400000UL
 #define CART_RAM_SIZE_4M   (4UL * 1024UL * 1024UL)
 
 /* HOT lump bodies are capped to the first 2 MB of the cart. The Z zone
@@ -502,23 +502,39 @@ static int probe_cart_mirror(unsigned long base, unsigned int size)
     return 0;
 }
 
-/* Probe + init the extended-RAM cart. Returns 1 if a cart is present
- * and initialized, 0 otherwise. Public and idempotent â€” main.c calls
- * it for the boot report, then I_WadBase relies on the cached result.
+/* 2026-11-24: does the word at base+off land on the same RAM as base+0?
+ * A smaller cart repeats its RAM higher up, and a mirrored word answers a
+ * write/verify like real RAM, so "the last word answers" alone cannot
+ * tell a 1 MB cart reporting the 4 MB id from a real 4 MB one. Writes a
+ * marker at +0, a different value at +off, checks the marker survived;
+ * both words are restored (+0 last, so it wins if they alias). */
+static int cart_aliases(unsigned long base, unsigned int off)
+{
+    volatile unsigned short *z = (volatile unsigned short *)base;
+    volatile unsigned short *p = (volatile unsigned short *)(base + off);
+    unsigned short z0 = *z;
+    unsigned short p0 = *p;
+    int alias;
+
+    *z = 0x1234;
+    *p = 0xEDCB;
+    alias = (*z != 0x1234);
+    *p = p0;
+    *z = z0;
+    return alias;
+}
+
+/* Probe + init the extended-RAM cart. Returns 1 if a usable cart is
+ * present, 0 otherwise (no cart, an unknown ID, or a failed check: then
+ * saturn_cart_probe_failed / saturn_cart_rw_point say why). Runs once;
+ * main.c calls it for the boot report, I_WadBase reuses the result.
  *
- * The strict probe would read `*0x24FFFFFF` and expect 0x5C (4 MB) or
- * 0x5A (1 MB). Some emulators with non-stock BIOSes may report a
- * different probe byte or return 0xFF for "no cart mapped." To stay
- * compatible, we accept any non-zero byte that isn't an obvious "no
- * hardware" sentinel (0xFF) and assume a 4 MB cart in that case. A
- * false positive would crash on the first cart write, which surfaces
- * immediately instead of hiding as a black screen; the no-cart
- * fallback in I_WadBase handles the real absence cleanly.
- *
- * The three-point write/verify (start/middle/last word) mirrors
- * ram_test.c. Its result is recorded in saturn_cart_rw_ok but does
- * NOT fail the init â€” on tolerant emulators a verify hiccup at one
- * probe point shouldn't demote the whole cart. */
+ * Only Sega DRAM cart IDs are driven (0x5C 4 MB; 0x5A/0x1A/0xDA 1 MB);
+ * anything else (a Saroo without a RAM cart answers 0x06) is no cart.
+ * Checks, each fatal (CD-stream mode): 16-bit and 32-bit write/verify at
+ * start/middle/end (point codes 1-3, 7-9); a 512K..2M size march that
+ * clamps the size to the last step that answers (10-12) or where the RAM
+ * starts to mirror (20-22, the cart stays in use at that size). */
 /* The cart was detected but failed a write/verify: run without it
  * (CD-stream mode). I_WadBase dispatches on cart_initialized, so every
  * cart field is cleared with it - a set flag with a NULL cart_base_ptr
@@ -609,7 +625,7 @@ int Saturn_CartInit(void)
      * the writes - and only if the RAM does not answer (Action Replay Pro:
      * real DRAM, reads 0xFFFF until enabled) the same setup is applied. */
     if (cart_id == CART_ID_BYTE_1M || cart_id == 0x1A || cart_id == 0xDA ||
-        !cart_quick_probe(CART_RAM_CACHED))
+        !cart_quick_probe(CART_RAM_UNC))
     {
         *CART_INIT_ADDR = 0x0001;
         {
@@ -653,8 +669,8 @@ int Saturn_CartInit(void)
      * lump copies, W_GetRawLumpData dispatch) goes through
      * cart_base_ptr, so both paths stay uniform. */
     saturn_cart_rw_point = 0;
-    /* SMOKE (12,12,12): entering the mirror write-probes (16-bit
-     * write/verify at 0x22400000, then 0x42400000). Held on SMOKE = the
+    /* SMOKE (12,12,12): entering the write-probes (16-bit
+     * write/verify at 0x22400000). Held on SMOKE = the
      * first cart WRITE hung or the bus locked up â€” on real hardware this
      * is where a flashcart that dislikes writes shows itself. */
     Saturn_StageColor(JO_COLOR_SATURN_RGB(12, 12, 12));
@@ -665,12 +681,12 @@ int Saturn_CartInit(void)
      * (the cache-through address) does not answer, nothing else will:
      * the cart is not usable and the game runs in CD-stream mode. */
     {
-        int p_cached  = probe_cart_mirror(CART_RAM_CACHED, size);
+        int p_cached  = probe_cart_mirror(CART_RAM_UNC, size);
 
         if (p_cached == 0)
         {
-            cart_base_ptr          = (unsigned char *)CART_RAM_CACHED;
-            saturn_cart_base_addr  = (unsigned int)CART_RAM_CACHED;
+            cart_base_ptr          = (unsigned char *)CART_RAM_UNC;
+            saturn_cart_base_addr  = (unsigned int)CART_RAM_UNC;
         }
         else
         {
@@ -750,6 +766,19 @@ int Saturn_CartInit(void)
                 saturn_cart_rw_ok        = 0;
                 break;
             }
+            /* 2026-11-24: the RAM below steps[si] answers; if the word AT
+             * steps[si] is the word at +0 again, the cart ends there and
+             * everything above is a mirror (the Z zone at +2 MB would sit
+             * on the hot lumps). Point codes 20-22 = mirror at 512K/1M/2M. */
+            if (cart_aliases(saturn_cart_base_addr, steps[si]))
+            {
+                cart_total_bytes         = steps[si];
+                saturn_cart_size         = steps[si];
+                cart_real_bytes          = steps[si];
+                saturn_cart_rw_point     = 20 + si;
+                saturn_cart_rw_ok        = 0;
+                break;
+            }
         }
         /* r69 HARD CLAMP: r63-r67 froze at F~1000-1100 KB and the r68
          * march saw the 1 MB point fail outright. Every cart write is
@@ -792,7 +821,7 @@ byte *Saturn_CartArena(unsigned int *size)
         return NULL;
     if (size)
         *size = (unsigned int)(CART_ARENA_END - CART_ARENA_OFF);
-    return (byte *)(CART_RAM_CACHED + CART_ARENA_OFF);
+    return (byte *)(CART_RAM_UNC + CART_ARENA_OFF);
 }
 
 /* Z-zone base: the cart's upper half via the CACHED mirror (the zone
@@ -814,17 +843,17 @@ byte *Saturn_ZoneBase(int *size)
 #define SATURN_ZONE_CACHED 0
 #endif
 #if SATURN_ZONE_CACHED
-    /* NOTE 2026-11-20: despite its name, CART_RAM_CACHED (0x22400000) is
-     * the SH-2 CACHE-THROUGH mirror (0x2xxxxxxx); the cached view of the
-     * cart is 0x02400000. The zone is written only by the master CPU, so
+    /* NOTE 2026-11-20: CART_RAM_UNC (0x22400000) is the SH-2
+     * CACHE-THROUGH address (0x2xxxxxxx); the cached view of the cart
+     * is 0x02400000. The zone is written only by the master CPU, so
      * the cached view would be coherent, but it MEASURED SLOWER (5thPlanet,
      * w/p2/m1a: 2 fewer frames per 240 fields each; D-miss +0.4..0.8 ms vs
      * uncached -0.2): zone data is read sparsely, a 16-byte line fill over
      * the 16-bit A-bus costs 8 accesses and evicts the renderer's lines.
      * So the zone stays uncached (the default below). */
-    return (byte *)((CART_RAM_CACHED & 0x0FFFFFFFUL) + CART_ZONE_OFF);
+    return (byte *)((CART_RAM_UNC & 0x0FFFFFFFUL) + CART_ZONE_OFF);
 #else
-    return (byte *)(CART_RAM_CACHED + CART_ZONE_OFF);
+    return (byte *)(CART_RAM_UNC + CART_ZONE_OFF);
 #endif
 }
 
@@ -1005,17 +1034,68 @@ volatile unsigned int saturn_prof_cpy_vbl = 0;
  * space-out E-poll. */
 volatile unsigned int saturn_dsp_engine_armed = 1;   /* r95: armed (A/B leg done — Kronos identical with and without) */
 
-/* r102 DSP-eval: FULL readback verify of EVERY DSP-copied 2 KB chunk
- * (the r71 one-time-full + 2-byte-spot policy only proved the FIRST
- * chunk byte-exact). kb counts verified KB (+2 per chunk); bad counts
- * chunks whose readback mismatched (repaired by CPU memcpy, per the
- * r71 policy — the DSP path is NOT demoted so the failure census
- * keeps accumulating). The in-loop census row X paints bad and V
- * paints kb every 64 vbl, so one photo mid-play reads the totals:
- * the standing directive is that the CD->cart transfer must be proven
- * correct, not assumed. */
+/* Cart write read-back census (r102; since 2026-11-24 for every cart
+ * write, see cart_copy_verify): kb counts verified KB; bad counts copies
+ * whose read-back mismatched (each is copied again). The in-loop census
+ * row X paints bad and V paints kb every 64 vbl, so one photo mid-play
+ * reads the totals: the CD->cart transfer must be proven correct, not
+ * assumed. */
 volatile unsigned int saturn_dsp_verify_kb  = 0;
 volatile unsigned int saturn_dsp_verify_bad = 0;
+/* 2026-11-24: chunks still wrong after the retry (the cart keeps them
+ * wrong: those lumps will read back corrupt). Should stay 0. */
+volatile unsigned int saturn_cart_verify_fail = 0;
+
+/* Does the cart hold src[0..n) at dst? Read back through the cart's
+ * cache-through address (no stale SH-2 cache line can fake it), 16 bits
+ * at a time when both sides allow it, else byte by byte. */
+static int cart_matches(const unsigned char *dst, const volatile unsigned char *src,
+                        unsigned int n)
+{
+    const volatile unsigned char *c =
+        (const volatile unsigned char *)(0x20000000u | (0x0FFFFFFFu & (unsigned int)dst));
+    unsigned int j;
+
+    if ((((unsigned int)c | (unsigned int)src) & 1u) == 0)
+    {
+        const volatile unsigned short *c16 = (const volatile unsigned short *)c;
+        const volatile unsigned short *s16 = (const volatile unsigned short *)src;
+        for (j = 0; j < (n >> 1); j++)
+            if (c16[j] != s16[j])
+                return 0;
+        j <<= 1;
+    }
+    else
+        j = 0;
+    for (; j < n; j++)
+        if (c[j] != src[j])
+            return 0;
+    return 1;
+}
+
+/* 2026-11-24: every cart write of the WAD loader goes through here: CPU
+ * copy, read back, one more copy + read back on a mismatch. The old checks
+ * only ran after a DSP copy, and Saturn_DspCartCopy2K is a stub that
+ * always fails, so no cart write was ever verified. Caller holds the
+ * cart-write critical section. Returns 0 when the cart holds the data. */
+static int cart_copy_verify(unsigned char *dst, const volatile unsigned char *src,
+                            unsigned int n)
+{
+    int tries;
+
+    for (tries = 0; tries < 2; tries++)
+    {
+        memcpy(dst, (const void *)src, n);
+        if (cart_matches(dst, src, n))
+        {
+            saturn_dsp_verify_kb += (n + 1023u) >> 10;
+            return 0;
+        }
+        saturn_dsp_verify_bad++;
+    }
+    saturn_cart_verify_fail++;
+    return -1;
+}
 
 /* r72: total cart bytes written (KB, +2 per staged 2 KB sector â€” both
  * the DSP path and its memcpy repairs/fallbacks). The ISR's pre-loop
@@ -1378,10 +1458,13 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
              * interrupts on; the fill splits every unaligned lump into
              * such a head). */
             if (in_cart)
+            {
                 Saturn_CartWriteBegin();
-            memcpy(d, (const void *)(saturn_sect_view() + within), take);
-            if (in_cart)
+                cart_copy_verify(d, saturn_sect_view() + within, take);
                 Saturn_CartWriteEnd();
+            }
+            else
+                memcpy(d, (const void *)(saturn_sect_view() + within), take);
             saturn_prof_cpy_vbl += saturn_vbl_count - t0;
         }
         saturn_gfs_site = 0;
@@ -1450,44 +1533,14 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
                                  * instead of nothing */
         {
             unsigned int t0 = saturn_vbl_count;         /* r66 */
-            /* r72: cart-write critical section â€” VBlank-IN masked
-             * (SCU manual p03_06: A-bus write sequences must not be
-             * split by interrupts) across the write burst, the verify
-             * reads and any repair memcpy. */
+            /* r72: cart-write critical section (SCU manual p03_06: A-bus
+             * write sequences must not be split by interrupts) across the
+             * write burst and its read-back (cart_copy_verify). */
             Saturn_GsubStamp(9);
             if (in_cart)
             {
                 Saturn_CartWriteBegin();
-                if (Saturn_DspCartCopy2K(d,
-                        (const void *)SATURN_SECT_UNC) == 0)
-                {
-                    /* 2026-11-23: read the cart back through its real
-                     * (cache-through) address, byte by byte. The old
-                     * check read 0x40000000|addr - the SH-2 associative
-                     * purge area, not the cart - as longwords, which is
-                     * an address error whenever d is not 4-aligned (a
-                     * lump at an odd disc offset). */
-                    const volatile unsigned char *src_v = saturn_sect_view();
-                    const volatile unsigned char *cart_v =
-                        (const volatile unsigned char *)(0x20000000u |
-                            (0x0FFFFFFFu & (unsigned int)d));
-                    unsigned int j;
-                    int bad = 0;
-
-                    for (j = 0; j < 2048u; j++)
-                        if (cart_v[j] != src_v[j]) { bad = 1; break; }
-                    saturn_dsp_verify_kb += 2;
-                    if (bad)
-                    {
-                        saturn_dsp_verify_bad++;
-                        memcpy(d, (const void *)saturn_sect_view(), 2048u);
-                    }
-                }
-                else
-                {
-                    memcpy(d, (const void *)saturn_sect_view(), 2048u);
-                    saturn_dsp_verify_kb += 2;
-                }
+                cart_copy_verify(d, saturn_sect_view(), 2048u);
                 Saturn_CartWriteEnd();
             }
             else
@@ -1598,10 +1651,13 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
             /* 2026-11-23: the partial tail is a cart write too (see the
              * partial head above). */
             if (in_cart)
+            {
                 Saturn_CartWriteBegin();
-            memcpy(d, (const void *)saturn_sect_view(), left);
-            if (in_cart)
+                cart_copy_verify(d, saturn_sect_view(), left);
                 Saturn_CartWriteEnd();
+            }
+            else
+                memcpy(d, (const void *)saturn_sect_view(), left);
             saturn_prof_cpy_vbl += saturn_vbl_count - t0;
         }
         saturn_gfs_site = 0;
@@ -1649,15 +1705,9 @@ int saturn_iwad_pread(unsigned int pos, void *dest, unsigned int nbytes)
 
     saturn_io_diag_oks = 0;   /* count sectors staged by THIS pread */
 
-    /* Positioning. Absolute GFS_Seek(GFS_SEEK_SET) has refused every far
-     * seek on this setup, so use Jo Engine's own proven pattern instead
-     * (jo_engine/fs.c seek_forward): ONE relative GFS_Seek(GFS_SEEK_CUR)
-     * with the forward sector delta. A backward target re-opens first
-     * (fresh handle sits at sector 0, so the delta is then the target
-     * itself). If we are already at the target sector, no seek at all â€”
-     * the header read right after open is therefore a pure sequential
-     * read, same as the font load. */
-    /* 2026-11-23: jo 2026.1's __jo_fs_seek_sector is ABSOLUTE and costs
+    /* Positioning. If we are already at the target sector, no seek at all
+     * (the header read right after open is a pure sequential read).
+     * 2026-11-23: jo 2026.1's __jo_fs_seek_sector is ABSOLUTE and costs
      * nothing (it only sets the handle's sector; the next read starts the
      * drive there), so a backward target needs no re-open and no PRIMER
      * read of sector 0. That workaround was for SGL's GFS, which this file
@@ -1669,45 +1719,8 @@ int saturn_iwad_pread(unsigned int pos, void *dest, unsigned int nbytes)
     {
         int positioned = 0;
 
-        if (0)   /* old backward path: re-open + primer (kept for reference) */
-        {
-            if (saturn_walk_to_sector(0, 1) < 0)   /* re-open: position 0 */
-                return -1;
-            /* PRIMER (2026-09-06 title stripes): the first GFS_Fread
-             * after a mid-session re-open ANSWERS (probe2: F2 returned
-             * 0800, seek and position bookkeeping honest) without
-             * landing data â€” the stage kept the boot's last directory
-             * sector. The boot's own proven pattern is open -> read
-             * sector 0 -> seek -> read, so replicate it: one primer
-             * read of sector 0 VERIFIED against the IWAD magic; if the
-             * magic never lands, walk forward from 0 on the fresh
-             * handle (slow, proven) instead of trusting the relative
-             * seek. */
-            if (sector > 0)
-            {
-                int primed = 0;
-
-                for (retry = 0; retry < 4 && !primed; retry++)
-                {
-                    const unsigned char *sv;
-
-                    if (saturn_gfs_read_sector() < 0)
-                        continue;
-                    sv = (const unsigned char *)saturn_sect_view();
-                    if (sv[0] == 'I' && sv[1] == 'W' &&
-                        sv[2] == 'A' && sv[3] == 'D')
-                        primed = 1;
-                }
-                if (!primed)
-                {
-                    if (saturn_walk_to_sector(sector, 1) < 0)
-                        return -1;
-                    positioned = 1;    /* walk left us at the target */
-                }
-            }
-            if (saturn_gfs_pos == sector)
-                positioned = 1;        /* sector 0: the re-open was it */
-        }
+        /* (the re-open + primer backward path was removed 2026-11-24;
+         * see the commit history for it) */
         if (!positioned)
         {
         for (retry = 0; retry < 8; retry++)
@@ -2455,15 +2468,9 @@ int saturn_iwad_background_fill(void)
 
             if (got > 0)
             {
-                /* r71: the Nw batch landed in the WRAM-H stage â move
-                 * it to the cart (SCU-DMA may never write the A-bus;
-                 * the DSP engine call is the one-line re-arm path, the
-                 * CPU memcpy from the stage is the live path). r102
-                 * DSP-eval: full readback verify of every landed batch
-                 * (was 2-byte spot), through the cart's cache-through
-                 * mirror â on mismatch or DSP timeout, repair with the
-                 * CPU memcpy from the stage view and count the chunk
-                 * in saturn_dsp_verify_bad. */
+                /* r71: the batch landed in the WRAM-H stage: move it to
+                 * the cart (SCU-DMA may never write the A-bus) with a CPU
+                 * copy and a full read-back (cart_copy_verify). */
                 unsigned char *cdst = cart_base_ptr + fill_txn_cart_off;
 
                 /* r72: cart-write critical section â VBlank-IN masked
@@ -2479,31 +2486,10 @@ int saturn_iwad_background_fill(void)
                      * just-landed batch copies correctly. */
                     if (!saturn_stage_probe((unsigned int)saturn_fill_stage))
                         saturn_stage_trip_now();
-                    /* 2026-11-23: byte-wise read-back through the cart's
-                     * cache-through address (was longwords through the
-                     * 0x40000000 purge area - see saturn_copy_from_here). */
-                    const volatile unsigned char *src_v = saturn_stage_view();
-                    const volatile unsigned char *cart_v =
-                        (const volatile unsigned char *)(0x20000000u |
-                            (0x0FFFFFFFu & (unsigned int)cdst));
-                    unsigned int j;
-                    unsigned int nw = (unsigned int)got;   /* bytes */
-                    int bad = (Saturn_DspCartCopy2K(cdst,
-                                  (const void *)SATURN_STAGE_UNC)
-                              != 0);
-
-                    /* Only the landed bytes are truth: got may be < 2 KB
-                     * on a partial batch, and beyond it both the stage
-                     * and the cart hold stale data. */
-                    for (j = 0; bad == 0 && j < nw; j++)
-                        if (cart_v[j] != src_v[j]) { bad = 1; break; }
-                    saturn_dsp_verify_kb += 2;
-                    if (bad)
-                    {
-                        saturn_dsp_verify_bad++;
-                        memcpy(cdst, (const void *)saturn_stage_view(),
-                               (unsigned int)got);
-                    }
+                    /* 2026-11-24: copy + read-back (cart_copy_verify).
+                     * Only the landed bytes are truth: got may be < 2 KB
+                     * on a partial batch. */
+                    cart_copy_verify(cdst, saturn_stage_view(), (unsigned int)got);
                 }
                 Saturn_CartWriteEnd();
                 saturn_cart_kb += 2;
