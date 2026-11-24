@@ -194,8 +194,10 @@ static int saturn_fill_boot_mode = 0;
 #define CART_INIT_ADDR     ((volatile unsigned short *)0x257EFFFE)
 #define A_BUS_SET_REG      ((volatile unsigned long  *)0x25FE00B0)
 #define A_BUS_REF_REG      ((volatile unsigned long  *)0x25FE00B8)
-#define CART_RAM_BASE      0x42400000UL   /* cache-through mirror of 0x22400000 */
-#define CART_RAM_CACHED    0x22400000UL   /* cached mirror (CPU-only data) */
+/* NOTE: despite the name, 0x22400000 is the SH-2 CACHE-THROUGH address of
+ * the cart (0x2xxxxxxx); the cached view is 0x02400000. There is no cart
+ * mirror at 0x42400000: 0x4xxxxxxx is the SH-2 associative purge area. */
+#define CART_RAM_CACHED    0x22400000UL   /* cache-through cart address */
 #define CART_RAM_SIZE_4M   (4UL * 1024UL * 1024UL)
 
 /* HOT lump bodies are capped to the first 2 MB of the cart. The Z zone
@@ -337,7 +339,7 @@ unsigned char  saturn_cart_id_seen = 0;
 int            saturn_cart_rw_ok   = 0;
 unsigned int   saturn_cart_size    = 0;
 int            saturn_cart_rw_point = 0;   /* 0 = passed; failure codes 1-9, see Saturn_CartInit */
-unsigned int   saturn_cart_base_addr = 0;  /* mirror the cart actually answers on (0x22400000 or 0x42400000) */
+unsigned int   saturn_cart_base_addr = 0;  /* 0x22400000 when the cart answered, 0 otherwise */
 int            saturn_cart_probe_failed = 0; /* cart seen on the bus but not writable â€” CD-stream mode */
 
 /* Heap-allocated IWAD header + directory used when cart is absent.
@@ -517,13 +519,58 @@ static int probe_cart_mirror(unsigned long base, unsigned int size)
  * ram_test.c. Its result is recorded in saturn_cart_rw_ok but does
  * NOT fail the init â€” on tolerant emulators a verify hiccup at one
  * probe point shouldn't demote the whole cart. */
+/* The cart was detected but failed a write/verify: run without it
+ * (CD-stream mode). I_WadBase dispatches on cart_initialized, so every
+ * cart field is cleared with it - a set flag with a NULL cart_base_ptr
+ * would write through NULL. `point` is the failure code for the boot
+ * report (saturn_cart_rw_point). Always returns 0. */
+static int cart_demote(int point)
+{
+    cart_base_ptr            = NULL;
+    saturn_cart_base_addr    = 0;
+    cart_total_bytes         = 0;
+    cart_real_bytes          = 0;
+    saturn_cart_size         = 0;
+    saturn_cart_rw_point     = point;
+    saturn_cart_rw_ok        = 0;
+    saturn_cart_probe_failed = 1;
+    cart_initialized         = 0;
+    return 0;
+}
+
+/* RAMCART-Test's quick_probe(): does the RAM at `base` answer with no
+ * register write? Two different words are written before either is read
+ * back, so the value left floating on the bus by the last write cannot
+ * pass for a good read. */
+static int cart_quick_probe(unsigned long base)
+{
+    volatile unsigned short *a = (volatile unsigned short *)base;
+    volatile unsigned short *b = (volatile unsigned short *)(base + 0x1000UL);
+    int ok;
+
+    *a = 0x5AA5;
+    *b = 0xA55A;
+    ok = (*a == 0x5AA5 && *b == 0xA55A);
+    *a = 0xC33C;
+    *b = 0x3CC3;
+    return (ok && *a == 0xC33C && *b == 0x3CC3);
+}
+
 int Saturn_CartInit(void)
 {
+    /* 2026-11-23: the probe runs ONCE. Only success used to be remembered
+     * (cart_initialized), so after a failed probe every later call (main.c
+     * boot report, then I_WadBase) wrote the init registers and the probe
+     * patterns to the cart all over again. */
+    static int    cart_probed = 0;
     unsigned char cart_id;
     unsigned int  size;
 
     if (cart_initialized)
         return 1;
+    if (cart_probed)
+        return 0;
+    cart_probed = 1;
 
     /* A-Bus 16-bit alignment: read 16-bit word at even boundary 0x24FFFFFE and mask low byte */
     cart_id = (unsigned char)(*CART_ID_ADDR_16 & 0x00FF);
@@ -555,7 +602,14 @@ int Saturn_CartInit(void)
      * inside its 1 MB branch too. Writing CART_INIT (0x257EFFFE=1)
      * unconditionally coincided with CART-4MB-RW-FAIL-1 on real
      * hardware; this now mirrors the proven sequence exactly. */
-    if (cart_id == CART_ID_BYTE_1M || cart_id == 0x1A || cart_id == 0xDA)
+    /* 2026-11-24: same sequence as RAMCART-Test (detect_cart, AUTO mode),
+     * which passes on the Saroo and the Action Replay Pro on real
+     * hardware. 1 MB ids: always set up (as above). 4 MB id 0x5C: first a
+     * probe with NO register write - the Saroo answers it and never gets
+     * the writes - and only if the RAM does not answer (Action Replay Pro:
+     * real DRAM, reads 0xFFFF until enabled) the same setup is applied. */
+    if (cart_id == CART_ID_BYTE_1M || cart_id == 0x1A || cart_id == 0xDA ||
+        !cart_quick_probe(CART_RAM_CACHED))
     {
         *CART_INIT_ADDR = 0x0001;
         {
@@ -570,8 +624,15 @@ int Saturn_CartInit(void)
         }
     }
 
+    /* 2026-11-23: a 1 MB cart is TWO 512 KB banks, at 0x22400000 and
+     * 0x22600000 - not 1 MB in a row. 0x22480000-0x224FFFFF mirrors the
+     * first bank, so the old "1 MB from the base" probed the mirror (the
+     * middle probe at +512 KB passed on the same RAM as +0) and described
+     * a size that is not there. Only bank 0 is used: everything this file
+     * places on a small cart (directory, hot lumps, the record slot) sits
+     * below 512 KB anyway. Bank 1 stays unused. */
     if (cart_id == CART_ID_BYTE_1M || cart_id == 0x1A || cart_id == 0xDA)
-        size = 1UL * 1024UL * 1024UL;
+        size = 512UL * 1024UL;
     else
         size = (unsigned)CART_RAM_SIZE_4M;   /* assume 4 MB on any other id */
 
@@ -587,8 +648,8 @@ int Saturn_CartInit(void)
      * the plain cached CS1 address â€” while this port's 0x42400000 area-2
      * mirror failed write/verify on the same hardware (every probe at
      * offset 0, 2026-08-30) even though the CS2 ID read at 0x24FFFFFF
-     * works. Probe the CS1 cached address FIRST; only fall back to
-     * 0x42400000 if it doesn't answer. Every later cart access (hot
+     * works. Probe the CS1 address (see the 2026-11-23 note below: the
+     * 0x42400000 fallback was removed). Every later cart access (hot
      * lump copies, W_GetRawLumpData dispatch) goes through
      * cart_base_ptr, so both paths stay uniform. */
     saturn_cart_rw_point = 0;
@@ -597,46 +658,42 @@ int Saturn_CartInit(void)
      * first cart WRITE hung or the bus locked up â€” on real hardware this
      * is where a flashcart that dislikes writes shows itself. */
     Saturn_StageColor(JO_COLOR_SATURN_RGB(12, 12, 12));
+    /* 2026-11-23: the 0x42400000 fallback is GONE. On the SH-2,
+     * 0x4xxxxxxx is the cache's associative PURGE area, not a mirror of
+     * the cart: writes there only purge cache lines and reads do not
+     * return RAM, which is why every probe there failed. If 0x22400000
+     * (the cache-through address) does not answer, nothing else will:
+     * the cart is not usable and the game runs in CD-stream mode. */
     {
         int p_cached  = probe_cart_mirror(CART_RAM_CACHED, size);
-        int p_mirror  = (p_cached == 0) ? 0 : probe_cart_mirror(CART_RAM_BASE, size);
 
         if (p_cached == 0)
         {
             cart_base_ptr          = (unsigned char *)CART_RAM_CACHED;
             saturn_cart_base_addr  = (unsigned int)CART_RAM_CACHED;
         }
-        else if (p_mirror == 0)
-        {
-            cart_base_ptr          = (unsigned char *)CART_RAM_BASE;
-            saturn_cart_base_addr  = (unsigned int)CART_RAM_BASE;
-        }
         else
         {
-            /* Neither mirror answers 16-bit writes. Point codes: 1/2/3 =
-             * 0x22400000 failed at start/middle/end, 4/5/6 = 0x42400000
-             * failed likewise. Demote to CD-stream mode â€” I_WadBase
-             * dispatches on cart_initialized, so leaving it set with a
-             * NULL cart_base_ptr would write through NULL. */
-            cart_base_ptr           = NULL;
-            saturn_cart_base_addr   = 0;
-            saturn_cart_rw_point    = (p_mirror == p_cached) ? p_cached : (3 + p_mirror);
-            saturn_cart_rw_ok       = 0;
-            saturn_cart_probe_failed = 1;
-            cart_initialized        = 0;
-            return 0;
+            /* The cart does not answer 16-bit writes. Point codes 1/2/3 =
+             * failed at start/middle/end (4/5/6 were the removed
+             * 0x42400000 probe and can no longer appear). */
+            return cart_demote(p_cached);
         }
     }
 
-    /* 32-bit longword write/verify on the CHOSEN mirror â€” memcpy into
-     * cart moves longwords, so this width must work too. Point codes
-     * 7/8/9 = failed at start/middle/end of the chosen base. */
+    /* 32-bit longword write/verify - memcpy into the cart moves
+     * longwords, so this width must work too. Point codes 7/8/9 = failed
+     * at start/middle/end.
+     * 2026-11-23: a failure here now DEMOTES the cart (CD-stream mode).
+     * It used to return 1 and keep the cart in use, so every later memcpy
+     * wrote longwords to a cart that had just failed a longword write:
+     * silently corrupt lumps instead of a slower, correct boot. */
     if (!probe_cart_long((volatile unsigned long *)(saturn_cart_base_addr + 0u), 0xDEADBEEFUL))
-    { saturn_cart_rw_point = 7; saturn_cart_rw_ok = 0; return 1; }
+        return cart_demote(7);
     if (!probe_cart_long((volatile unsigned long *)(saturn_cart_base_addr + (size >> 1)), 0xCAFEBABEUL))
-    { saturn_cart_rw_point = 8; saturn_cart_rw_ok = 0; return 1; }
+        return cart_demote(8);
     if (!probe_cart_long((volatile unsigned long *)(saturn_cart_base_addr + size - 4u), 0x12345678UL))
-    { saturn_cart_rw_point = 9; saturn_cart_rw_ok = 0; return 1; }
+        return cart_demote(9);
     saturn_cart_rw_ok = 1;
 
     /* r68 SIZE MARCH: the probes above are three one-off writes, but the
@@ -673,15 +730,22 @@ int Saturn_CartInit(void)
                                   (saturn_cart_base_addr + steps[si] - 2u),
                                   0x5A5Au))
             {
-                cart_total_bytes         = steps[si];  /* verified extent */
-                saturn_cart_size         = steps[si];
+                /* 2026-11-23: the usable size is the last step that
+                 * PASSED. It used to be steps[si], which counts the very
+                 * address that just failed as good (the fill region and
+                 * the record slot could then sit on it). A failure at the
+                 * first step leaves nothing verified: no cart. */
+                if (si == 0)
+                    return cart_demote(10);
+                cart_total_bytes         = steps[si - 1];
+                saturn_cart_size         = steps[si - 1];
                 /* A failed march step is hard evidence the cart is smaller
                  * (or mirrors): the Z zone (+2..4 MB) and texture arena
                  * gate on cart_real_bytes, which the 1008 KB policy clamp
                  * deliberately leaves alone - but this is not that clamp.
                  * Without it both were placed on unverified/mirrored RAM
                  * (2026-11-22). */
-                cart_real_bytes          = (si > 0) ? steps[si - 1] : 0u;  /* last step that passed */
+                cart_real_bytes          = steps[si - 1];  /* last step that passed */
                 saturn_cart_rw_point     = 10 + si;
                 saturn_cart_rw_ok        = 0;
                 break;
@@ -1284,8 +1348,12 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
     /* Multi-sector GFS reads are only direct into cart DRAM (A-bus,
      * uncached â€” no SH-2 OC coherency question) when the cart exists.
      * Cached destinations (heap/BSS fallback) keep the staged path. */
+    /* 2026-11-23: test against cart_real_bytes (the whole cart), not
+     * cart_total_bytes: that one is the FILL clamp (1008 KB), so reads
+     * into the Z zone at +2..4 MB (saturn_cd_big, zone copies) were
+     * classed "not in cart" and their cart writes ran unprotected. */
     in_cart = cart_initialized && d >= cart_base_ptr
-              && d < cart_base_ptr + cart_total_bytes;
+              && d < cart_base_ptr + cart_real_bytes;
 
     /* r64: during the boot drain even this multi-sector path is gated
      * to the staged 1-sector loop (saturn_fill_boot_mode â€” see
@@ -1305,7 +1373,15 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
                                  * P/W row at all */
         {
             unsigned int t0 = saturn_vbl_count;         /* r66 */
+            /* 2026-11-23: the partial head is a cart write too - same
+             * critical section as the whole sectors below (it ran with
+             * interrupts on; the fill splits every unaligned lump into
+             * such a head). */
+            if (in_cart)
+                Saturn_CartWriteBegin();
             memcpy(d, (const void *)(saturn_sect_view() + within), take);
+            if (in_cart)
+                Saturn_CartWriteEnd();
             saturn_prof_cpy_vbl += saturn_vbl_count - t0;
         }
         saturn_gfs_site = 0;
@@ -1385,15 +1461,20 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
                 if (Saturn_DspCartCopy2K(d,
                         (const void *)SATURN_SECT_UNC) == 0)
                 {
-                    const volatile unsigned int *src_v =
-                        (const volatile unsigned int *)saturn_sect_view();
-                    volatile unsigned int *cart_v =
-                        (volatile unsigned int *)(0x40000000u |
+                    /* 2026-11-23: read the cart back through its real
+                     * (cache-through) address, byte by byte. The old
+                     * check read 0x40000000|addr - the SH-2 associative
+                     * purge area, not the cart - as longwords, which is
+                     * an address error whenever d is not 4-aligned (a
+                     * lump at an odd disc offset). */
+                    const volatile unsigned char *src_v = saturn_sect_view();
+                    const volatile unsigned char *cart_v =
+                        (const volatile unsigned char *)(0x20000000u |
                             (0x0FFFFFFFu & (unsigned int)d));
                     unsigned int j;
                     int bad = 0;
 
-                    for (j = 0; j < 512u; j++)
+                    for (j = 0; j < 2048u; j++)
                         if (cart_v[j] != src_v[j]) { bad = 1; break; }
                     saturn_dsp_verify_kb += 2;
                     if (bad)
@@ -1514,7 +1595,13 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
         saturn_gfs_site = 10;
         {
             unsigned int t0 = saturn_vbl_count;         /* r66 */
+            /* 2026-11-23: the partial tail is a cart write too (see the
+             * partial head above). */
+            if (in_cart)
+                Saturn_CartWriteBegin();
             memcpy(d, (const void *)saturn_sect_view(), left);
+            if (in_cart)
+                Saturn_CartWriteEnd();
             saturn_prof_cpy_vbl += saturn_vbl_count - t0;
         }
         saturn_gfs_site = 0;
@@ -1570,11 +1657,19 @@ int saturn_iwad_pread(unsigned int pos, void *dest, unsigned int nbytes)
      * itself). If we are already at the target sector, no seek at all â€”
      * the header read right after open is therefore a pure sequential
      * read, same as the font load. */
+    /* 2026-11-23: jo 2026.1's __jo_fs_seek_sector is ABSOLUTE and costs
+     * nothing (it only sets the handle's sector; the next read starts the
+     * drive there), so a backward target needs no re-open and no PRIMER
+     * read of sector 0. That workaround was for SGL's GFS, which this file
+     * no longer uses, and it cost two physical CD seeks (to the WAD start
+     * and back) on every backward read - every out-of-order lump read of
+     * a level load. Any target, forward or backward, is one seek below;
+     * the walk fallbacks still cover a refused seek. */
     if (saturn_gfs_pos != sector)
     {
         int positioned = 0;
 
-        if (saturn_gfs_pos > sector)
+        if (0)   /* old backward path: re-open + primer (kept for reference) */
         {
             if (saturn_walk_to_sector(0, 1) < 0)   /* re-open: position 0 */
                 return -1;
@@ -2384,14 +2479,15 @@ int saturn_iwad_background_fill(void)
                      * just-landed batch copies correctly. */
                     if (!saturn_stage_probe((unsigned int)saturn_fill_stage))
                         saturn_stage_trip_now();
-                    const volatile unsigned int *src_v =
-                        (const volatile unsigned int *)
-                            saturn_stage_view();
-                    volatile unsigned int *cart_v =
-                        (volatile unsigned int *)(0x40000000u |
+                    /* 2026-11-23: byte-wise read-back through the cart's
+                     * cache-through address (was longwords through the
+                     * 0x40000000 purge area - see saturn_copy_from_here). */
+                    const volatile unsigned char *src_v = saturn_stage_view();
+                    const volatile unsigned char *cart_v =
+                        (const volatile unsigned char *)(0x20000000u |
                             (0x0FFFFFFFu & (unsigned int)cdst));
                     unsigned int j;
-                    unsigned int nw = ((unsigned int)got) >> 2;
+                    unsigned int nw = (unsigned int)got;   /* bytes */
                     int bad = (Saturn_DspCartCopy2K(cdst,
                                   (const void *)SATURN_STAGE_UNC)
                               != 0);

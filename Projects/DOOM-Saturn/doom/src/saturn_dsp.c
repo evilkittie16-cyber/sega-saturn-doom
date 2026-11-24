@@ -5,11 +5,12 @@
  * whereas CPU memcpy through the uncached mirror inside Saturn_CartWriteBegin/End
  * is faster and 100% deterministic).
  *
- * This module retains Saturn_CartWriteBegin / Saturn_CartWriteEnd (which mask
- * VBlank-IN and DSP-End in the 16-bit SCU IMS register 0x25FE00A0 during A-bus
- * cart writes) and the stubbed DSP status accessors queried by main.c, i_wad.c,
- * and i_video.c.
+ * This module retains Saturn_CartWriteBegin / Saturn_CartWriteEnd (which hold
+ * off all interrupts at the CPU during A-bus cart writes) and the stubbed DSP
+ * status accessors queried by main.c, i_wad.c, and i_video.c.
  */
+
+#include <jo/jo.h>
 
 #include "doomdef.h"
 #include "saturn_dsp.h"
@@ -43,16 +44,28 @@ int Saturn_DspCartOk(void)
     return 0;
 }
 
-static unsigned short saturn_cart_ims_save = 0;
+/* Cart-write critical section: all interrupts are held off at the CPU
+ * (SR interrupt mask) for the duration of one cart write burst. A VBlank
+ * that happens meanwhile stays pending in the SCU and is taken as soon
+ * as Saturn_CartWriteEnd restores SR.
+ *
+ * Why not the SCU mask register (IMS, 0x25FE00A0), as before:
+ *   - the old code accessed it as a 16-bit word at 0x25FE00A0, which on
+ *     the big-endian SH-2 is bits 31-16: it never masked VBlank-IN (bit 0);
+ *   - IMS cannot be relied on for reading: jo and the BIOS each keep
+ *     their own copy of the mask (jo_core_scu_mask, 0x06000348) for that
+ *     reason, so "read, OR, write back" restores an unknown value;
+ *   - jo's interrupt handlers (VBlank-IN, SMPC) rewrite IMS from jo's
+ *     copy when they return, which would undo a mask set here.
+ * Not nestable, main thread only (the only callers are in i_wad.c). */
+static unsigned int saturn_cart_sr_save = 0;
 
 void Saturn_CartWriteBegin(void)
 {
-    saturn_cart_ims_save = *(volatile unsigned short *)0x25FE00A0u;
-    *(volatile unsigned short *)0x25FE00A0u =
-        saturn_cart_ims_save | 1u | (1u << 5);
+    saturn_cart_sr_save = __jo_core_disable_interrupts();
 }
 
 void Saturn_CartWriteEnd(void)
 {
-    *(volatile unsigned short *)0x25FE00A0u = saturn_cart_ims_save;
+    __jo_core_restore_interrupts(saturn_cart_sr_save);
 }

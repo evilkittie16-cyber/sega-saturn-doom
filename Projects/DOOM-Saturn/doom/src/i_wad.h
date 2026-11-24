@@ -36,11 +36,14 @@ int  saturn_iwad_read(void *dest, unsigned int nbytes);
  * -1 (reported through DOOM's I_Error, never Jo's blue screen). */
 int  saturn_iwad_pread(unsigned int pos, void *dest, unsigned int nbytes);
 
-/* Drain one entry from the background cart-fill queue. Called once
- * per VBlank from saturn_vblank_callback so the cart progressively
- * fills with HOT lump bodies during gameplay instead of holding up
- * boot for seconds. Returns 1 if a copy was performed, 0 if the
- * queue was empty or disabled. */
+/* Drain the background cart-fill queue for one frame. Called once per
+ * displayed frame from the MAIN LOOP (D_DoomLoop) so the cart
+ * progressively fills with HOT lump bodies during gameplay instead of
+ * holding up boot for seconds. NEVER call it from an interrupt handler
+ * (VBlank callback) or the slave CPU: it shares the IWAD handle and the
+ * sector staging buffer with saturn_iwad_pread. Returns the number of
+ * queue entries completed this frame (0 if the queue was empty or
+ * disabled; negative when a copy failed and the queue was stopped). */
 int  saturn_iwad_background_fill(void);
 
 /* Light pump for the async cart-fill batch (no issuing): advances a
@@ -54,24 +57,31 @@ void saturn_iwad_fill_pump(void);
  * overlaps rendering. */
 void saturn_iwad_fill_drain_all(void);
 
-/* Probe + init the extended-RAM cart. Idempotent; returns 1 when a
- * cart is present and initialized. Safe to call from main.c before
- * I_WadBase for the boot report. */
+/* Probe + init the extended-RAM cart. The probe runs once; later calls
+ * return the remembered result (1 = a usable cart, 0 = none, unknown,
+ * or failed write/verify -> CD-stream mode). Safe to call from main.c
+ * before I_WadBase for the boot report. */
 int  Saturn_CartInit(void);
 
-/* 1 if Saturn_CartInit succeeded (cart present). */
+/* 1 if Saturn_CartInit succeeded (cart present and usable). */
 int  Saturn_CartPresent(void);
 
-/* Z-zone base in the cart's upper half (cached mirror), or NULL when
- * no cart / cart too small. *size receives the zone size in bytes. */
+/* Z-zone base in the cart's upper half (cache-through address
+ * 0x226xxxxx by default; the cached view 0x026xxxxx only with
+ * SATURN_ZONE_CACHED), or NULL when no cart / cart smaller than 4 MB.
+ * *size receives the zone size in bytes. */
 unsigned char *Saturn_ZoneBase(int *size);
 
 /* Boot-probe results for the on-screen boot report. */
-extern unsigned char saturn_cart_id_seen;   /* raw ID byte from 0x24FFFFFF */
-extern int           saturn_cart_rw_ok;     /* 3-point write/verify passed */
-extern int           saturn_cart_rw_point; /* 0 = passed; failure codes 1-9, see Saturn_CartInit */
-extern unsigned int  saturn_cart_base_addr;  /* mirror the cart answers on (0x22400000 or 0x42400000) */
+extern unsigned char saturn_cart_id_seen;   /* raw ID: low byte of the word at 0x24FFFFFE */
+extern int           saturn_cart_rw_ok;     /* every write/verify passed */
+extern int           saturn_cart_rw_point; /* 0 = passed; 1-3 = 16-bit probe, 7-9 = 32-bit
+                                            * probe, 10-12 = size march at 512K/1M/2M
+                                            * (see Saturn_CartInit) */
+extern unsigned int  saturn_cart_base_addr;  /* 0x22400000 when the cart answered, 0 otherwise */
 extern int           saturn_cart_probe_failed; /* cart seen but not writable — CD-stream mode */
-extern unsigned int  saturn_cart_size;       /* cart size in bytes (0 = none) */
+extern unsigned int  saturn_cart_size;       /* usable cart bytes for the hot-lump fill (0 = none;
+                                              * 512 KB on a 1 MB cart: bank 0 only; at most
+                                              * 1008 KB on a 4 MB cart: the fill clamp) */
 
 #endif /* __SATURN_I_WAD_H__ */

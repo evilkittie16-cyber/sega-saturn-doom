@@ -40,9 +40,12 @@ int Saturn_DspCartOk(void);
 
 /* r72 — cart-write critical section (SCU manual p03_06: A-bus flash
  * writes must not be interleaved with interrupts/DMA; its remedy is to
- * disable them around the write sequence). Masks VBlank-IN (IMS bit 0)
- * for the duration. Every cart-write burst — DSP copy or CPU memcpy —
- * runs between these two. */
+ * disable them around the write sequence). Holds off ALL interrupts at
+ * the CPU (SR mask) for the duration - not the SCU mask register, see
+ * saturn_dsp.c. A VBlank that falls inside is taken right after End.
+ * Every cart-write burst of the WAD loader (i_wad.c) runs between these
+ * two. Not nestable; main thread only. Keep the section short: one
+ * 2 KB copy. */
 void Saturn_CartWriteBegin(void);
 void Saturn_CartWriteEnd(void);
 
