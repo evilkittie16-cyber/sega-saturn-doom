@@ -60,6 +60,7 @@ SRCS = main.c \
        doom/src/saturn_cmdbuf.c \
        doom/src/saturn_hw_render.c \
        doom/src/saturn_hw_slave_walls.c \
+       doom/src/saturn_hw_walk2.c \
        doom/src/saturn_vdp2_plane.c \
        doom/src/saturn_baked_flats.c \
        doom/src/saturn_baked_segs.c \
@@ -127,6 +128,14 @@ endif
 # Extra -D flags from the environment (profiling variants), e.g. "-DHW_SUBMAX=0".
 EXTRA_DEFS ?=
 CCFLAGS += $(EXTRA_DEFS)
+# HW_WALK2 (2026-11-24): two-CPU screen split - the slave walks the BSP for
+# the right part of the screen with its own copy of the renderer
+# (saturn_hw_walk2.c). -DHW_WALK2=1 in EXTRA_DEFS also turns it on.
+HW_WALK2 ?= 0
+ifneq ($(findstring -DHW_WALK2=1,$(EXTRA_DEFS)),)
+HW_WALK2 := 1
+endif
+CCFLAGS += -DHW_WALK2=$(HW_WALK2)
 # JO_FS_MAX_FILES is 256 in Jo Engine v2026.1
 CCFLAGS += -fno-strict-aliasing
 
@@ -180,6 +189,26 @@ doom/src/saturn_hw_render.o: doom/src/saturn_hw_render.c $(SATURN_HW_DEPS)
 doom/src/saturn_hw_slave_walls.o: doom/src/saturn_hw_slave_walls.c $(SATURN_HW_DEPS)
 	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
 	sh-elf-objcopy --weaken $@
+
+# Slave copy of the whole renderer walk (HW_WALK2, saturn_hw_walk2.c): the C
+# copy is partially linked with its own assembly of the asm kernels (their
+# ctx tables bind to this copy; list limits = saturn_hw_walk2.h HW_W2_*_CAP,
+# the five list symbols the asm names directly renamed to the copy's) and
+# every global except the walker entry points is localized.
+W2_ASM_DEFS = -Wa,--defsym,HW_CMDM_CAP=512 -Wa,--defsym,HW_CMDS_CAP=512 -Wa,--defsym,HW_VISIT_CAP=192
+W2_ASM_SYMS = --redefine-sym _saturn_cmd_m=_hw_w2_cmd_m --redefine-sym _saturn_cmd_m_count=_hw_w2_cmd_m_count \
+              --redefine-sym _saturn_v1w_captured=_hw_w2_v1w_captured --redefine-sym _saturn_v1w_cells=_hw_w2_v1w_cells \
+              --redefine-sym _saturn_v1w_drop=_hw_w2_v1w_drop
+doom/src/saturn_hw_walk2.o: doom/src/saturn_hw_walk2.c doom/src/saturn_hw_render.c $(SATURN_HW_DEPS) doom/src/saturn_hw_asm.s
+ifeq ($(HW_WALK2),1)
+	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o doom/src/saturn_hw_walk2_c.o
+	$(CC) doom/src/saturn_hw_asm.s $(DFLAGS) $(W2_ASM_DEFS) -c -o doom/src/saturn_hw_asm_w2.o
+	sh-elf-objcopy $(W2_ASM_SYMS) doom/src/saturn_hw_asm_w2.o
+	$(CC) -m2 -nostdlib -r -o $@ doom/src/saturn_hw_walk2_c.o doom/src/saturn_hw_asm_w2.o
+	sh-elf-objcopy --keep-global-symbol=_hw_w2_entry --keep-global-symbol=_hw_w2_init $@
+else
+	$(CC) $< $(DFLAGS) $(HW_RENDER_FLAGS) -DSATURN_VDP1_WALL=1 -DSATURN_LEAF_RENDERER -DSATURN_PVS -o $@
+endif
 
 doom/src/saturn_baked_flats.o: doom/src/saturn_baked_flats.c
 	$(CC) $< $(DFLAGS) $(CCFLAGS_OPT) -o $@

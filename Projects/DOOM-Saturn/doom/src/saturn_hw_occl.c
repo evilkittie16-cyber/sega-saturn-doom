@@ -342,7 +342,7 @@ typedef struct {
 
 /* Sector light (>> 4) captured at level load (Saturn_HW_RenderInit), the
  * value bake_walls.py baked into every seg's baked_light. */
-static uint8_t hw_sec_light0[HW_MAX_AP_SECTORS];
+HW_W2_SHARED(uint8_t hw_sec_light0[HW_MAX_AP_SECTORS], );
 
 HW_ALWAYS_INLINE int HW_SecLight16(int lightlevel)
 {
@@ -408,19 +408,21 @@ static int32_t hw_sec_far[HW_MAX_AP_SECTORS];
  * the sector holds things). Used for sky sectors, whose ceiling is not
  * drawn. Jo heap (BSS is at its 0x060C0000 ceiling). */
 #define HW_SEC_ZTOP_CEIL 0x7FFF
-static int16_t *hw_sec_ztop;
-static int32_t *hw_sec_dz_top;            /* published (non-NULL) only while the lists are valid */
-static int32_t *hw_sec_dz_mem;
-static const uint16_t *hw_sec_nb_first;   /* PU_LEVEL: neighbour list offsets, [s]..[s+1] */
-static const uint16_t *hw_sec_nb;         /* PU_LEVEL: two-sided neighbour sectors */
+/* (HW_WALK2: built per level / per frame by the master; the slave copy
+ * reads the master's) */
+HW_W2_SHARED(int16_t *hw_sec_ztop, );
+HW_W2_SHARED(int32_t *hw_sec_dz_top, );            /* published (non-NULL) only while the lists are valid */
+HW_W2_SHARED(int32_t *hw_sec_dz_mem, );
+HW_W2_SHARED(const uint16_t *hw_sec_nb_first, );   /* PU_LEVEL: neighbour list offsets, [s]..[s+1] */
+HW_W2_SHARED(const uint16_t *hw_sec_nb, );         /* PU_LEVEL: two-sided neighbour sectors */
 extern uint32_t hw_wram_h_sub_flat_info[HW_MAX_AP_SUBSECTORS * 4];
 /* Per-subsector flat info: the static High-WRAM table, or a PU_LEVEL table
  * for maps with more than HW_MAX_AP_SUBSECTORS subsectors (then
  * hw_sub_flat_big = 1 and flat jobs go through the C submit path, since
  * hw_asm_flatsub indexes the static table). Set in Saturn_HW_RenderPlayerView
  * when the level's baked flats change. */
-static hw_sub_flat_info_t *hw_sub_flat_info_p = (hw_sub_flat_info_t *)hw_wram_h_sub_flat_info;
-static int hw_sub_flat_big = 0;
+HW_W2_SHARED(hw_sub_flat_info_t *hw_sub_flat_info_p, = (hw_sub_flat_info_t *)hw_wram_h_sub_flat_info);
+HW_W2_SHARED(int hw_sub_flat_big, = 0);
 extern uint32_t hw_wram_h_portal_segs[HW_MAX_PORTAL_SEGS * 3];
 #define HW_WRAM_L_SCRATCH ((hw_wram_l_scratch_t *)SATURN_WRAM_L_PILLARS_ADDR)
 #define HW_APERTURE       (&hw_aperture_state)

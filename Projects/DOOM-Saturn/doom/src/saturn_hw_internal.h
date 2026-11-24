@@ -19,10 +19,88 @@
 #include "i_system.h"
 #include <jo/jo.h>
 #include "saturn_slave.h"
+#if defined(HW_WALK2) && HW_WALK2 && !defined(SATURN_WIN32) && !defined(HW_SLAVE_TU)
+#ifdef HW_WALK2_TU
+#define SATURN_LUT_W2 2         /* the slave copy: the master's tables */
+#else
+#define SATURN_LUT_W2 1         /* the master renderer: exports them */
+#endif
+#endif
 #include "saturn_light_lut.h"
 #include "saturn_memmap.h"
 #include "saturn_cmdbuf.h"
 #include "saturn_vdp2_plane.h"
+#include "saturn_hw_walk2.h"
+
+/* HW_WALK2 (two-CPU screen split, saturn_hw_walk2.c): this TU is compiled
+ * twice; the second copy (HW_WALK2_TU) is the slave's renderer and keeps
+ * every variable private unless it is declared through HW_W2_SHARED, which
+ * makes the copy reference the master's definition instead (configuration,
+ * per-level data the master builds). */
+#ifdef HW_WALK2_TU
+#define HW_W2_SHARED(decl, init) extern decl
+#else
+#define HW_W2_SHARED(decl, init) decl init
+#endif
+#ifdef HW_WALK2_TU
+/* the slave copy's list capacities (its part of the master's buffers) */
+#undef  CMDBUF_M_CAP
+#define CMDBUF_M_CAP     HW_W2_M_CAP
+#undef  CMDBUF_S_CAP
+#define CMDBUF_S_CAP     HW_W2_S_CAP
+#undef  CMDBUF_MAX_VISIT
+#define CMDBUF_MAX_VISIT HW_W2_VISIT_CAP
+#define HW_ASM_M_CAP     HW_W2_M_CAP      /* saturn_hw_asm.s limits, this copy */
+#define HW_ASM_S_CAP     HW_W2_S_CAP
+#define HW_ASM_VISIT_CAP HW_W2_VISIT_CAP
+#else
+#define HW_ASM_M_CAP     1280
+#define HW_ASM_S_CAP     1024
+#define HW_ASM_VISIT_CAP 384
+#endif
+#ifdef HW_WALK2_TU
+/* per-walker command lists and counters: the copy's own */
+#define saturn_cmd_m              hw_w2_cmd_m
+#define saturn_cmd_s              hw_w2_cmd_s
+#define saturn_cmd_m_count        hw_w2_cmd_m_count
+#define saturn_cmd_s_count        hw_w2_cmd_s_count
+#define saturn_cmd_m_needs_ytrim  hw_w2_needs_ytrim
+#define saturn_sub_ranges         hw_w2_sub_ranges
+#define saturn_visit_count        hw_w2_visit_count
+#define saturn_v1w_cells          hw_w2_v1w_cells
+#define saturn_v1w_drop           hw_w2_v1w_drop
+#define saturn_v1w_captured       hw_w2_v1w_captured
+/* the copy never feeds the slave flat-job ring: it renders its own flats */
+#define saturn_slave_enabled      hw_w2_no_slave
+/* texture-cache tags through cache-through aliases; no optional copies */
+#define saturn_v1_wall_tags       hw_w2_wall_tags
+#define saturn_v1_flat_tags       hw_w2_flat_tags
+#define saturn_v1_wall_half_req   hw_w2_half_req
+#define saturn_v1_late_copy_armed hw_w2_late_copy_armed
+/* master-only services become requests to the master (saturn_hw_render.c) */
+#define Saturn_Vdp1_GetTexSrca          hw_w2_GetTexSrca
+#define Saturn_Vdp1_GetFlatSrca         hw_w2_GetFlatSrca
+#define Saturn_Vdp1_GetFlatSrcaVariant  hw_w2_GetFlatSrcaVariant
+#define Saturn_Vdp1_FlatAvgColor        hw_w2_FlatAvgColor
+#define Saturn_Vdp1Spr_Add              hw_w2_SprAdd
+#define Saturn_SpritePatch              hw_w2_SpritePatch
+#define I_AllocHigh                     hw_w2_AllocHigh
+extern vdp1_cmd_t        *hw_w2_cmd_m, *hw_w2_cmd_s;
+extern sub_range_t       *hw_w2_sub_ranges;
+extern volatile uint16_t  hw_w2_cmd_m_count, hw_w2_cmd_s_count;
+extern int                hw_w2_visit_count;
+extern uint8_t            hw_w2_needs_ytrim;
+extern int                hw_w2_v1w_cells, hw_w2_v1w_drop, hw_w2_v1w_captured;
+extern unsigned char      hw_w2_no_slave;
+extern v1_tag_t          *hw_w2_wall_tags, *hw_w2_flat_tags;
+extern int                hw_w2_half_req, hw_w2_late_copy_armed;
+int  hw_w2_GetTexSrca(int texnum, int *tw, int *th);
+int  hw_w2_GetFlatSrca(int flatnum);
+int  hw_w2_GetFlatSrcaVariant(int flatnum, int variant);
+int  hw_w2_FlatAvgColor(int flatnum);
+int  hw_w2_SprAdd(int scache, int xA, int xB, int yt, int yb, int srcrow, int rows, int shade, int mark);
+byte *hw_w2_AllocHigh(int length);
+#endif
 
 typedef struct {
     fixed_t cx;
@@ -234,17 +312,18 @@ static const hw_oracle_t *hw_oracle_cur = NULL;
  * Option A: SATURN_VIEW_DOS  (320x168, CY=84, STBAR=168, 1:1 DOS pixel parity, locked 30 FPS)
  * Option B: SATURN_VIEW_FULL (320x192, CY=96, STBAR=192, borderless fullscreen)
  */
-int saturn_view_w    = 320;
-int saturn_view_mode = SATURN_VIEW_DOS; /* Starts in Option A (DOS mode) by default */
-int saturn_view_h    = 168;
-int saturn_view_cy   = 84;
-int saturn_view_cx   = 160;
-int saturn_stbar_y   = 168;
-int saturn_view_latch = 2;
+HW_W2_SHARED(int saturn_view_w,     = 320);
+HW_W2_SHARED(int saturn_view_mode,  = SATURN_VIEW_DOS); /* Starts in Option A (DOS mode) by default */
+HW_W2_SHARED(int saturn_view_h,     = 168);
+HW_W2_SHARED(int saturn_view_cy,    = 84);
+HW_W2_SHARED(int saturn_view_cx,    = 160);
+HW_W2_SHARED(int saturn_stbar_y,    = 168);
+HW_W2_SHARED(int saturn_view_latch, = 2);
 extern int saturn_hw_sky_latch;
 extern int saturn_stbar_dirty_latch;
 extern int gametic;
 
+#ifndef HW_WALK2_TU
 void Saturn_SetViewMode(int mode)
 {
     if (mode == SATURN_VIEW_DOS)
@@ -281,13 +360,15 @@ void Saturn_ToggleViewMode(void)
 {
     Saturn_SetViewMode(saturn_view_mode == SATURN_VIEW_DOS ? SATURN_VIEW_FULL : SATURN_VIEW_DOS);
 }
+#endif /* !HW_WALK2_TU */
 
 /* Wall Strip Subdivision (Perspective-Correct VDP1 1D Strips):
  * 1 = Enabled (subdivides oblique walls into 16px perspective-correct vertical strips)
  * 0 = Disabled (classic monolithic quads with VDP1 affine trapezoid warping)
  */
-int saturn_wall_subdivision = 1;
+HW_W2_SHARED(int saturn_wall_subdivision, = 1);
 
+#ifndef HW_WALK2_TU
 void Saturn_ToggleWallSubdivision(void)
 {
     extern void Saturn_Vdp1Wall_FlushCache(void);
@@ -299,6 +380,7 @@ void Saturn_ToggleWallSubdivision(void)
     fflush(stdout);
 #endif
 }
+#endif /* !HW_WALK2_TU */
 
 #define HW_VIEW_W       320
 #define HW_VIEW_H       saturn_view_h
@@ -320,8 +402,8 @@ static fixed_t   hw_viewx, hw_viewy, hw_viewz;
 static angle_t   hw_viewangle;
 static fixed_t   hw_viewsin, hw_viewcos;
 static int       hw_cam_x, hw_cam_y;
-sector_t        *hw_psec = NULL;
-int              saturn_hw_is_sky = 0;
+HW_W2_SHARED(sector_t *hw_psec, = NULL);
+HW_W2_SHARED(int saturn_hw_is_sky, = 0);
 #define hw_is_sky saturn_hw_is_sky
 static int       hw_displayplayer = 0;
 
@@ -338,7 +420,7 @@ static int       hw_solid_words = 0;
 int              saturn_hw_sky_visible = 0;
 int              saturn_hw_sky_latch = 0;
 int              saturn_hw_sky_prime = 0;
-int16_t        (*hw_node_bboxes)[2][4] = NULL;
+HW_W2_SHARED(int16_t (*hw_node_bboxes)[2][4], = NULL);
 unsigned int saturn_hw_prof_bsp = 0;
 unsigned int saturn_hw_prof_segs = 0;
 unsigned int saturn_hw_prof_ap = 0;
@@ -368,8 +450,8 @@ unsigned int saturn_hw_bsp_abort = 0;
  * 1 = on, 2 = off. Initialised non-zero so it lives in .data (the .bss
  * is zeroed every frame by the known BSS stomper). Toggled live with the
  * L+R+X pad chord (i_system.c); shown on the HUD perf row as O1/O2. */
-int saturn_hw_bsp_occl = 1;
-int saturn_hw_skydbg = 1;   /* 1 = normal sky, 2 = magenta background (L+R+Y) */
+HW_W2_SHARED(int saturn_hw_bsp_occl, = 1);
+HW_W2_SHARED(int saturn_hw_skydbg, = 1);   /* 1 = normal sky, 2 = magenta background (L+R+Y) */
 unsigned int saturn_hw_occl_culls = 0;
 unsigned int saturn_hw_seg_iter = 0;   /* baked segs iterated / frame */
 unsigned int saturn_hw_seg_vis = 0;    /* ... surviving all culls     */
@@ -435,7 +517,13 @@ typedef uint32_t aliased_uint32_t;
 #endif
 
 #define HW_MAX_FLAT_VERTS        1536
+#ifdef HW_WALK2_TU
+/* the slave copy renders its flats on the master path, into the slave
+ * flat worker's buffer (idle while the slave walks) */
+static saturn_proj_v_t *hw_proj_verts_master = (saturn_proj_v_t *)SATURN_WRAM_L_PROJ_VERTS_ADDR;
+#else
 static saturn_proj_v_t *hw_proj_verts_master = (saturn_proj_v_t *)((uint8_t *)SATURN_WRAM_L_PROJ_VERTS_ADDR + 0x6000u);
+#endif
 static saturn_proj_v_t *hw_proj_verts_slave  = (saturn_proj_v_t *)SATURN_WRAM_L_PROJ_VERTS_ADDR;
 static uint32_t  sub_solid_mask[HW_SOLID_WORDS];
 static int       sub_solid_active = 0;
@@ -445,6 +533,20 @@ static int       hw_first_flat_job = 0;
 static uint16_t  hw_render_frame = 0;
 extern unsigned char saturn_slave_enabled;
 static int       hw_frame_slave_enabled = 0;
+/* this frame's floor jobs go to the slave's flat-job ring (= hw_frame_slave_
+ * enabled; a byte for hw_asm_subsector). 0 in split frames: each walker
+ * renders its own flats. */
+static unsigned char hw_flat_ring = 0;
+/* this walker's screen columns [hw_w_x0, hw_w_x1) (HW_WALK2 split; the full
+ * view otherwise): wall user clips stay inside them */
+static int16_t   hw_w_x0 = 0, hw_w_x1 = 320;
+static int       hw_w2_inited = 0;       /* HW_WALK2: hw_w2_init done (master) */
+#if HW_WALK2 && !defined(SATURN_WIN32) && !defined(HW_WALK2_TU)
+static void HW_W2_Serve(void);          /* saturn_hw_render.c: serve a split walk's request */
+#define HW_W2_SERVE() HW_W2_Serve()
+#else
+#define HW_W2_SERVE() ((void)0)
+#endif
 
 
 #endif /* SATURN_HW_INTERNAL_H */

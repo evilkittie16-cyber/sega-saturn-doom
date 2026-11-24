@@ -143,7 +143,17 @@ int saturn_tex_dirty = 1;
  * (zone 2, 0x060D5F00..0x060FBC00, ~138 KB free in game), so a large tier
  * fits there; see SATURN_T0_OFF. */
 #ifndef SATURN_HWRAM_WANT
+#if defined(HW_WALK2) && HW_WALK2
+/* two-CPU split (2026-11-24): the slave's renderer copy (saturn_hw_walk2.c)
+ * takes ~85 KB of the High WRAM this tier lived in */
+#define SATURN_HWRAM_WANT  32768u
+#elif defined(HW_SLAVE_WALLS) && HW_SLAVE_WALLS
+/* slave walls (2026-11-24): its emitter copy (~17 KB) and the slave's
+ * 512-command region in saturn_cmd_m (16 KB) come out of this tier */
+#define SATURN_HWRAM_WANT  65536u
+#else
 #define SATURN_HWRAM_WANT  114688u   /* 112 KB (2026-11-18; was 48 KB with the tier off) */
+#endif
 #endif
 
 /* T0 = the High WRAM tier. ON since 2026-11-18 (5thPlanet, 12 static views
@@ -898,6 +908,27 @@ byte *Saturn_SpritePatch(int s, int *w, int *h, int *lofs, int *tofs)
     *w = hd->w; *h = hd->h; *lofs = hd->lo; *tofs = hd->to;
     return sprite_raw[s];
 }
+
+/* HW_WALK2: the slave renderer's lookup - Saturn_SpritePatch for a patch
+ * already loaded (header filled, raw lump cached), else NULL (the slave then
+ * asks the master, which may load it). Read only; header and pointers are
+ * read through the cache-through alias (the master may have filled them
+ * this frame). */
+#ifndef SATURN_WIN32
+byte *Saturn_SpritePatchPeek(int s, int *w, int *h, int *lofs, int *tofs)
+{
+    if (s < 0 || s >= numsprites || !sprite_hdr) return NULL;
+    const volatile sprhdr_t *hd = (const volatile sprhdr_t *)((uintptr_t)&sprite_hdr[s] | 0x20000000u);
+    byte *p = NULL;
+    if (sprite_cache)
+        p = *(byte *const volatile *)((uintptr_t)&sprite_cache[s] | 0x20000000u);
+    if (!p && sprite_raw)
+        p = *(byte *const volatile *)((uintptr_t)&sprite_raw[s] | 0x20000000u);
+    if (!p || hd->w < 1) return NULL;
+    *w = hd->w; *h = hd->h; *lofs = hd->lo; *tofs = hd->to;
+    return p;
+}
+#endif
 
 byte *Saturn_SpriteData(int s)
 {

@@ -36,6 +36,9 @@ enum {
 #ifndef HW_LOD_C8_DEF
 #define HW_LOD_C8_DEF 32   /* quarter block = 32 texel columns: <= 32 px never undersamples it */
 #endif
+#ifdef HW_WALK2_TU
+extern int32_t hw_wall_lod[16];     /* the master's (adaptive detail changes it) */
+#else
 int32_t hw_wall_lod[16] = {
 #if HW_LOD_REF
     -1, -1, 512 << 16, -1, -1, -1, -1, -1, 48, 1000, 0x7FFFFFFF, -1,
@@ -43,6 +46,7 @@ int32_t hw_wall_lod[16] = {
     16, 6, 512 << 16, 28, 20, 56, 52, 20, 48, 1000, 192 << 16, HW_LOD_C8_DEF,
 #endif
 };
+#endif
 #define HW_LOD(i) (hw_wall_lod[(i)])
 #if SATURN_BENCH
 /* Tuning-harness input: sdbg pokes [0..15] then bumps [16]; the renderer
@@ -477,11 +481,27 @@ typedef struct {
     int16_t   snap;         /* hw_defer_snap index, -1 = none needed */
 } hw_wall_sub_t;
 
-typedef struct {
+/* 16-byte multiple: every queue item starts on a cache line (the slave
+ * reads the queue through its cache, see HW_SlaveEmitSub) */
+typedef struct __attribute__((aligned(16))) {
     uint32_t mask[HW_SOLID_WORDS];
     uint32_t summary, any;      /* hw_solid_summary / hw_solid_any (occl queries read them) */
     int      count;
 } hw_solid_snap_t;
+_Static_assert(sizeof(hw_wall_rec_t) % 16u == 0 && sizeof(hw_wall_sub_t) % 16u == 0 &&
+               sizeof(hw_solid_snap_t) % 16u == 0, "deferred-wall queue items: whole cache lines");
+
+/* Queue in High WRAM (2026-11-24): once the level runs, HW_DeferTryHigh
+ * moves the queue into whatever the Jo heap has left (~27 KB in pieces in a
+ * HW_SLAVE_WALLS retail build); the Low WRAM queue made recording cost the
+ * master ~3.7 ms and the slave's cache-through reads ~5 ms on E4M9.
+ * Measured high-water marks (5thPlanet, retail): records 99-175, headers
+ * 44-103, snapshots 9-41; a full queue just emits the rest immediately. */
+#ifndef HW_DEFER_HIGH
+#define HW_DEFER_HIGH 1
+#endif
+#define HW_DEFER_H_SUB_CAP  160
+#define HW_DEFER_H_SNAP_CAP 48
 
 #if HW_DEFER_WALLS && !defined(SATURN_WIN32)
 /* Low WRAM (saturn_memmap.h): the High WRAM BSS has no room for ~37 KB
@@ -493,15 +513,19 @@ typedef struct {
 _Static_assert(((sizeof(hw_wall_rec_t) * HW_DEFER_REC_CAP + sizeof(hw_wall_sub_t) * HW_DEFER_SUB_CAP + 15u) & ~15u)
                + sizeof(hw_solid_snap_t) * HW_DEFER_SNAP_CAP <= SATURN_WRAM_L_DEFER_SIZE,
                "deferred-wall queue must fit SATURN_WRAM_L_DEFER");
-#define hw_defer_rec  ((hw_wall_rec_t *)SATURN_WRAM_L_DEFER_ADDR)
-#define hw_defer_sub  ((hw_wall_sub_t *)(SATURN_WRAM_L_DEFER_ADDR + HW_DEFER_REC_BYTES))
-#define hw_defer_snap ((hw_solid_snap_t *)(SATURN_WRAM_L_DEFER_ADDR + \
-                       ((HW_DEFER_REC_BYTES + HW_DEFER_SUB_BYTES + 15u) & ~15u)))
+static __attribute__((unused)) hw_wall_rec_t   *hw_defer_rec  = (hw_wall_rec_t *)SATURN_WRAM_L_DEFER_ADDR;
+static __attribute__((unused)) hw_wall_sub_t   *hw_defer_sub  = (hw_wall_sub_t *)(SATURN_WRAM_L_DEFER_ADDR + HW_DEFER_REC_BYTES);
+static __attribute__((unused)) hw_solid_snap_t *hw_defer_snap = (hw_solid_snap_t *)(SATURN_WRAM_L_DEFER_ADDR +
+                                         ((HW_DEFER_REC_BYTES + HW_DEFER_SUB_BYTES + 15u) & ~15u));
 #else
 static hw_wall_rec_t   hw_defer_rec[HW_DEFER_REC_CAP];
 static hw_wall_sub_t   hw_defer_sub[HW_DEFER_SUB_CAP];
 static hw_solid_snap_t hw_defer_snap[HW_DEFER_SNAP_CAP];
 #endif
+/* current capacities (lower once the queue sits in High WRAM) */
+static __attribute__((unused)) int hw_defer_rec_cap  = HW_DEFER_REC_CAP;
+static __attribute__((unused)) int hw_defer_sub_cap  = HW_DEFER_SUB_CAP;
+static __attribute__((unused)) int hw_defer_snap_cap = HW_DEFER_SNAP_CAP;
 static int     hw_defer_nrec = 0, hw_defer_nsub = 0, hw_defer_nsnap = 0;
 static int     hw_defer_on = 0;         /* this subsector records instead of emitting */
 static int     hw_defer_tex_seen = -1;  /* last wall texture touched in pass 1 */
@@ -737,7 +761,7 @@ _Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall
                offsetof(hw_wall_emit_ctx_t, rows) == 90 && offsetof(hw_wall_emit_ctx_t, inv_u_span) == 100 &&
                offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104 && offsetof(hw_wall_emit_ctx_t, last_clip_x0) == 76 &&
                offsetof(hw_wall_emit_ctx_t, tw) == 68 && offsetof(hw_wall_emit_ctx_t, u_start) == 92 &&
-               CMDBUF_M_CAP == 1280 && sizeof(vdp1_cmd_t) == 32, "hw_asm_lingen: layout");
+               CMDBUF_M_CAP == HW_ASM_M_CAP && sizeof(vdp1_cmd_t) == 32, "hw_asm_lingen: layout");
 const void *const hw_asm_lingen_ctx[12] = {
     &saturn_cmd_m, (const void *)&saturn_cmd_m_count, &saturn_v1w_cells, &saturn_hw_wall_quads,
     &saturn_hw_wall_strips, &saturn_v1w_drop, &saturn_v1w_captured, hw_wall_coord_tmp,
@@ -1202,7 +1226,7 @@ _Static_assert(offsetof(hw_wall_emit_ctx_t, occl_state) == 2 && offsetof(hw_wall
 _Static_assert(offsetof(hw_trans_pillar_t, cx) == 0 && offsetof(hw_trans_pillar_t, cz) == 4 &&
                offsetof(hw_trans_pillar_t, px) == 12 && offsetof(baked_seg_t, baked_light) == 2 &&
                sizeof(hw_wall_lod[0]) == 4 && HW_LOD_P4_CZ == 10 && sizeof(wall_zlight_cmdcolr_LUT[0]) == 256 &&
-               HW_NEAR_Z == 0x40000 && CMDBUF_M_CAP == 1280 && sizeof(vdp1_cmd_t) == 32 &&
+               HW_NEAR_Z == 0x40000 && CMDBUF_M_CAP == HW_ASM_M_CAP && sizeof(vdp1_cmd_t) == 32 &&
                sizeof(saturn_view_cy) == 4 && HW_VIEW_CX == 160 && HW_VIEW_W == 320 &&
                sizeof(hw_wall_coord_tmp[0]) == 4, "hw_asm_persp: data layout");
 static HW_NOINLINE HW_HOT_O2 int HW_IsStripOccluded_Slow(int s_px0, int s_px1, int coal_strips);
@@ -2115,7 +2139,7 @@ _Static_assert(offsetof(hw_wall_emit_ctx_t, top_overlap) == 5 && offsetof(hw_wal
                offsetof(hw_wall_emit_ctx_t, rows) == 90 && offsetof(hw_wall_emit_ctx_t, u_start) == 92 &&
                offsetof(hw_wall_emit_ctx_t, u_span) == 96 && offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104 &&
                offsetof(hw_trans_pillar_t, s) == 8 && offsetof(baked_seg_t, flags) == 3 &&
-               SEG_FLAG_UPPER == 2 && CMDBUF_M_CAP == 1280 && HW_VIEW_W == 320 && sizeof(vdp1_cmd_t) == 32,
+               SEG_FLAG_UPPER == 2 && CMDBUF_M_CAP == HW_ASM_M_CAP && HW_VIEW_W == 320 && sizeof(vdp1_cmd_t) == 32,
                "hw_asm_multiband: layout");
 const void *const hw_asm_multiband_ctx[6] = {
     hw_wall_coord_tmp, (const void *)HW_ExtrapolateMonoWallY, (const void *)HW_WallXYClamp_Slow,
@@ -2950,6 +2974,68 @@ static HW_NOINLINE HW_COLD_OS void HW_OccludeZeroHeightSeg(
 static HW_WFUSE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx(
     hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg);
 
+#if HW_DEFER_WALLS
+/* Pass 1: record the wall hw_wctx describes (ya*, overlaps set); pass 2
+ * (HW_EmitDeferredWalls, or the slave) emits it. Called from the C seg
+ * path and from hw_asm_walk's emitter callback (2026-11-24: before, only
+ * the C path recorded, so with the asm walk nothing was deferred).
+ * The texture is still uploaded HERE, in walk order: the cache builds a
+ * texture's mono/64 variants only while the arena has room, so uploading
+ * every wall after every flat (pass 2) left walls without variants -> up
+ * to ~40% more wall quads (tour9 E1M1 Zigzag 164 -> 227). Eviction only
+ * runs at the frame boundary, so the upload is still valid in pass 2. */
+static HW_NOINLINE void HW_DeferRecordWall(hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
+{
+    int tex_id = seg->tex_64;
+    if (tex_id != hw_defer_tex_seen)
+    {
+        int ttw, tth, tmono, t64;
+        extern int saturn_v1_wall_half_req;
+        hw_defer_tex_seen = tex_id;
+        /* this first load decides the copy like HW_LoadWallTexCtx_Miss
+         * does: a far wall gets the half-width copy (distance texture LOD,
+         * 2026-11-24 fix: without it every deferred texture loaded full) */
+        saturn_v1_wall_half_req = HW_WallTexFar(ctx);
+#if HW_SLAVE_WALLS
+        /* the optional wall copies HW_LoadWallTexCtx makes in pass 2 on
+         * the master: make them here, the slave's pass 2 can't */
+        int ts = HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
+        extern int saturn_v1_late_copy_armed;
+        if (__builtin_expect(saturn_v1_late_copy_armed && ts != 0 && ts != 0xFFFF && tmono == ts, 0))
+            Saturn_Vdp1_WallLateCopy(tex_id);
+#else
+        (void)HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
+#endif
+        saturn_v1_wall_half_req = 0;
+    }
+    hw_wall_rec_t *r = &hw_defer_rec[hw_defer_nrec++];
+    r->seg              = seg;
+    r->p0               = *ctx->p0;
+    r->p1               = *ctx->p1;
+    r->dz_top           = ctx->dz_top;
+    r->dz_bot           = ctx->dz_bot;
+    r->u_start          = ctx->u_start;
+    r->u_span           = ctx->u_span;
+    r->inv_u_span       = ctx->inv_u_span;
+    r->ya0              = ctx->ya0;
+    r->ya1              = ctx->ya1;
+    r->yb0              = ctx->yb0;
+    r->yb1              = ctx->yb1;
+    r->seg_sx           = ctx->seg_sx;
+    r->seg_ex           = ctx->seg_ex;
+    r->ytop_min         = ctx->ytop_min;
+    r->ybot_max         = ctx->ybot_max;
+    r->wall_h           = ctx->wall_h;
+    r->cur_v            = ctx->cur_v;
+    r->top_overlap      = ctx->top_overlap;
+    r->bot_overlap      = ctx->bot_overlap;
+    r->was_near_clipped = ctx->was_near_clipped;
+    r->occl_state       = ctx->occl_state;
+    if (ctx->occl_state)
+        hw_defer_need_snap = 1;
+}
+#endif
+
 static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     const baked_seg_t *seg)
 {
@@ -3099,61 +3185,6 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     if (__builtin_expect((ya0 < -8 && yb0 < -8) || (ya1 > HW_VIEW_H + 8 && yb1 > HW_VIEW_H + 8), 0))
         saturn_cmd_m_needs_ytrim = 1;
 
-#if HW_DEFER_WALLS
-    if (hw_defer_on)
-    {
-        /* Pass 1: record; HW_EmitDeferredWalls emits it (capacity checked
-         * per subsector in HW_RenderSubsector_Body).
-         * Still make sure the texture is uploaded HERE, in walk order: the
-         * cache builds a texture's mono/64 variants only while the arena has
-         * room, so uploading every wall after every flat (pass 2) left walls
-         * without variants -> up to ~40% more wall quads (tour9 E1M1
-         * Zigzag 164 -> 227). Eviction only runs at the frame boundary, so
-         * the upload is still valid in pass 2. */
-        if (tex_id != hw_defer_tex_seen)
-        {
-            int ttw, tth, tmono, t64;
-            hw_defer_tex_seen = tex_id;
-#if HW_SLAVE_WALLS
-            /* the optional wall copies HW_LoadWallTexCtx makes in pass 2 on
-             * the master: make them here, the slave's pass 2 can't */
-            int ts = HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
-            extern int saturn_v1_late_copy_armed;
-            if (__builtin_expect(saturn_v1_late_copy_armed && ts != 0 && ts != 0xFFFF && tmono == ts, 0))
-                Saturn_Vdp1_WallLateCopy(tex_id);
-#else
-            (void)HW_FastWallSrca(tex_id, &ttw, &tth, &tmono, &t64);
-#endif
-        }
-        hw_wall_rec_t *r = &hw_defer_rec[hw_defer_nrec++];
-        r->seg              = seg;
-        r->p0               = *ctx->p0;
-        r->p1               = *ctx->p1;
-        r->dz_top           = ctx->dz_top;
-        r->dz_bot           = ctx->dz_bot;
-        r->u_start          = ctx->u_start;
-        r->u_span           = ctx->u_span;
-        r->inv_u_span       = ctx->inv_u_span;
-        r->ya0              = (int16_t)ya0;
-        r->ya1              = (int16_t)ya1;
-        r->yb0              = (int16_t)yb0;
-        r->yb1              = (int16_t)yb1;
-        r->seg_sx           = ctx->seg_sx;
-        r->seg_ex           = ctx->seg_ex;
-        r->ytop_min         = ctx->ytop_min;
-        r->ybot_max         = ctx->ybot_max;
-        r->wall_h           = ctx->wall_h;
-        r->cur_v            = ctx->cur_v;
-        r->top_overlap      = (uint8_t)top_overlap;
-        r->bot_overlap      = (uint8_t)bot_overlap;
-        r->was_near_clipped = ctx->was_near_clipped;
-        r->occl_state       = ctx->occl_state;
-        if (ctx->occl_state)
-            hw_defer_need_snap = 1;
-        return;
-    }
-#endif
-
     ctx->seg         = seg;
     ctx->ya0         = (int16_t)ya0;
     ctx->ya1         = (int16_t)ya1;
@@ -3161,6 +3192,13 @@ static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitVisibleBakedSeg(
     ctx->yb1         = (int16_t)yb1;
     ctx->top_overlap = (uint8_t)top_overlap;
     ctx->bot_overlap = (uint8_t)bot_overlap;
+#if HW_DEFER_WALLS
+    if (hw_defer_on)
+    {
+        HW_DeferRecordWall(ctx, seg);
+        return;
+    }
+#endif
 #if HW_VIS_STATS
     /* size census (2026-11-17, distance-LOD study): [24] walls emitted
      * [25] width <= 2 px [26] width <= 4 [27] height <= 3 px (before the
@@ -3697,14 +3735,22 @@ static HW_NOINLINE HW_HOT_O2 void HW_WalkSubsectorBakedSegs(
 }
 
 #ifndef HW_ASM_WALK
-#define HW_ASM_WALK (HW_ASM && HW_ASM_SPANAP && !HW_DEFER_WALLS && !HW_VIS_STATS && !HW_WALL_TINY)
+#define HW_ASM_WALK (HW_ASM && HW_ASM_SPANAP && !HW_VIS_STATS && !HW_WALL_TINY)
+#endif
+/* Stage B1 (the walls emitted inside hw_asm_walk) writes saturn_cmd_m
+ * directly; with HW_DEFER_WALLS every wall goes through the C emitter
+ * instead, which records it for pass 2 (2026-11-24: the deferred / slave
+ * walls path keeps the asm walk). */
+#ifndef HW_ASM_EMIT
+#define HW_ASM_EMIT (!HW_DEFER_WALLS)
 #endif
 #if HW_ASM_WALK
 /* Compact rewrite stage A: seg walk + pillar projection/cull + the front of
  * HW_EmitVisibleBakedSeg in saturn_hw_asm.s (hw_asm_walk); layout there. */
 extern void hw_asm_walk(const baked_seg_t *seg, const baked_seg_t *seg_end,
                         const saturn_wl_pillar_t *pillars, const void *const *ctx);
-_Static_assert(!HW_DEFER_WALLS && !HW_VIS_STATS && !HW_WALL_TINY, "hw_asm_walk: default build only");
+_Static_assert(!HW_VIS_STATS && !HW_WALL_TINY && !(HW_DEFER_WALLS && HW_ASM_EMIT),
+               "hw_asm_walk: no VIS_STATS / WALL_TINY; DEFER_WALLS needs HW_ASM_EMIT=0");
 _Static_assert(offsetof(hw_wall_emit_ctx_t, needs_near_clip) == 7 &&
                offsetof(hw_wall_emit_ctx_t, seg_sx) == 8 &&
                offsetof(hw_wall_emit_ctx_t, ya0) == 16 &&
@@ -3729,14 +3775,18 @@ _Static_assert(HW_FAR_Z == (1 << 30) && HW_VIEW_W == 320, "hw_asm_walk: constant
 
 static HW_NOINLINE HW_HOT_O2_NOTHREAD void HW_EmitWallFromCtx_Call(hw_wall_emit_ctx_t *ctx, const baked_seg_t *seg)
 {
+#if HW_DEFER_WALLS
+    if (hw_defer_on)
+    {
+        HW_DeferRecordWall(ctx, seg);
+        return;
+    }
+#endif
     HW_EmitWallFromCtx(ctx, seg);
 }
 
 /* Stage B1: one-band unclipped mono walls emitted inside hw_asm_walk
  * (layout in saturn_hw_asm.s at .Le_*); everything else -> C emitter. */
-#ifndef HW_ASM_EMIT
-#define HW_ASM_EMIT 1
-#endif
 _Static_assert(offsetof(hw_wall_emit_ctx_t, srca) == 24 && offsetof(hw_wall_emit_ctx_t, th) == 26 &&
                offsetof(hw_wall_emit_ctx_t, cur_tex_id) == 60 && offsetof(hw_wall_emit_ctx_t, tw) == 68 &&
                offsetof(hw_wall_emit_ctx_t, srca_mono) == 70 && offsetof(hw_wall_emit_ctx_t, srca_64) == 72 &&
@@ -3749,7 +3799,7 @@ _Static_assert(offsetof(hw_wall_emit_ctx_t, should_subdivide) == 64 && offsetof(
                offsetof(hw_wall_emit_ctx_t, q_xa) == 86 && offsetof(hw_wall_emit_ctx_t, q_xb) == 88 &&
                offsetof(hw_wall_emit_ctx_t, cmd_header1) == 104, "hw_asm_walk emitter: multi-band fields");
 _Static_assert(offsetof(baked_seg_t, baked_light) == 2 && offsetof(baked_seg_t, u_start) == 8 &&
-               offsetof(baked_seg_t, u_span) == 10 && sizeof(vdp1_cmd_t) == 32 && CMDBUF_M_CAP == 1280 &&
+               offsetof(baked_seg_t, u_span) == 10 && sizeof(vdp1_cmd_t) == 32 && CMDBUF_M_CAP == HW_ASM_M_CAP &&
                SEG_FLAG_STATIC == 0x40 && SEG_FLAG_MID == 0x08,
                "hw_asm_walk emitter: layout/constants");
 #if HW_ASM_EMIT
@@ -3901,7 +3951,27 @@ static HW_NOINLINE HW_COLD_OS int HW_V2PlanePunchProj(const hw_trans_pillar_t *p
     aliased_uint32_t *c = (aliased_uint32_t *)&saturn_cmd_m[m_cnt];
     uint32_t xa_p = (uint32_t)xa << 16, xb_p = (uint32_t)xb << 16;
     c[0] = 0x00040000u;                         /* polygon */
-    c[1] = 0x00C00000u;                         /* PMOD ECD|SPD (no user clip), COLR 0 = transparent */
+    /* PMOD ECD|SPD, COLR 0 = transparent; no user clip, except in HW_WALK2
+     * split frames, where it must stay in this walker's columns (window
+     * restored to them first) */
+    c[1] = 0x00C00000u;
+    if (hw_w_x0 > 0 || hw_w_x1 < HW_VIEW_W)
+    {
+        if (hw_wctx.last_clip_x0 != -1)
+        {
+            saturn_cmd_m_count = m_cnt;     /* the restore goes first */
+            HW_EmitUserClip(0, 0, HW_VIEW_W - 1, HW_VIEW_H - 1);
+            hw_wctx.last_clip_x0 = -1;
+            hw_wctx.last_clip_x1 = -1;
+            m_cnt = saturn_cmd_m_count;
+            if (m_cnt >= CMDBUF_M_CAP - 1)
+                return -1;
+            saturn_cmd_m_count = m_cnt + 1;
+            c = (aliased_uint32_t *)&saturn_cmd_m[m_cnt];
+            c[0] = 0x00040000u;
+        }
+        c[1] = 0x04C00000u;
+    }
     c[2] = 0;
     c[3] = xa_p | (uint16_t)ya;                 /* A: floor line left  */
     c[4] = xb_p | (uint16_t)yb;                 /* B: floor line right */
@@ -3965,12 +4035,13 @@ static void HW_V2PlaneAddSpan(int sp)
  * Subsector flag: any candidate. Unbaked portal flag: 1 = punch. */
 #define HW_V2P_NEAR_U  160
 #define HW_V2P_ENDS    256
-static uint8_t    *hw_v2p_segf = NULL;      /* zone (level) memory, read only for flagged subsectors */
-static uint8_t    *hw_v2p_portf = NULL;     /* [HW_MAX_PORTAL_SEGS], same zone block */
+/* (HW_WALK2: per-level, built by the master; the slave copy reads them) */
+HW_W2_SHARED(uint8_t *hw_v2p_segf, = NULL);      /* zone (level) memory, read only for flagged subsectors */
+HW_W2_SHARED(uint8_t *hw_v2p_portf, = NULL);     /* [HW_MAX_PORTAL_SEGS], same zone block */
 /* subsector has a candidate (fast RAM bitmap, tested inline by the body;
  * subsectors past the bitmap always take the call) */
-static uint8_t     hw_v2p_subbits[(HW_MAX_SUBSECTORS + 7) / 8];
-static unsigned    hw_v2p_key_gen = 0xFFFFFFFFu;
+HW_W2_SHARED(uint8_t hw_v2p_subbits[(HW_MAX_SUBSECTORS + 7) / 8], );
+HW_W2_SHARED(unsigned hw_v2p_key_gen, = 0xFFFFFFFFu);
 extern unsigned int saturn_level_gen;        /* g_game.c, ++ at every level load */
 
 #define HW_V2P_PLANE_SEC(s) (saturn_vdp2_plane_secmask[(unsigned)(s) & (SATURN_V2P_MAX_SECTORS - 1)])
@@ -3980,6 +4051,10 @@ static HW_NOINLINE HW_COLD_OS int HW_V2PlaneBuild(void)
     const int nseg = saturn_baked_wall_num_segs, nsub = saturn_baked_wall_num_subsectors;
     if (hw_v2p_key_gen == saturn_level_gen)
         return hw_v2p_segf != NULL;
+#ifdef HW_WALK2_TU
+    (void)nseg; (void)nsub;
+    return 0;       /* the master builds them (zone memory): no punch until then */
+#endif
     hw_v2p_key_gen = saturn_level_gen;
     D_memset(hw_v2p_subbits, 0, sizeof(hw_v2p_subbits));
     /* one level block: seg flags | portal flags | endpoint scratch (static
@@ -4344,6 +4419,43 @@ static void HW_EmitDeferredRange(int lo, int hi)
     hw_solid_count   = live_count;
 }
 
+/* Between frames (queue empty): after the level's first frames, when every
+ * one-time High WRAM allocation (tags, HUD, sky, snapshots) has been made,
+ * move the queue into what the Jo heap has left. Each part moves on its
+ * own; what doesn't fit stays in Low WRAM. */
+static void HW_DeferTryHigh(void)
+{
+#if HW_DEFER_HIGH && HW_DEFER_WALLS && !defined(SATURN_WIN32)
+    static int frames = 0;      /* jo_malloc_with_behaviour: jo/malloc.h */
+    if (frames < 0 || ++frames < 8)
+        return;
+    frames = -1;
+    static const uint16_t rec_try[] = { 192, 176, 160, 144, 128, 96 };
+    for (unsigned k = 0; k < sizeof(rec_try) / sizeof(rec_try[0]); k++)
+    {
+        void *p = jo_malloc_with_behaviour(rec_try[k] * (unsigned)sizeof(hw_wall_rec_t) + 15u, 0);
+        if (p)
+        {
+            hw_defer_rec     = (hw_wall_rec_t *)(((uintptr_t)p + 15u) & ~(uintptr_t)15u);
+            hw_defer_rec_cap = rec_try[k];
+            break;
+        }
+    }
+    void *p = jo_malloc_with_behaviour(HW_DEFER_H_SNAP_CAP * (unsigned)sizeof(hw_solid_snap_t) + 15u, 0);
+    if (p)
+    {
+        hw_defer_snap     = (hw_solid_snap_t *)(((uintptr_t)p + 15u) & ~(uintptr_t)15u);
+        hw_defer_snap_cap = HW_DEFER_H_SNAP_CAP;
+    }
+    p = jo_malloc_with_behaviour(HW_DEFER_H_SUB_CAP * (unsigned)sizeof(hw_wall_sub_t) + 15u, 0);
+    if (p)
+    {
+        hw_defer_sub     = (hw_wall_sub_t *)(((uintptr_t)p + 15u) & ~(uintptr_t)15u);
+        hw_defer_sub_cap = HW_DEFER_H_SUB_CAP;
+    }
+#endif
+}
+
 #if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
 /* ---- pass 2 shared with the slave (master side) ---- */
 static int hw_sw_on    = 0;     /* the slave takes deferred walls this frame */
@@ -4407,6 +4519,7 @@ static void HW_SlaveWalls_Finish(void)
     hw_defer_nsub = 0;
     hw_defer_nrec = 0;
     hw_defer_nsnap = 0;
+    HW_DeferTryHigh();
 }
 #else
 static void HW_SlaveWalls_BeginFrame(int enabled) { (void)enabled; }
@@ -4433,7 +4546,7 @@ static void HW_DeferCloseSub(int visit_idx, int subnum, int rec_first,
     h->snap        = -1;
     if ((hw_defer_need_snap || HW_DEFER_ALWAYS_SNAP) && hw_solid_count > 0)
     {
-        if (hw_defer_nsnap >= HW_DEFER_SNAP_CAP)
+        if (hw_defer_nsnap >= hw_defer_snap_cap)
         {
             HW_EmitDeferredSub(h);          /* live mask is this subsector's */
             hw_defer_nrec = rec_first;
@@ -4469,6 +4582,14 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredWalls(void)
     int nsub = 0;
 #else
     int nsub = hw_defer_nsub;
+#endif
+#ifdef HW_DEFER_PEAK    /* measurement: queue high-water marks (read with sdbg m) */
+    {
+        extern volatile int hw_defer_peak[3];
+        if (hw_defer_nrec  > hw_defer_peak[0]) hw_defer_peak[0] = hw_defer_nrec;
+        if (hw_defer_nsub  > hw_defer_peak[1]) hw_defer_peak[1] = hw_defer_nsub;
+        if (hw_defer_nsnap > hw_defer_peak[2]) hw_defer_peak[2] = hw_defer_nsnap;
+    }
 #endif
 #if HW_SLAVE_WALLS && !defined(SATURN_WIN32)
     if (hw_sw_on)
@@ -4512,8 +4633,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredWalls(void)
     hw_defer_nsub = 0;
     hw_defer_nrec = 0;
     hw_defer_nsnap = 0;
+    HW_DeferTryHigh();
 }
 #endif /* !HW_SLAVE_TU */
+
+#if defined(HW_DEFER_PEAK) && !defined(HW_SLAVE_TU)
+volatile int hw_defer_peak[3] = { 0, 0, 0 };
+#endif
 
 #if defined(HW_SLAVE_TU) && !defined(SATURN_WIN32)
 /* ---- pass 2 shared with the master (slave side, saturn_hw_slave_walls.c).
@@ -4522,9 +4648,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_EmitDeferredWalls(void)
 static int hw_sw_gen    = 0x7FFFFFFF;  /* last frame generation seen (never a 16-bit value) */
 static int hw_sw_next   = 0;           /* next item from the front */
 static int hw_sw_active = 0;           /* still taking items this frame */
-static hw_wall_rec_t   hw_sw_rec;      /* private copies (not on the small stack) */
-static hw_wall_sub_t   hw_sw_sub;
-static hw_solid_snap_t hw_sw_snap;
+static __attribute__((unused)) hw_wall_rec_t   hw_sw_rec;      /* private copies (not on the small stack) */
+static __attribute__((unused)) hw_wall_sub_t   hw_sw_sub;
+static __attribute__((unused)) hw_solid_snap_t hw_sw_snap;
 
 /* SH-2 cache-through alias (bit 29), valid for High and Low WRAM alike;
  * SATURN_WRAM_H_UNCACHED (0x26000000) is right for High WRAM only. */
@@ -4538,7 +4664,7 @@ static void HW_SW_Read32(void *dst, uint32_t src, int bytes)
         *d++ = *s++;
 }
 
-static void HW_SW_Read16(void *dst, uint32_t src, int bytes)
+static __attribute__((unused)) void HW_SW_Read16(void *dst, uint32_t src, int bytes)
 {
     const volatile uint16_t *s = (const volatile uint16_t *)(src | HW_SW_THRU);
     uint16_t *d = (uint16_t *)dst;
@@ -4546,9 +4672,31 @@ static void HW_SW_Read16(void *dst, uint32_t src, int bytes)
         *d++ = *s++;
 }
 
+/* Cached queue reads (2026-11-24): a header, its snapshot and its records
+ * are complete before the master publishes the header (ready), are never
+ * rewritten in the frame, and each starts and ends on a cache line, so no
+ * line the slave fetches can hold an older copy of them (the cache is
+ * purged at each new generation). */
+#ifndef HW_SW_CACHED_Q
+#define HW_SW_CACHED_Q 1
+#endif
+
 static HW_NOINLINE HW_HOT_O2 void HW_SlaveEmitSub(volatile hw_wall_ipc_t *w, int j)
 {
     hw_wall_emit_ctx_t *ctx = &hw_wctx;
+#if HW_SW_CACHED_Q
+    const hw_wall_sub_t *h = (const hw_wall_sub_t *)(uintptr_t)(w->subs + (uint32_t)j * sizeof(hw_wall_sub_t));
+    if (h->snap >= 0)
+    {
+        const hw_solid_snap_t *sn = (const hw_solid_snap_t *)(uintptr_t)
+            (w->snaps + (uint32_t)h->snap * sizeof(hw_solid_snap_t));
+        for (int k = 0; k < HW_SOLID_WORDS; k++)
+            hw_solid_mask[k] = sn->mask[k];
+        hw_solid_summary = sn->summary;
+        hw_solid_any     = sn->any;
+        hw_solid_count   = sn->count;
+    }
+#else
     hw_wall_sub_t *h = &hw_sw_sub;
     HW_SW_Read16(h, w->subs + (uint32_t)j * sizeof(hw_wall_sub_t), (int)sizeof(hw_wall_sub_t));
     if (h->snap >= 0)
@@ -4561,6 +4709,7 @@ static HW_NOINLINE HW_HOT_O2 void HW_SlaveEmitSub(volatile hw_wall_ipc_t *w, int
         hw_solid_any     = hw_sw_snap.any;
         hw_solid_count   = hw_sw_snap.count;
     }
+#endif
     else
     {
         hw_solid_count = 0;
@@ -4574,8 +4723,12 @@ static HW_NOINLINE HW_HOT_O2 void HW_SlaveEmitSub(volatile hw_wall_ipc_t *w, int
     uint32_t rsrc = w->recs + (uint32_t)h->rec_first * sizeof(hw_wall_rec_t);
     for (int k = 0; k < (int)h->rec_count; k++, rsrc += sizeof(hw_wall_rec_t))
     {
+#if HW_SW_CACHED_Q
+        HW_EmitDeferredRec(ctx, (const hw_wall_rec_t *)(uintptr_t)rsrc);
+#else
         HW_SW_Read32(&hw_sw_rec, rsrc, (int)sizeof(hw_wall_rec_t));
         HW_EmitDeferredRec(ctx, &hw_sw_rec);
+#endif
     }
     if (ctx->last_clip_x0 != -1)
     {

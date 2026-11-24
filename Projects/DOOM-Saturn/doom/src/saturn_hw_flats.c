@@ -158,6 +158,9 @@ static hw_slave_ipc_t hw_slave_ipc_hwram __attribute__((aligned(16)));
 /* HW_Slave_IsSpanOccluded defined below hw_flat_emit_ctx_t */
 
 static int saturn_master_flat_q = HW_SLAVE_FLAT_Q_CAP;
+/* slave only (HW_WALK2): cmd_s quads the split walk used this frame; the
+ * frame's first ring job starts after them */
+static int hw_w2_s_base = 0;
 #if HW_FLAT_STEAL
 typedef struct {
     uint32_t summary;      /* hw_solid_summary */
@@ -759,8 +762,10 @@ typedef struct {
 #ifdef SATURN_WIN32
 unsigned int saturn_warp_hits = 0, saturn_warp_fallbacks = 0;   /* emulator diagnostics */
 #endif
-static HW_ALIGN16 hw_warp_req_t hw_warp_req[2][HW_WARP_REQ_MAX];   /* [0] slave, [1] master */
-static volatile int hw_warp_req_n[2];
+/* (HW_WALK2: shared; the slave renderer copy queues into [0], free while
+ * the slave walks instead of taking flat jobs) */
+HW_W2_SHARED(HW_ALIGN16 hw_warp_req_t hw_warp_req[2][HW_WARP_REQ_MAX], );   /* [0] slave, [1] master */
+HW_W2_SHARED(volatile int hw_warp_req_n[2], );
 
 static HW_ALIGN16 hw_flat_emit_ctx_t hw_fctx_master;
 static uint32_t HW_WarpApply(hw_flat_emit_ctx_t *fctx, int q_local, fixed_t cz_min, int emit_floor, int emit_ceil, int prefetch);
@@ -878,7 +883,7 @@ unsigned int saturn_hw_flat_backings = 0;   /* backing polygons this frame (stat
  * at frame start from the previous frame's sky visibility (measured cost
  * when on, 5thPlanet E1M1 start: VDP1 draw 13.2 -> 15.6 ms, slave +2.4 ms
  * per field). Read by the slave through the uncached alias. */
-int hw_hole_backing_on = 0;
+HW_W2_SHARED(int hw_hole_backing_on, = 0);
 
 typedef struct {
     int de, de_inc, de_adj, de_cmp;
@@ -2327,7 +2332,8 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
             fctx->vcy       = (int)ipc->view_cy;
             fctx->cmd_s_out = saturn_cmd_s;
             fctx->qcap      = HW_SLAVE_FLAT_Q_CAP;
-            fctx->local_q   = 0;
+            fctx->local_q   = hw_w2_s_base;     /* 0, or after a split walk's floors */
+            hw_w2_s_base    = 0;
             fctx->solid_any     = 0;
             fctx->solid_summary = 0;
             fctx->proj_v        = hw_proj_verts_slave;
@@ -3098,12 +3104,40 @@ static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
 
     hw_fctx_slave.cache_gen = ipc->job_done;
     hw_fctx_slave.local_q   = 0;
+#if HW_WALK2 && !defined(HW_WALK2_TU)
+    /* split frames: the slave renders its columns with its renderer copy
+     * (saturn_hw_walk2.c); its walk time is compared with the master's FRT,
+     * so its own FRT runs at the same rate (phi/32) */
+    uint32_t w2_seen = HW_W2_MAIL->seq;
+    (*(volatile unsigned char *)0xFFFFFE16u) = 0x01u;
+#endif
 
+#if HW_WALK2 && !defined(HW_WALK2_TU)
+    /* A split walk starts before any of the frame's ring jobs (the master
+     * kicks it before submitting one): its floors fill cmd_s [0, n), and the
+     * frame's first ring job then starts the worker at n (hw_w2_s_base). */
+#define HW_W2_POLL()                                                       \
+    {                                                                      \
+        volatile hw_w2_mail_t *m_ = HW_W2_MAIL;                            \
+        uint32_t s_ = m_->seq;                                             \
+        if (s_ != w2_seen)                                                 \
+        {                                                                  \
+            w2_seen = s_;                                                  \
+            hw_w2_entry();          /* purges, renders, publishes */       \
+            hw_w2_s_base = m_->s_count;                                    \
+            m_->done = s_;                                                 \
+        }                                                                  \
+    }
+#else
+#define HW_W2_POLL() ((void)0)
+#endif
     while (1)
     {
+        HW_W2_POLL();
         /* Pure lockless SPSC spin-wait with 64-cycle in-register bus yield */
         while ((int)(head - ipc->job_tail) >= 0)
         {
+            HW_W2_POLL();
 #if HW_SLAVE_WALLS
             /* no flat job: emit a deferred wall subsector if one is queued */
             extern int HW_SlaveWallsService(void);
@@ -3151,11 +3185,13 @@ static HW_NOINLINE HW_HOT_O2 void HW_Slave_FlatWorker_Loop(void)
 }
 #endif
 
-#ifndef HW_SLAVE_TU     /* the slave-wall object needs only the types above */
+#if !defined(HW_SLAVE_TU) && !defined(HW_WALK2_TU)     /* the slave-wall object needs only the types above */
 void HW_Slave_FlatWorker(void)
 {
 #ifndef SATURN_WIN32
-#if HW_SLAVE_WALLS
+#if HW_WALK2 && !defined(SATURN_WIN32)
+#define HW_SLAVE_STACK_WORDS 1024     /* split frames run the whole walk here */
+#elif HW_SLAVE_WALLS
 #define HW_SLAVE_STACK_WORDS 640
 #else
 #define HW_SLAVE_STACK_WORDS 224
@@ -3364,7 +3400,11 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_WarpApply(hw_flat_emit_ctx_t *fctx, int
         else
             missing = 1;
         {
+#ifdef HW_WALK2_TU
+            const int r = 0;    /* the slave copy: the slave's queue */
+#else
             const int r = (fctx == &hw_fctx_master) ? 1 : 0;
+#endif
 #ifndef SATURN_WIN32
             volatile int *np = (volatile int *)((uintptr_t)&hw_warp_req_n[r] | (r ? 0u : SATURN_WRAM_H_UNCACHED));
             hw_warp_req_t *rq = (hw_warp_req_t *)((uintptr_t)hw_warp_req[r] | (r ? 0u : SATURN_WRAM_H_UNCACHED));
@@ -3835,7 +3875,7 @@ _Static_assert(offsetof(hw_slave_ipc_t, job_tail) == 32 && offsetof(hw_slave_ipc
                offsetof(hw_slave_ipc_t, jobs) == 64 && sizeof(hw_flat_job_t) == 96 && HW_JOB_RING == 256 &&
                HW_SOLID_WORDS == 11 && HW_JOB_ALT_SRCA_WORD == 22 && HW_JOB_AVG_WORD == 23 &&
                sizeof(hw_steal_snap_t) == 52 && HW_STEAL_SNAPS == 64 && HW_SPLIT_MIN_Q == 96 &&
-               HW_MAX_DEF_FLAT_JOBS == 4 && CMDBUF_S_CAP == 1024, "hw_asm_flatsub: ring layout");
+               HW_MAX_DEF_FLAT_JOBS == 4 && CMDBUF_S_CAP == HW_ASM_S_CAP, "hw_asm_flatsub: ring layout");
 _Static_assert(offsetof(hw_sub_flat_info_t, q_count) == 4 && offsetof(hw_sub_flat_info_t, lod1_q_first) == 8 &&
                offsetof(hw_sub_flat_info_t, lod1_v_count) == 14 && sizeof(saturn_flat_vert_t) == 4 &&
                sizeof(saturn_flat_quad_idx_t) == 8 && sizeof(saturn_flat_bbox_t) == 8 &&
@@ -4094,6 +4134,7 @@ static HW_NOINLINE void HW_StealFlatJobs(volatile hw_slave_ipc_t *ipc)
             break;
         }
         saturn_hw_steal_why[7]++;
+        HW_W2_SERVE();              /* a split walk's request first (HW_WALK2) */
         HW_StealRun(ipc, kk);
         saturn_hw_steal_jobs++;
         k = kk;

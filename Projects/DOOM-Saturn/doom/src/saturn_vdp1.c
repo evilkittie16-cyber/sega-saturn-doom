@@ -198,6 +198,7 @@ static void v1w_table_try_alloc(void);
  * srca 0 = not resident; V1_TAG_BAD = known-unusable (don't retry). */
 v1_tag_t *saturn_v1_flat_tags = NULL;
 v1_tag_t *saturn_v1_wall_tags = NULL;
+v1_tag_t *saturn_v1_spr_tags  = NULL;   /* HW_WALK2: the slave's sprite lookups */
 
 #define V1_TAG_BAD 0xFFFFu      /* never a real SRCA: starts are 32-B aligned */
 
@@ -1062,6 +1063,7 @@ static void v1_tags_try_alloc(void)
     v1_tag_warp0 = v1_tag_spr0 + (int)numsprites;
     saturn_v1_flat_tags = &v1_tag[0][v1_tag_flat0];
     saturn_v1_wall_tags = &v1_tag[0][0];
+    saturn_v1_spr_tags  = &v1_tag[0][v1_tag_spr0];
     D_memset(v1_tag[0], 0, bytes);
     v1_page_flush[0] = v1_page_flush[1] = 1;
 }
@@ -2302,6 +2304,12 @@ short Saturn_Vdp1Wall_Q(int n, int f)
  * latch saturn_v1w_captured — sprite refuses must never disarm the
  * walk's wall capture for the frame; the caller keeps the sprite in
  * software instead. Returns 1 = quad stored, 0 = keep software. */
+/* HW_WALK2: the slave renderer's sprite texture requests (master side) */
+int Saturn_Vdp1_SprSrca(int scache, int *pw, int *h)
+{
+    return v1_spr_get(scache, pw, h);
+}
+
 int Saturn_Vdp1Spr_Add(int scache, int xA, int xB, int yt, int yb,
                        int srcrow, int rows, int shade, int mark)
 {
@@ -3084,10 +3092,26 @@ int Saturn_Vdp1_GetWarpSrca(int quad, int is_ceil, int flatnum, int lv,
  * per flat from its raw texels (no palette needed; a real texture colour
  * blends in where a hole lets it show). Master only. */
 #define V1_FLAT_AVG_MAX 1024
+static unsigned char v1_flat_avg[V1_FLAT_AVG_MAX];
+static unsigned char v1_flat_avg_have[V1_FLAT_AVG_MAX];
+
+/* HW_WALK2: the slave renderer's lookup - the colour if already computed,
+ * else -1 (the slave then asks the master). Read only. */
+int Saturn_Vdp1_FlatAvgPeek(int flatnum)
+{
+    int f;
+    if (flatnum < 0 || flatnum >= (int)numflats)
+        return 0;
+    f = flattranslation ? (int)flattranslation[flatnum] : flatnum;
+    if (f < 0 || f >= (int)numflats || f >= V1_FLAT_AVG_MAX)
+        return 0;
+    return v1_flat_avg_have[f] ? (int)v1_flat_avg[f] : -1;
+}
+
 int Saturn_Vdp1_FlatAvgColor(int flatnum)
 {
-    static unsigned char avg[V1_FLAT_AVG_MAX];
-    static unsigned char have[V1_FLAT_AVG_MAX];
+#define avg  v1_flat_avg
+#define have v1_flat_avg_have
     static unsigned short hist[256];
     int f, i, best;
     const byte *src;
@@ -3113,6 +3137,8 @@ int Saturn_Vdp1_FlatAvgColor(int flatnum)
     avg[f] = (unsigned char)best;
     have[f] = 1;
     return best;
+#undef avg
+#undef have
 }
 
 void Saturn_Vdp1_ClearPages(void)

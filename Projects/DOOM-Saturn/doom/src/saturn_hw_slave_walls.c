@@ -18,6 +18,9 @@
 #if defined(HW_SLAVE_WALLS) && HW_SLAVE_WALLS && !defined(SATURN_WIN32)
 
 #define HW_SLAVE_TU 1
+/* the asm kernels address the master's lists and state through their
+ * context tables: this copy uses the C emitters */
+#define HW_ASM 0
 
 #include "saturn_cmdbuf.h"
 #include "saturn_vdp1.h"

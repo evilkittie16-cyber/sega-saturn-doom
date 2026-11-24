@@ -9,6 +9,19 @@
 ! mapping byte -> sign-extended 32-bit keeps unsigned order, so no extu.b
 ! is needed inside loops.
 
+! Command-list capacities (saturn_cmdbuf.h CMDBUF_M_CAP / CMDBUF_S_CAP /
+! CMDBUF_MAX_VISIT). The slave renderer copy (HW_WALK2, saturn_hw_walk2.c)
+! assembles this file again with its smaller limits (makefile --defsym).
+	.ifndef HW_CMDM_CAP
+	.set	HW_CMDM_CAP, 1280
+	.endif
+	.ifndef HW_CMDS_CAP
+	.set	HW_CMDS_CAP, 1024
+	.endif
+	.ifndef HW_VISIT_CAP
+	.set	HW_VISIT_CAP, 384
+	.endif
+
 	.section .text
 	.align	4
 
@@ -1624,8 +1637,8 @@ _hw_asm_walk:
 	mov.w	@r0,r0
 	extu.w	r0,r0			! m_cnt
 	add	#16,r0
-	mov	#5,r4
-	shll8	r4			! CMDBUF_M_CAP 1280
+	mov	#(HW_CMDM_CAP/256),r4
+	shll8	r4			! CMDBUF_M_CAP
 	cmp/ge	r4,r0
 	bt	.Le_ret
 	mov	#76,r0
@@ -3182,7 +3195,7 @@ _hw_asm_lingen:
 .Ll_k1024:	.long	1024
 .Ll_k2047:	.long	2047
 .Ll_k320:	.long	320
-.Ll_k1279:	.long	1279
+.Ll_k1279:	.long	HW_CMDM_CAP-1
 .Ll_k20000:	.long	0x00020000
 .Ll_k10100:	.long	0x00010100
 .Ll_k10000:	.long	0x00010000
@@ -6159,7 +6172,7 @@ _hw_asm_subsector:
 	bt	.Lu_ret
 	mov.l	@(12,r8),r0
 	mov.l	@r0,r0			! saturn_visit_count
-	mov	#96,r1
+	mov	#(HW_VISIT_CAP/4),r1
 	shll2	r1			! CMDBUF_MAX_VISIT
 	cmp/ge	r1,r0
 	bt	.Lu_ret
@@ -6797,7 +6810,7 @@ _hw_asm_flatsub:
 	shll	r0
 	add	r0,r1
 	add	#8,r1
-	mov	#4,r0
+	mov	#(HW_CMDS_CAP/256),r0
 	shll8	r0			! CMDBUF_S_CAP
 	cmp/ge	r0,r1
 	bf	.Lfj_c
@@ -7494,7 +7507,7 @@ _hw_asm_multiband:
 .Lmb_k1023:	.word	1023
 .Lmb_k1024:	.word	1024
 .Lmb_k2047:	.word	2047
-.Lmb_k1279:	.word	1279
+.Lmb_k1279:	.word	HW_CMDM_CAP-1
 .Lmb_cy:	.long	_saturn_view_cy
 .Lmb_vh:	.long	_saturn_view_h
 .Lmb_ctx:	.long	_hw_asm_multiband_ctx
@@ -9217,7 +9230,7 @@ _hw_asm_persp:
 .Lp_1023:	.long	1023
 .Lp_320l:	.long	320
 .Lp_ff00:	.long	0x0000FF00
-.Lp_capm1:	.long	1279
+.Lp_capm1:	.long	HW_CMDM_CAP-1
 
 ! ===================================================================
 ! Stage K: hw_asm_unbp(ctx) = HW_RecordSubsectorUnbakedPortals

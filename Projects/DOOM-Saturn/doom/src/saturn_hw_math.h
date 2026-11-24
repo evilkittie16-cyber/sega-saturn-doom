@@ -810,13 +810,22 @@ HW_ALWAYS_INLINE int HW_FastLightRow(int lightlevel, int dist)
     return (int)HW_WallLightLevel(lightlevel, dist);
 }
 
-/* Fast emitter for VDP1 user clip area commands (CMD_USERCLIP = 0x0008). */
+/* Fast emitter for VDP1 user clip area commands (CMD_USERCLIP = 0x0008).
+ * HW_WALK2 split frames: the window stays inside this walker's columns
+ * [hw_w_x0, hw_w_x1) (the full view otherwise: no change); a window with
+ * nothing left goes off screen (x 400, beyond the displayed 352). */
 static HW_NOINLINE HW_COLD_OS void HW_EmitUserClip(int x0, int y0, int x1, int y1)
 {
     uint16_t cnt = saturn_cmd_m_count;
     if (cnt < CMDBUF_M_CAP)
     {
         int x_offset = (HW_MAX_SCREEN_W - saturn_view_w) >> 1;
+        if (x0 < hw_w_x0)
+            x0 = hw_w_x0;
+        if (x1 > hw_w_x1 - 1)
+            x1 = hw_w_x1 - 1;
+        if (x1 < x0)
+            x0 = x1 = 400 - x_offset;
         x0 += x_offset;
         x1 += x_offset;
         aliased_uint32_t *cmd32 = (aliased_uint32_t *)&saturn_cmd_m[cnt];

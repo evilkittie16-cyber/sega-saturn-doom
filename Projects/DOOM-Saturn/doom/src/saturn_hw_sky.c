@@ -234,6 +234,10 @@ void Saturn_HW_RenderInit(void)
     hw_sec_nb = NULL;
     hw_sec_dz_top = NULL;
     Saturn_CmdBuf_Init();
+#if HW_WALK2 && !defined(SATURN_WIN32)
+    hw_w2_init();               /* the slave renderer copy's buffers */
+    hw_w2_inited = 1;
+#endif
     Saturn_Vdp1_ClearPages();
 
     int s;

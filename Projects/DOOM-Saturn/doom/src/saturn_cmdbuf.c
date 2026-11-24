@@ -386,18 +386,56 @@ static inline uint32_t cmdbuf_quad_dda(const uint32_t *c32)
     return (uint32_t)inner * (uint32_t)outer;
 }
 
+/* HW_WALK2 split frame (saturn_hw_render.c): -1 = not split, else the
+ * column: the master's lists start at HW_W2_M_CAP / HW_W2_S_CAP /
+ * HW_W2_VISIT_CAP, the slave's (hw_w2_out_*) at 0 in the same buffers. */
+extern int saturn_w2_split_x;
+extern int hw_w2_out_m, hw_w2_out_s, hw_w2_out_v;
+#include "saturn_hw_walk2.h"
+#if !HW_WALK2 || defined(SATURN_WIN32)
+int saturn_w2_split_x = -1;
+int hw_w2_out_m, hw_w2_out_s, hw_w2_out_v;
+#endif
+
 CMDBUF_HOT_O2 void Saturn_CmdBuf_CullOccluded(void)
 {
     extern int saturn_view_w;
     extern int saturn_view_h;
     uint32_t m_count = saturn_cmd_m_count;
+    const int split = (saturn_w2_split_x >= 0);
+#ifndef SATURN_WIN32
+    if (split)
+    {
+        /* the slave wrote the bottom of the lists: purge before reading them */
+        extern void _hw_purge_cache(void);
+        ((void (*)(void))((uintptr_t)_hw_purge_cache | SATURN_WRAM_H_UNCACHED))();
+    }
+#endif
     if (__builtin_expect(saturn_cmd_m_needs_ytrim != 0, 0) &&
         m_count > 0 && saturn_view_w <= CMDBUF_VW && saturn_view_h <= CMDBUF_VH)
     {
-        /* Trim extreme off-screen vertical wall coordinates before purging L1 cache */
+        /* Trim extreme off-screen vertical wall coordinates before purging L1 cache
+         * (split frame: the slave's part [0, out_m), then the master's) */
         uint32_t *c32 = (uint32_t *)saturn_cmd_m;
         uint32_t *m_end = c32 + (m_count << 3);
-        for (; c32 != m_end; c32 += 8)
+#if HW_WALK2 && !defined(SATURN_WIN32)
+        if (split)
+        {
+            uint32_t *s_end = c32 + ((uint32_t)hw_w2_out_m << 3);
+            for (; c32 != s_end; c32 += 8)
+            {
+                uint32_t ctrl = c32[0] >> 16;
+                if ((ctrl & 0x802Fu) != 0x0002u)
+                    continue;
+                int yLt = CMD_YA(c32), yRt = CMD_YB(c32);
+                int yLb = CMD_YD(c32), yRb = CMD_YC(c32);
+                if ((yLt < -8 && yRt < -8) || (yLb > CMDBUF_VH + 8 && yRb > CMDBUF_VH + 8))
+                    Saturn_CmdBuf_TrimWallY(c32);
+            }
+            c32 = (uint32_t *)saturn_cmd_m + ((uint32_t)HW_W2_M_CAP << 3);
+        }
+#endif
+        for (; c32 < m_end; c32 += 8)
         {
             uint32_t ctrl = c32[0] >> 16;
             if ((ctrl & 0x802Fu) != 0x0002u)
@@ -521,6 +559,52 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     uint32_t flat_q = (uint32_t)saturn_hw_flat_quads;
     if (flat_q < (uint32_t)saturn_cmd_s_count)
         flat_q = (uint32_t)saturn_cmd_s_count;
+#if HW_WALK2 && !defined(SATURN_WIN32)
+    if (saturn_w2_split_x >= 0)
+    {
+        /* HW_WALK2 split frame: the master's half [0, x) and the slave's
+         * half [x, vw), each behind a user clip of its columns (every
+         * drawing command uses the user clip; the walls' own clips stay
+         * inside their walker's columns). Each half far-to-near; the halves
+         * never overlap, so their order does not matter. */
+        extern int saturn_v1w_slotdrop;
+        const int sx = saturn_w2_split_x;
+        int i;
+        saturn_v1w_slotdrop = 0;
+        if (sx > 0 && vram32 + 8 <= vram_limit)
+        {
+            v1_write_userclip((volatile uint32_t *)vram32, x_offset, 0, x_offset + sx - 1, clip_y1);
+            vram32 += 8;
+            for (i = saturn_visit_count - 1; i >= HW_W2_VISIT_CAP; i--)
+            {
+                const sub_range_t *r = &ranges[i];
+                if (r->s_count > 0)
+                    vram32 = deliver_range_32(vram32, vram_limit, cmd_s_base + ((uint32_t)r->s_start << 3), r->s_count);
+                if (r->m_count > 0)
+                    vram32 = deliver_range_32(vram32, vram_limit, cmd_m + ((uint32_t)r->m_start << 3), r->m_count);
+            }
+        }
+        if (vram32 + 8 <= vram_limit)
+        {
+            v1_write_userclip((volatile uint32_t *)vram32, x_offset + sx, 0, x_offset + vw - 1, clip_y1);
+            vram32 += 8;
+            for (i = hw_w2_out_v - 1; i >= 0; i--)
+            {
+                const sub_range_t *r = &ranges[i];
+                if (r->s_count > 0)
+                    vram32 = deliver_range_32(vram32, vram_limit, cmd_s_base + ((uint32_t)r->s_start << 3), r->s_count);
+                if (r->m_count > 0)
+                    vram32 = deliver_range_32(vram32, vram_limit, cmd_m + ((uint32_t)r->m_start << 3), r->m_count);
+            }
+        }
+        if (vram32 + 8 <= vram_limit)      /* full view again for the weapon */
+        {
+            v1_write_userclip((volatile uint32_t *)vram32, x_offset, 0, (vw - 1) + x_offset, clip_y1);
+            vram32 += 8;
+        }
+    }
+    else
+#endif
     if (__builtin_expect((uint32_t)saturn_cmd_m_count + (uint32_t)saturn_cmd_sw_count +
                          flat_q + (uint32_t)saturn_cmd_w_count <= fit_slots, 1))
     {
