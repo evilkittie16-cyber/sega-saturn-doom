@@ -100,6 +100,14 @@ static void boot_report(void)
 void    jo_main(void)
 {
     (void)boot_report;
+    /* 2026-11-25 (real HW): after the console's RESET button the VDP2 came
+     * up broken (white border, no status bar, striped NBG0, rolling) in
+     * every build; a power-on boot was always clean. jo_core_init() selects
+     * the 28.6 MHz clock (352 px) through the boot ROM's SYS_CHGSYSCK, and
+     * that clock change is what resets the VDPs - after a reset the console
+     * may still be on 28.6 MHz, so the change (and the reset) does not
+     * happen. Going to 26.8 MHz first makes jo's change a real one. */
+    JO_BIOS_CHANGE_SYSTEM_CLOCK(JO_BIOS_SYSTEM_CLOCK_320);
     jo_core_init(JO_COLOR_Black);
     jo_core_add_vblank_callback(boot_vbl_tick);
 
