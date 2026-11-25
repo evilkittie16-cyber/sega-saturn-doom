@@ -446,6 +446,13 @@ static int           saturn_fill_count = 0;
  * 15-60 s load screen. */
 static int           saturn_fill_block_count = 0;
 #define XRAM_BLOCK_BYTES (SATURN_CART_REC_OFF - IWAD_DIR_BYTES)
+/* HUD fill readout (2026-11-25, Saturn_FillStats): first hot-region
+ * offset, level loads seen, and the vblanks the last load spent in the
+ * blocking drain and in the XRAM slice. */
+static unsigned int  saturn_fill_hot_start  = 0;
+static int           saturn_fill_loads      = 0;
+static int           saturn_fill_block_vbls = 0;
+static int           saturn_fill_slice_vbls = 0;
 static int           saturn_fill_active = 0;
 
 /* Partial-copy cursor for the head fill entry: the drain reads at most
@@ -2257,6 +2264,7 @@ byte *I_WadBase(void)
     int pass;
     int npasses = cart_xram_bytes ? 4 : 3;
     unsigned int hot_start = cart_used_bytes;
+    saturn_fill_hot_start   = hot_start;
     saturn_fill_block_count = -1;   /* set below (XRAM) or after the loop */
     for (pass = 0; pass < npasses; pass++)
     {
@@ -2515,6 +2523,9 @@ void saturn_iwad_fill_drain_all(void)
 #ifndef XRAM_LOAD_SLICE_VBLS
 #define XRAM_LOAD_SLICE_VBLS 300   /* 5 s per level load */
 #endif
+    saturn_fill_block_vbls = (int)(saturn_vbl_count - v0);
+    saturn_fill_slice_vbls = 0;
+    saturn_fill_loads++;
     if (cart_xram_bytes)
     {
         unsigned int v1 = saturn_vbl_count;
@@ -2522,6 +2533,7 @@ void saturn_iwad_fill_drain_all(void)
         while (saturn_fill_active && saturn_fill_head < saturn_fill_count &&
                (int)(saturn_vbl_count - v1) < XRAM_LOAD_SLICE_VBLS)
             saturn_iwad_background_fill();
+        saturn_fill_slice_vbls = (int)(saturn_vbl_count - v1);
     }
     saturn_fill_boot_mode = 0;
     /* 2026-11-21: only switch the fill off when the queue really emptied;
@@ -2801,6 +2813,27 @@ int saturn_iwad_background_fill(void)
     if (saturn_fill_head >= saturn_fill_count && fill_part_left == 0)
         saturn_fill_active = 0;
     return entries;
+}
+
+/* HUD fill readout (saturn_hud.c row 3). filled/total = queue entries
+ * resident / queued (boot-synced entries count once the drain passes
+ * them); kb = KB of lump data resident; loads = level loads seen;
+ * block/slice = vblanks the last load spent in the blocking drain / the
+ * XRAM slice. */
+void Saturn_FillStats(int *filled, int *total, int *kb, int *loads,
+                      int *block_vbls, int *slice_vbls)
+{
+    unsigned int end;
+
+    end = (saturn_fill_head < saturn_fill_count)
+        ? saturn_fill_queue[saturn_fill_head].cart_off : cart_used_bytes;
+    *filled     = saturn_fill_head;
+    *total      = saturn_fill_count;
+    *kb         = (end > saturn_fill_hot_start)
+                ? (int)((end - saturn_fill_hot_start) >> 10) : 0;
+    *loads      = saturn_fill_loads;
+    *block_vbls = saturn_fill_block_vbls;
+    *slice_vbls = saturn_fill_slice_vbls;
 }
 
 /* ====== Hot-fill state (queue-indexed lookup) ====== */

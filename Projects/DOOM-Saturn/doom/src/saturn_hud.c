@@ -1244,6 +1244,36 @@ void Saturn_HUD_Draw(void)
                     dbg[dn] = 0;
                     hud_tiny(8, dbg_y + 8, 304, dbg);
                 }
+#ifndef SATURN_WIN32
+                /* Row 3 (2026-11-25): cart fill. X SAROO XRAM state (0 none,
+                 * 1 in use, 31-40 failed check), L lumps resident / queued,
+                 * K KB resident, N level loads, T vblanks the last load
+                 * spent in the blocking drain / in the XRAM fill slice. */
+                if (dbg_y + 16 + 6 <= 224)
+                {
+                    extern int  saturn_cart_xram_state;
+                    extern void Saturn_FillStats(int *, int *, int *, int *, int *, int *);
+                    int f_done, f_tot, f_kb, f_loads, f_blk, f_slc;
+
+                    Saturn_FillStats(&f_done, &f_tot, &f_kb, &f_loads, &f_blk, &f_slc);
+                    dn = 0;
+                    dn = hud_tiny_tag(dbg, dn, 'X', saturn_cart_xram_state);
+                    dbg[dn++] = ' ';
+                    dn = hud_tiny_tag(dbg, dn, 'L', f_done);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, f_tot);
+                    dbg[dn++] = ' ';
+                    dn = hud_tiny_tag(dbg, dn, 'K', f_kb);
+                    dbg[dn++] = ' ';
+                    dn = hud_tiny_tag(dbg, dn, 'N', f_loads);
+                    dbg[dn++] = ' ';
+                    dn = hud_tiny_tag(dbg, dn, 'T', f_blk);
+                    dbg[dn++] = '/';
+                    dn = hud_tiny_num(dbg, dn, f_slc);
+                    dbg[dn] = 0;
+                    hud_tiny(8, dbg_y + 16, 120, dbg);
+                }
+#endif
             }
         }
     }
