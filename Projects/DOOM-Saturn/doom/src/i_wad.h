@@ -81,6 +81,8 @@ extern int           saturn_cart_rw_point; /* 0 = passed; 1-3 = 16-bit probe, 7-
                                             * kept at that size; see Saturn_CartInit) */
 extern unsigned int  saturn_cart_base_addr;  /* 0x22400000 when the cart answered, 0 otherwise */
 extern int           saturn_cart_probe_failed; /* cart seen but not writable — CD-stream mode */
+extern int           saturn_cart_xram_state; /* SAROO XRAM: 0 = none/not eligible, 1 = 8 MB in use,
+                                              * 31-40 = found but failed a check (unused) */
 extern unsigned int  saturn_cart_size;       /* usable cart bytes for the hot-lump fill (0 = none;
                                               * 512 KB on a 1 MB cart: bank 0 only; the
                                               * march-verified size on a 4 MB cart, or

@@ -64,6 +64,15 @@ static void boot_report(void)
         boot_report_line(60, (saturn_cart_base_addr == 0x22400000u) ? "BASE-22400000"
                                                                     : "BASE-NONE");
         boot_report_line(44, "CART-WAD-MODE");
+        /* SAROO XRAM (i_wad.h): row 76, between SCU-DSP (68) and BOOTING (84) */
+        if (saturn_cart_xram_state == 1)
+            boot_report_line(76, "SAROO-XRAM-8MB");
+        else if (saturn_cart_xram_state != 0)
+        {
+            Saturn_Format(line, (int)sizeof(line), "SAROO-XRAM-FAIL-%d",
+                          saturn_cart_xram_state);
+            boot_report_line(76, line);
+        }
     }
     else if (saturn_cart_probe_failed)
     {

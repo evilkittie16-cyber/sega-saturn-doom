@@ -212,6 +212,23 @@ static int saturn_fill_boot_mode = 0;
 #define SATURN_CART_CLAMP_1MB 0
 #endif
 
+/* SAROO XRAM (2026-11-25): a SAROO in RAM-cart mode maps 8 MB more SDRAM
+ * right above the 4 MB cart, 0x22800000-0x22FFFFFF = cart offsets 4..12 MB,
+ * so every cart_base_ptr + offset access reaches it unchanged. Hardware-
+ * verified by RAMCART-Stress 1.3 test 11 (Sega timing, CD load on). The
+ * SAROO's own RAM (firmware, saves) is 0x22000000-0x223FFFFF, BELOW the
+ * cart base: nothing here ever addresses it. When XRAM is found and
+ * verified, the whole WAD is placed there (all lumps HOT, filled in the
+ * background) and the fill queue lives there too. -DSATURN_CART_XRAM=0
+ * turns detection off. */
+#ifndef SATURN_CART_XRAM
+#define SATURN_CART_XRAM 1
+#endif
+#define SAROO_ID_ADDR      ((volatile unsigned short *)0x25807000)
+#define SAROO_ID_WORD      0x5253u
+#define CART_XRAM_OFF      CART_RAM_SIZE_4M          /* cart base + 4 MB */
+#define CART_XRAM_SIZE     (8UL * 1024UL * 1024UL)
+
 /* COLD lumps get their on-disc offset biased with the top bit so the
  * dispatch shims can tell "cart-resident" from "CD-stream" without
  * relying on numeric-range overlap (a COLD lump at CD offset 0x1000
@@ -338,6 +355,14 @@ static unsigned int   cart_real_bytes  = 0;  /* r69: pre-clamp size â€” the
                                               * must not shrink with the
                                               * fill clamp */
 static int            cart_initialized = 0;
+static unsigned int   cart_xram_bytes  = 0;  /* verified SAROO XRAM above the
+                                              * 4 MB cart (0 = none) */
+
+/* SAROO XRAM probe result for the boot report: 0 = not a SAROO (or not
+ * eligible: no verified 4 MB cart, or detection built off), 1 = 8 MB in
+ * use, 31-40 = a SAROO whose XRAM failed a check (not used), see
+ * cart_xram_probe. */
+int            saturn_cart_xram_state = 0;
 
 /* Boot-probe results, reported on the boot screen by main.c. */
 unsigned char  saturn_cart_id_seen = 0;
@@ -405,9 +430,22 @@ typedef struct {
                                       * streaming MTEX loader); flats now come
                                       * first in pass 1, the cut entries are raw
                                       * patches/sprites the baked packs replace */
-static saturn_fill_t saturn_fill_queue[SATURN_FILL_QUEUE_MAX];
+static saturn_fill_t  saturn_fill_queue_bss[SATURN_FILL_QUEUE_MAX];
+/* The live queue: the BSS array above, or (SAROO XRAM) one entry per lump
+ * at the start of XRAM - a whole-WAD queue (2308 entries = 36 KB) does not
+ * fit the BSS. Cart memory is cache-through, so no coherency question. */
+static saturn_fill_t *saturn_fill_queue = saturn_fill_queue_bss;
+static int            saturn_fill_max   = SATURN_FILL_QUEUE_MAX;
 static int           saturn_fill_head = 0;
 static int           saturn_fill_count = 0;
+/* Entries the blocking level-load drain (saturn_iwad_fill_drain_all) waits
+ * for: the whole queue, except with SAROO XRAM, where only the first
+ * XRAM_BLOCK_BYTES of placements (the same priority order and about the
+ * same amount the 4 MB cart blocks on, so the first load takes no longer)
+ * - the rest of the WAD fills in the background during play instead of a
+ * 15-60 s load screen. */
+static int           saturn_fill_block_count = 0;
+#define XRAM_BLOCK_BYTES (SATURN_CART_REC_OFF - IWAD_DIR_BYTES)
 static int           saturn_fill_active = 0;
 
 /* Partial-copy cursor for the head fill entry: the drain reads at most
@@ -577,6 +615,43 @@ static int cart_quick_probe(unsigned long base)
     return (ok && *a == 0xC33C && *b == 0x3CC3);
 }
 
+/* SAROO XRAM probe (2026-11-25). Only called for a 4 MB cart (id 0x5C)
+ * that the size march verified in full AND that answered with no setup
+ * write (the SAROO does; an Action Replay needs the setup), so the CS2 ID
+ * read below never runs on a cart that is plainly not a SAROO. Mirrors
+ * RAMCART-Stress 1.3: the ID word, then write/verify and alias checks.
+ * Returns the saturn_cart_xram_state value: 0 = no SAROO ID, 1 = usable,
+ * 31-33 = 16-bit write/verify failed at start/middle/end, 34-36 = the
+ * same for 32-bit, 37 = XRAM is a copy of the 4 MB cart, 38-40 = XRAM
+ * repeats at 1/2/4 MB (smaller than 8 MB). Every probe restores what it
+ * wrote. Never touches 0x22000000-0x223FFFFF (the SAROO's own RAM). */
+static int cart_xram_probe(void)
+{
+    static const unsigned int steps[3] = {
+        1024u * 1024u, 2048u * 1024u, 4096u * 1024u
+    };
+    unsigned long x = saturn_cart_base_addr + CART_XRAM_OFF;
+    int           p, si;
+
+    if (*SAROO_ID_ADDR != SAROO_ID_WORD)
+        return 0;
+    p = probe_cart_mirror(x, (unsigned int)CART_XRAM_SIZE);
+    if (p)
+        return 30 + p;
+    if (!probe_cart_long((volatile unsigned long *)(x + 0u), 0xDEADBEEFUL))
+        return 34;
+    if (!probe_cart_long((volatile unsigned long *)(x + (CART_XRAM_SIZE >> 1)), 0xCAFEBABEUL))
+        return 35;
+    if (!probe_cart_long((volatile unsigned long *)(x + CART_XRAM_SIZE - 4u), 0x12345678UL))
+        return 36;
+    if (cart_aliases(saturn_cart_base_addr, (unsigned int)CART_XRAM_OFF))
+        return 37;
+    for (si = 0; si < 3; si++)
+        if (cart_aliases(x, steps[si]))
+            return 38 + si;
+    return 1;
+}
+
 int Saturn_CartInit(void)
 {
     /* 2026-11-23: the probe runs ONCE. Only success used to be remembered
@@ -586,6 +661,7 @@ int Saturn_CartInit(void)
     static int    cart_probed = 0;
     unsigned char cart_id;
     unsigned int  size;
+    int           cart_setup_written = 0;   /* the 0x257EFFFE/ASR0 setup ran */
 
     if (cart_initialized)
         return 1;
@@ -632,6 +708,7 @@ int Saturn_CartInit(void)
     if (cart_id == CART_ID_BYTE_1M || cart_id == 0x1A || cart_id == 0xDA ||
         !cart_quick_probe(CART_RAM_UNC))
     {
+        cart_setup_written = 1;
         *CART_INIT_ADDR = 0x0001;
         {
             volatile int d;
@@ -806,6 +883,20 @@ int Saturn_CartInit(void)
         }
 #endif
     }
+
+#if SATURN_CART_XRAM
+    /* SAROO XRAM: only on a fully verified 4 MB cart that needed no setup
+     * write (see cart_xram_probe). A failed probe just leaves it unused. */
+    if (cart_id == CART_ID_BYTE_4M && !cart_setup_written &&
+        saturn_cart_rw_ok && cart_real_bytes == (unsigned)CART_RAM_SIZE_4M)
+    {
+        saturn_cart_xram_state = cart_xram_probe();
+        if (saturn_cart_xram_state == 1)
+            cart_xram_bytes = (unsigned int)CART_XRAM_SIZE;
+    }
+#else
+    (void)cart_setup_written;
+#endif
     return 1;
 }
 
@@ -1450,8 +1541,9 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
      * cart_total_bytes: that one was the FILL clamp (1008 KB), so reads
      * into the Z zone at +2..4 MB (saturn_cd_big, zone copies) were
      * classed "not in cart" and their cart writes ran unprotected. */
+    /* 2026-11-25: + SAROO XRAM, contiguous above the 4 MB cart. */
     in_cart = cart_initialized && d >= cart_base_ptr
-              && d < cart_base_ptr + cart_real_bytes;
+              && d < cart_base_ptr + cart_real_bytes + cart_xram_bytes;
 
     /* r64: during the boot drain even this multi-sector path is gated
      * to the staged 1-sector loop (saturn_fill_boot_mode â€” see
@@ -2131,6 +2223,22 @@ byte *I_WadBase(void)
      * hot-cart capacity; those lumps just stream from CD instead. */
     if (hot_cap > SATURN_CART_REC_OFF)
         hot_cap = SATURN_CART_REC_OFF;
+    /* 2026-11-25 SAROO XRAM: the hot region moves to XRAM (cart offsets
+     * 4..12 MB), led by a one-entry-per-lump fill queue, and pass 3 below
+     * takes every remaining lump: the whole WAD becomes cart-resident as
+     * the background fill completes. The 4 MB cart keeps its directory,
+     * record slot, texture arena and Z zone exactly as before (its old
+     * 36 KB..512 KB hot region is left unused). */
+    if (cart_initialized && cart_xram_bytes)
+    {
+        unsigned int qbytes = (((unsigned)numlumps * (unsigned)sizeof(saturn_fill_t))
+                               + 2047u) & ~2047u;
+
+        saturn_fill_queue = (saturn_fill_t *)(cart_base_ptr + CART_XRAM_OFF);
+        saturn_fill_max   = numlumps;
+        cart_used_bytes   = (unsigned)CART_XRAM_OFF + qbytes;
+        hot_cap           = (unsigned)CART_XRAM_OFF + cart_xram_bytes;
+    }
     saturn_fill_head   = 0;
     saturn_fill_count  = 0;
     saturn_fill_active = cart_initialized ? 1 : 0;
@@ -2140,12 +2248,17 @@ byte *I_WadBase(void)
      * Pass 0: First-frame critical named lumps + first map block (THINGS..BLOCKMAP)
      * Pass 1: ALL flats (F_START..F_END) - critical for VDP1 floor/ceiling rendering
      * Pass 2: Patches and Sprites (remaining space under hot_cap and queue limit)
+     * Pass 3: (SAROO XRAM only) every other lump - later maps, sounds,
+     *         music, demos, the rest
      */
     uint8_t placed[512];
     memset(placed, 0, sizeof(placed));
 
     int pass;
-    for (pass = 0; pass < 3; pass++)
+    int npasses = cart_xram_bytes ? 4 : 3;
+    unsigned int hot_start = cart_used_bytes;
+    saturn_fill_block_count = -1;   /* set below (XRAM) or after the loop */
+    for (pass = 0; pass < npasses; pass++)
     {
         for (i = 0; i < numlumps; i++)
         {
@@ -2186,6 +2299,10 @@ byte *I_WadBase(void)
                     i > first_flat && i < last_flat)
                     is_hot = 1;
             }
+            else if (pass == 3)
+            {
+                is_hot = 1;                     /* XRAM: everything left */
+            }
             else /* pass == 2 */
             {
                 if (lump_is_named_hot(dir[i].name))
@@ -2207,13 +2324,20 @@ byte *I_WadBase(void)
             int          is_first_frame_critical = 0;
 
             cart_off = cart_used_bytes;
-            if (is_hot && lump_size > FILL_PREWARM_MAX)
+            /* the per-lump cap only protects the small 512 KB region; in
+             * XRAM the capacity check alone decides */
+            if (is_hot && lump_size > FILL_PREWARM_MAX && !cart_xram_bytes)
                 is_hot = 0;
 
             if (is_hot && lump_size > 0 && cart_initialized &&
                 cart_off + lump_size <= hot_cap &&
-                saturn_fill_count < SATURN_FILL_QUEUE_MAX)
+                saturn_fill_count < saturn_fill_max)
             {
+                /* XRAM: the blocking drain stops before the first entry
+                 * that crosses XRAM_BLOCK_BYTES of placements */
+                if (cart_xram_bytes && saturn_fill_block_count < 0 &&
+                    cart_off + lump_size - hot_start > (unsigned)XRAM_BLOCK_BYTES)
+                    saturn_fill_block_count = saturn_fill_count;
                 if (lump_name_eq(dir[i].name, "PLAYPAL")  ||
                     lump_name_eq(dir[i].name, "COLORMAP") ||
                     lump_name_eq(dir[i].name, "FONT1")    ||
@@ -2274,6 +2398,8 @@ byte *I_WadBase(void)
      * saturn_fill_remaining tracks count-head from the per-frame drain. */
     saturn_fill_total = saturn_fill_count;
     saturn_fill_remaining = saturn_fill_count;
+    if (saturn_fill_block_count < 0)
+        saturn_fill_block_count = saturn_fill_count;   /* block on all */
 
     /* Sub-stage marker: TEAL-GREEN = I_WadBase complete (directory
      * rewritten, fill queue armed). The next stages are Z_Init + player
@@ -2379,9 +2505,24 @@ void saturn_iwad_fill_drain_all(void)
 
     /* r64: boot-drain sync-only gate (see saturn_fill_boot_mode). */
     saturn_fill_boot_mode = 1;
-    while (saturn_fill_active && saturn_fill_head < saturn_fill_count &&
+    while (saturn_fill_active && saturn_fill_head < saturn_fill_block_count &&
            (int)(saturn_vbl_count - v0) < 60 * 60)
         saturn_iwad_background_fill();
+    /* SAROO XRAM: then up to XRAM_LOAD_SLICE_VBLS more of the whole-WAD
+     * queue behind this load screen - back-to-back reads keep the drive
+     * streaming, unlike in-game single sectors - so the WAD becomes
+     * resident over the first level loads at no in-game cost. */
+#ifndef XRAM_LOAD_SLICE_VBLS
+#define XRAM_LOAD_SLICE_VBLS 300   /* 5 s per level load */
+#endif
+    if (cart_xram_bytes)
+    {
+        unsigned int v1 = saturn_vbl_count;
+
+        while (saturn_fill_active && saturn_fill_head < saturn_fill_count &&
+               (int)(saturn_vbl_count - v1) < XRAM_LOAD_SLICE_VBLS)
+            saturn_iwad_background_fill();
+    }
     saturn_fill_boot_mode = 0;
     /* 2026-11-21: only switch the fill off when the queue really emptied;
      * after a watchdog timeout the leftovers stay queued for the in-game
@@ -2434,6 +2575,30 @@ int saturn_iwad_background_fill(void)
          * frame but the CD pipe stays saturated â€” minutes -> ~10-20 s. */
         extern volatile unsigned int saturn_vbl_count;
         unsigned int v0 = saturn_vbl_count;
+        /* 2026-11-25 SAROO XRAM: the in-game tail of a whole-WAD queue is
+         * megabytes, not the few leftover entries the 2-vblank budget was
+         * made for - at that budget it held retail E1M1 at 7.8 fps in
+         * 5thPlanet. In this "lazy" mode a frame does at most XRAM_LAZY_OPS
+         * steps (a batch landing, a batch issued, or one sync sector), so
+         * the fill trickles in at ~2 KB per frame while the game runs at
+         * its normal rate. Lumps not filled yet still stream from CD. */
+        int lazy = cart_xram_bytes && !saturn_fill_boot_mode &&
+                   saturn_fill_head >= saturn_fill_block_count;
+        int lazy_ops = 0;
+#define XRAM_LAZY_OPS 2
+        /* ...and even that costs too much: 5thPlanet E3M6 went 15.5 ->
+         * 5.2 fps, ~100 ms/frame in jo_cd_command - a lone sector read
+         * per frame pays the drive's seek/spin-up every time. So by
+         * default the XRAM tail is NOT filled during play at all; each
+         * level load drains another slice instead (fill_drain_all). */
+#ifndef SATURN_XRAM_INGAME_FILL
+#define SATURN_XRAM_INGAME_FILL 0
+#endif
+        if (lazy && !SATURN_XRAM_INGAME_FILL)
+        {
+            saturn_fill_remaining = 0;   /* no HUD fill strip during play */
+            return 0;
+        }
 
         while (bytes < FILL_FRAME_BYTES)
         {
@@ -2443,6 +2608,9 @@ int saturn_iwad_background_fill(void)
              * chunks only while inside the vblank budget. */
             if (copied && (int)(saturn_vbl_count - v0) >= FILL_BUDGET_VBLS)
                 break;
+            if (lazy && lazy_ops >= XRAM_LAZY_OPS)
+                break;
+            lazy_ops++;
 
         if (fill_part_left == 0)
         {
@@ -2590,6 +2758,8 @@ int saturn_iwad_background_fill(void)
              * synchronous, so the per-frame byte cap applies. */
             if (head && chunk > 2048u - head)
                 chunk = 2048u - head;
+            if (lazy && chunk > 2048u)
+                chunk = 2048u;      /* lazy: one sector of sync CD time */
             if (chunk > FILL_FRAME_BYTES - bytes)
                 chunk = FILL_FRAME_BYTES - bytes;
             if (chunk > FILL_CHUNK_BYTES)
