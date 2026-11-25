@@ -82,7 +82,8 @@ extern int           saturn_cart_rw_point; /* 0 = passed; 1-3 = 16-bit probe, 7-
 extern unsigned int  saturn_cart_base_addr;  /* 0x22400000 when the cart answered, 0 otherwise */
 extern int           saturn_cart_probe_failed; /* cart seen but not writable — CD-stream mode */
 extern unsigned int  saturn_cart_size;       /* usable cart bytes for the hot-lump fill (0 = none;
-                                              * 512 KB on a 1 MB cart: bank 0 only; at most
-                                              * 1008 KB on a 4 MB cart: the fill clamp) */
+                                              * 512 KB on a 1 MB cart: bank 0 only; the
+                                              * march-verified size on a 4 MB cart, or
+                                              * 1008 KB with -DSATURN_CART_CLAMP_1MB=1) */
 
 #endif /* __SATURN_I_WAD_H__ */

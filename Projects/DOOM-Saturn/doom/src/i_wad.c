@@ -207,6 +207,11 @@ static int saturn_fill_boot_mode = 0;
 #define CART_ZONE_OFF      0x00200000UL
 #define CART_ZONE_SIZE     0x00200000UL
 
+/* r69 1008 KB fill clamp: off since 2026-11-25 (see Saturn_CartInit). */
+#ifndef SATURN_CART_CLAMP_1MB
+#define SATURN_CART_CLAMP_1MB 0
+#endif
+
 /* COLD lumps get their on-disc offset biased with the top bit so the
  * dispatch shims can tell "cart-resident" from "CD-stream" without
  * relying on numeric-range overlap (a COLD lump at CD offset 0x1000
@@ -781,12 +786,15 @@ int Saturn_CartInit(void)
             }
         }
         /* r69 HARD CLAMP: r63-r67 froze at F~1000-1100 KB and the r68
-         * march saw the 1 MB point fail outright. Every cart write is
-         * held below 1008 KB â€” 16 KB of safety margin under the 1 MB
-         * line. The prewarm cap (hot_cap) follows cart_total_bytes, so
-         * surplus hot lumps demote to COLD/CD at arm time. Paint the
-         * clamp as the final breadcrumb â€” "C=01008" on screen = the
-         * clamp ran. */
+         * march saw the 1 MB point fail outright, so every fill write was
+         * held below 1008 KB. Those boots predate the Saroo FPGA update
+         * for Sega RAM-cart A-bus timings, the mirror check above and the
+         * verified cart writes (2026-11-24), and the Z zone at 2..4 MB
+         * worked all along. 2026-11-25: OFF by default - the march above
+         * is the only size limit now. Build with -DSATURN_CART_CLAMP_1MB=1
+         * to bring the old clamp (and the 1008 KB arena end) back.
+         * "C=01008" on screen = the clamp ran. */
+#if SATURN_CART_CLAMP_1MB
         if (cart_total_bytes > 1008u * 1024u)
         {
             char bc2[8];
@@ -796,6 +804,7 @@ int Saturn_CartInit(void)
             Saturn_Udec0(bc2 + 2, cart_total_bytes >> 10, 5);
             Saturn_StageText(8, 208, bc2);
         }
+#endif
     }
     return 1;
 }
@@ -811,9 +820,18 @@ int Saturn_CartPresent(void)
  * up to the 1008 KB clamp on real hardware, so this range is HW-proven and
  * now unused. saturn_tex.c places baked textures here when WRAM-L is full,
  * before falling back to the Z zone (E3M6: ~2.1 MB of level data would
- * not fit the 2 MB zone). Reset per level by the texture loader. */
+ * not fit the 2 MB zone). Reset per level by the texture loader.
+ * 2026-11-25: with the 1008 KB clamp off the arena runs up to the Z zone
+ * (512 KB .. 2 MB = 1.5 MB, was 496 KB); the 1008 KB..2 MB range was
+ * never used by anything. The guard below already requires the march to
+ * have verified the whole 4 MB (cart_real_bytes), so a smaller or
+ * mirroring cart never gets it. */
 #define CART_ARENA_OFF   0x00080000UL
+#if SATURN_CART_CLAMP_1MB
 #define CART_ARENA_END   (1008UL * 1024UL)
+#else
+#define CART_ARENA_END   CART_HOT_CAP
+#endif
 byte *Saturn_CartArena(unsigned int *size)
 {
     if (!cart_initialized || cart_real_bytes < (CART_HOT_CAP + CART_ZONE_SIZE) ||
@@ -1429,7 +1447,7 @@ static int saturn_copy_from_here(unsigned char *d, unsigned int within,
      * uncached â€” no SH-2 OC coherency question) when the cart exists.
      * Cached destinations (heap/BSS fallback) keep the staged path. */
     /* 2026-11-23: test against cart_real_bytes (the whole cart), not
-     * cart_total_bytes: that one is the FILL clamp (1008 KB), so reads
+     * cart_total_bytes: that one was the FILL clamp (1008 KB), so reads
      * into the Z zone at +2..4 MB (saturn_cd_big, zone copies) were
      * classed "not in cart" and their cart writes ran unprotected. */
     in_cart = cart_initialized && d >= cart_base_ptr
