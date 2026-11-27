@@ -113,6 +113,8 @@ void Saturn_CmdBuf_TrimWallY(uint32_t *c32);
 void Saturn_CmdBuf_CullOccluded(void);
 unsigned int Saturn_CmdBuf_ComputeDDA(void);
 void Saturn_CmdBuf_Deliver(void);
+int  Saturn_CmdBuf_DmaBusy(void);   /* SCU DMA delivery still running */
+void Saturn_CmdBuf_DmaWait(void);   /* wait for it (before touching cmd buffers / VDP1 VRAM) */
 void Saturn_VDP1_BurstCopy32(uint32_t **dst_ptr, const uint32_t **src_ptr);
 
 #endif /* __SATURN_CMDBUF_H__ */

@@ -1935,6 +1935,10 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     if (!I_VideoBuffer || numnodes <= 0 || numlines <= 0 || !player->mo)
         return;
 
+    /* last frame's SCU DMA command delivery (saturn_cmdbuf.c) must finish
+     * before frame-start texture work (warp service, evictions) and the
+     * command buffers are reused */
+    Saturn_CmdBuf_DmaWait();
     HW_Divlut_Init();
 #if SATURN_BENCH && !defined(SATURN_WIN32)
     {

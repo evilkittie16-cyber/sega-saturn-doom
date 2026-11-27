@@ -796,7 +796,10 @@ static void v1m_vblank(void)
             V2P_LIST_REDRAW();
         }
     }
-    if (v1m_pending && !v1m_writing && v1m_draw_done())
+    /* SCU DMA delivery (saturn_cmdbuf.c): the pending list may still be
+     * on its way into VRAM - change frames once it is complete */
+    extern int Saturn_CmdBuf_DmaBusy(void);
+    if (v1m_pending && !v1m_writing && v1m_draw_done() && !Saturn_CmdBuf_DmaBusy())
         v1m_request_change();
 }
 
@@ -2434,6 +2437,12 @@ static int s_mru_flat_srca = 0;
 
 void Saturn_Vdp1Wall_Reset(void)
 {
+    {
+        /* last frame's SCU DMA delivery must be complete before evictions
+         * scan the command tables or the buffers are refilled */
+        extern void Saturn_CmdBuf_DmaWait(void);
+        Saturn_CmdBuf_DmaWait();
+    }
     /* Arena double buffer (2026-10-05). VDP1 keeps re-rasterising the
      * LAST COMMITTED command list (every vblank, for as many vblanks as
      * the CPU frame takes), and that list references only the page it
@@ -3565,7 +3574,9 @@ void Saturn_Vdp1_Show2D(void)
 void Saturn_Vdp1_Enter2D(void)
 {
     extern int saturn_game_started;
+    extern void Saturn_CmdBuf_DmaWait(void);
 
+    Saturn_CmdBuf_DmaWait();            /* SCU DMA delivery of the last 3D list */
     saturn_game_started = 0;
     /* (saturn_vdp2_plane_active is no longer cleared here: that switched the
      * RBG0 floor off for good after a pause. 2D pages hide RBG0 through the

@@ -63,6 +63,121 @@ static void *cmdbuf_alloc_aligned32(int size)
     return (void *)(((uintptr_t)raw + 31u) & ~(uintptr_t)31u);
 }
 
+/* SCU DMA delivery (2026-11-27, user: "do both"). Saturn_CmdBuf_Deliver used
+ * to copy every command into VDP1 VRAM with the master CPU (2.0-2.9 ms of
+ * master time per frame in the E4 views, B-bus write bound). Now it builds an
+ * SCU indirect-mode table ({bytes, dst, src} per contiguous run, in WRAM-H)
+ * and starts SCU DMA level 1; the CPU goes on with the next frame's game
+ * logic. The frame change waits for the DMA (v1m_vblank), and the next frame
+ * waits for it before touching the command buffers or VDP1 VRAM
+ * (Saturn_CmdBuf_DmaWait at the start of rendering / 2D / blank lists).
+ * Level 1 (Jo's own VDP1 pipeline owns level 0): a table entry moves at most
+ * 4 KB, so long runs are split. hw_cmd_dma = 0 (pokeable) or -DHW_CMD_DMA=0
+ * restores the CPU copy. */
+#ifndef HW_CMD_DMA
+#define HW_CMD_DMA 1
+#endif
+#if HW_CMD_DMA && !defined(SATURN_WIN32)
+#define CMD_DMA_LEVEL    1
+#define CMD_DMA_BASE     (0x25FE0000u + CMD_DMA_LEVEL * 0x20u)
+#define CMD_DMA_REG(o)   (*(volatile uint32_t *)(CMD_DMA_BASE + (o)))
+#define CMD_DMA_STATUS   (*(volatile uint32_t *)0x25FE007Cu)
+#define CMD_DMA_BUSY_BIT (1u << (4 + CMD_DMA_LEVEL * 4))
+#define CMD_DMA_CHUNK    4064u                 /* <= 4096 (level 1/2 count), multiple of 32 */
+#define CMD_DMA_MAX_ENT  (CMDBUF_MAX_VISIT * 2 + 64)
+volatile int hw_cmd_dma = 1;                   /* runtime switch (pokeable) */
+unsigned int saturn_cmd_dma_entries = 0;       /* debug: table entries last frame */
+static uint32_t *cmd_dma_tab = NULL;           /* {bytes, dst, src} x CMD_DMA_MAX_ENT */
+static int       cmd_dma_n = 0;
+static int       cmd_dma_on = 0;
+static uint32_t  cmd_dma_next_src = 0;
+
+int Saturn_CmdBuf_DmaBusy(void)
+{
+    return (CMD_DMA_STATUS & CMD_DMA_BUSY_BIT) != 0;
+}
+
+void Saturn_CmdBuf_DmaWait(void)
+{
+    unsigned int guard = 4000000u;
+    while ((CMD_DMA_STATUS & CMD_DMA_BUSY_BIT) && --guard)
+        ;
+}
+
+/* Queue `count` commands from WRAM-H `src` to VRAM `dst` (dst is always the
+ * end of the previous run, so a run whose source continues the last entry's
+ * source just grows that entry). Returns the new VRAM write position. */
+static uint32_t *cmd_dma_add(uint32_t *dst, const uint32_t *src, int count)
+{
+    uint32_t bytes = (uint32_t)count << 5;
+    uint32_t s = (uint32_t)(uintptr_t)src, d = (uint32_t)(uintptr_t)dst;
+    /* SCU DMA reads only WRAM-H (not Low WRAM): anything else is CPU-copied */
+    const int dma_ok = (s & 0x07000000u) == 0x06000000u;
+    while (bytes)
+    {
+        uint32_t take;
+        if (!dma_ok)
+        {
+            const uint32_t *ps = (const uint32_t *)(uintptr_t)s;
+            uint32_t *pd = (uint32_t *)(uintptr_t)d;
+            for (uint32_t k = 0; k < (bytes >> 2); k++)
+                pd[k] = ps[k];
+            d += bytes;
+            break;
+        }
+        if (cmd_dma_n > 0 && s == cmd_dma_next_src && cmd_dma_tab[(cmd_dma_n - 1) * 3] < CMD_DMA_CHUNK)
+        {
+            uint32_t room = CMD_DMA_CHUNK - cmd_dma_tab[(cmd_dma_n - 1) * 3];
+            take = (bytes < room) ? bytes : room;
+            cmd_dma_tab[(cmd_dma_n - 1) * 3] += take;
+        }
+        else if (cmd_dma_n < CMD_DMA_MAX_ENT)
+        {
+            uint32_t *e = &cmd_dma_tab[cmd_dma_n * 3];
+            take = (bytes < CMD_DMA_CHUNK) ? bytes : CMD_DMA_CHUNK;
+            e[0] = take;
+            e[1] = d & 0x07FFFFFFu;
+            e[2] = s & 0x07FFFFFFu;
+            cmd_dma_n++;
+        }
+        else
+        {
+            /* table full (never seen): the CPU copies the rest; its VRAM
+             * area is disjoint from the DMA's, so order does not matter */
+            const uint32_t *ps = (const uint32_t *)(uintptr_t)s;
+            uint32_t *pd = (uint32_t *)(uintptr_t)d;
+            for (uint32_t k = 0; k < (bytes >> 2); k++)
+                pd[k] = ps[k];
+            d += bytes;
+            break;
+        }
+        s += take;
+        d += take;
+        bytes -= take;
+        cmd_dma_next_src = s;
+    }
+    return (uint32_t *)(uintptr_t)d;
+}
+
+static void cmd_dma_kick(void)
+{
+    saturn_cmd_dma_entries = (unsigned int)cmd_dma_n;
+    if (cmd_dma_n <= 0)
+        return;
+    cmd_dma_tab[(cmd_dma_n - 1) * 3 + 2] |= 0x80000000u;   /* last entry */
+    /* the table and the commands are in WRAM-H, written through the
+     * write-through cache: memory is current when the SCU reads it */
+    CMD_DMA_REG(0x10) = 0;                       /* DxEN off */
+    CMD_DMA_REG(0x04) = (uint32_t)(uintptr_t)cmd_dma_tab & 0x07FFFFFFu;   /* table */
+    CMD_DMA_REG(0x0C) = 0x101u;                  /* read +4, write +2 (B-bus) */
+    CMD_DMA_REG(0x14) = 0x01000007u;             /* indirect, start by DxEN go */
+    CMD_DMA_REG(0x10) = 0x101u;                  /* enable + go */
+}
+#else
+int  Saturn_CmdBuf_DmaBusy(void) { return 0; }
+void Saturn_CmdBuf_DmaWait(void) { }
+#endif
+
 void Saturn_CmdBuf_Init(void)
 {
     if (saturn_cmd_m != NULL)
@@ -84,6 +199,11 @@ void Saturn_CmdBuf_Init(void)
     saturn_sub_ranges = (sub_range_t *)cmdbuf_alloc_aligned32(CMDBUF_MAX_VISIT * (int)sizeof(sub_range_t));
     if (!saturn_sub_ranges)
         I_Error("Saturn_CmdBuf_Init: Failed to allocate sub_ranges in WRAM-H\n");
+
+#if HW_CMD_DMA && !defined(SATURN_WIN32)
+    /* no room: the CPU copy stays (cmd_dma_tab NULL) */
+    cmd_dma_tab = (uint32_t *)cmdbuf_alloc_aligned32(CMD_DMA_MAX_ENT * 12);
+#endif
 }
 
 void Saturn_CmdBuf_Reset(void)
@@ -202,6 +322,10 @@ CMDBUF_INLINE uint32_t *copy_quads_32(uint32_t *dst, const uint32_t *src, int co
     }
     return dst;
 #else
+#if HW_CMD_DMA
+    if (cmd_dma_on)
+        return (count > 0) ? cmd_dma_add(dst, src, count) : dst;
+#endif
     /* Word 7 (CMDGRDA + dummy) is NOT copied: VDP1 reads the gouraud table
      * address only when PMOD selects gouraud, and no command this renderer
      * emits does (walls, flats, sprites, punch polygons: CC != 4). The copy
@@ -528,6 +652,13 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     uint32_t *vram32 = (uint32_t *)(SATURN_VDP1_VRAM + saturn_v1_write_table);
     const uint32_t * const vram_start = vram32;
 
+#if HW_CMD_DMA && !defined(SATURN_WIN32)
+    Saturn_CmdBuf_DmaWait();                    /* previous list (normally long done) */
+    cmd_dma_n = 0;
+    cmd_dma_next_src = 0;
+    cmd_dma_on = (cmd_dma_tab != NULL) && hw_cmd_dma;
+#endif
+
     /* 1. Slot 0 (V1_USER0): Set user clip to full 3D viewport */
     extern int saturn_view_w;
     extern int saturn_view_h;
@@ -702,6 +833,13 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     vram32[0] = 0x80000000u; /* CTRL: END (0x8000), LINK (0x0000); VDP1 reads nothing else of it */
     vram32 += 8;
 
+#if HW_CMD_DMA && !defined(SATURN_WIN32)
+    /* the body goes in the background; the frame change waits for it */
+    if (cmd_dma_on)
+        cmd_dma_kick();
+    cmd_dma_on = 0;
+#endif
+
     saturn_vdp1_bus_cmd_bytes = (uint32_t)((uintptr_t)vram32 - (uintptr_t)vram_start);
 }
 
@@ -717,6 +855,7 @@ void Saturn_CmdBuf_DeliverBlank(void)
     const int vh = (saturn_view_h > 0) ? saturn_view_h : 168;
     const int x_offset = (352 - vw) >> 1;
 
+    Saturn_CmdBuf_DmaWait();
     v1_write_userclip(vram32, x_offset, 0, (vw - 1) + x_offset, vh - 1);
     v1_write_localcoord(vram32 + 8, x_offset, 0);
     v1_write_clear(vram32 + 16, vw, vh, 0u);   /* no 3D: let NBG0 show */
