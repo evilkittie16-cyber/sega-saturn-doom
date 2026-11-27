@@ -91,10 +91,11 @@ int16_t 	worldbbox[4];
 #ifndef SATURN_LEVEL_POOL_BYTES
 #define SATURN_LEVEL_POOL_BYTES (88u * 1024u)
 #endif
-enum { LP_NODES, LP_BBOXES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_BMAP, LP_SIDES, LP_COUNT };
+enum { LP_NODES, LP_BBOXES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_BMAP, LP_SIDES, LP_MOBJS, LP_COUNT };
 static __attribute__((aligned(16))) uint8_t saturn_level_pool[SATURN_LEVEL_POOL_BYTES];
 static uint8_t *lp_slot[LP_COUNT];
 static unsigned int lp_next;                     /* first free byte of the pool */
+static unsigned int lp_mobj_bytes;               /* planned moving-mobj block size */
 unsigned int saturn_level_pool_used = 0;         /* debug: bytes handed out this level */
 unsigned int saturn_level_pool_miss = 0;         /* debug: bit per LP_ slot / request that went to the zone */
 
@@ -117,8 +118,19 @@ static void *LP_Alloc(unsigned int bytes, unsigned int miss_bit)
 
 static void LP_Plan(int lumpnum)
 {
+/* 1 = moving mobjs before the renderer's node bboxes. Measured on E4M9
+ * (pool full): mobj logic 3.2 -> 1.7 ms but the bboxes in the cart cost the
+ * BSP cull +1.9 ms -> same frame rate; 0 keeps the renderer's bboxes first,
+ * mobjs fill what is left (smaller maps) or go to Low WRAM. */
+#ifndef LP_MOBJ_FIRST
+#define LP_MOBJ_FIRST 0
+#endif
 	static const uint8_t order[LP_COUNT] = {
-		LP_NODES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_BBOXES, LP_BMAP, LP_SIDES
+#if LP_MOBJ_FIRST
+		LP_NODES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_MOBJS, LP_BBOXES, LP_BMAP, LP_SIDES
+#else
+		LP_NODES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_BBOXES, LP_BMAP, LP_SIDES, LP_MOBJS
+#endif
 	};
 	unsigned int need[LP_COUNT];
 	int i;
@@ -133,6 +145,25 @@ static void LP_Plan(int lumpnum)
 	need[LP_VERTS]   = (unsigned)(W_LumpLength(lumpnum + ML_VERTEXES) / sizeof(mapvertex_t)) * sizeof(mapvertex_t);
 	need[LP_BMAP]    = (unsigned)W_LumpLength(lumpnum + ML_BLOCKMAP);
 	need[LP_SIDES]   = (unsigned)(W_LumpLength(lumpnum + ML_SIDEDEFS) / sizeof(mapsidedef_t)) * sizeof(side_t);
+	{
+		/* the moving mobjs P_PreSpawnMobjs will pre-allocate (same count as
+		 * P_LoadThings: real things + 40 for puffs and projectiles) */
+		/* (NOT I_TempBuffer: that zero-fills the scratch buffer the level's
+		 * lumps are staged in - it wiped E1M1's walls in the first try) */
+		int nt = W_LumpLength(lumpnum + ML_THINGS) / sizeof(mapthing_t), k, real = 40;
+		const mapthing_t *mt = (const mapthing_t *)W_GetLumpData(lumpnum + ML_THINGS);
+		for (k = 0; k < nt; k++)
+		{
+			mapthing_t m;
+			D_memcpy(&m, &mt[k], sizeof(m));
+			m.type = LITTLESHORT(m.type);
+			m.options = LITTLESHORT(m.options);
+			if (P_MapThingSpawnsMobj(&m) == 1)
+				real++;
+		}
+		need[LP_MOBJS] = (unsigned)real * sizeof(mobj_t);
+		lp_mobj_bytes = lp_round(need[LP_MOBJS]);
+	}
 
 	lp_next = 0;
 	saturn_level_pool_used = 0;
@@ -142,6 +173,17 @@ static void LP_Plan(int lumpnum)
 		int s = order[i];
 		lp_slot[s] = (uint8_t *)LP_Alloc(need[s], 1u << s);
 	}
+}
+
+/* p_mobj.c P_PreSpawnMobjs: the planned moving-mobj block if it is big
+ * enough, else NULL (then Low WRAM / the zone). */
+void *Saturn_LevelPoolTakeMobjs(unsigned int bytes)
+{
+	void *p = lp_slot[LP_MOBJS];
+	if (!p || lp_round(bytes) > lp_mobj_bytes)
+		return NULL;
+	lp_slot[LP_MOBJS] = NULL;
+	return p;
 }
 
 /* The planned block for slot s (once), or NULL = use the Z zone. */
@@ -1309,6 +1351,12 @@ D_printf ("P_SetupLevel(%s,%i)\n",lumpname,skill);
 
 	/* reserve the per-level High WRAM pool before the loads use it */
 	LP_Plan(lumpnum);
+	{
+		/* the Low WRAM mobj block is reserved by this level's texture
+		 * placement (PAK load); drop last level's */
+		extern void Saturn_LwMobjReset(void);
+		Saturn_LwMobjReset();
+	}
 
 /* note: most of this ordering is important	 */
 	/* Saturn debug sub-stage: MEDIUM PURPLE + the lump name while each map

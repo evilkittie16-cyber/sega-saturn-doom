@@ -364,6 +364,50 @@ static boolean PS_CheckSight2(mobj_t *t1, mobj_t *t2)
    return PS_CrossBSPNode(&sw, numnodes-1);
 }
 
+/* PVS pre-test (2026-11-27, offline-help item 1): when the target's
+ * subsector is not in the looker's PVS row, skip the BSP trace.
+ * SIGHT_PVS=1 uses it; SIGHT_PVS=2 validates: always runs the full trace and
+ * counts in saturn_sight_stats [0] traces [1] PVS says no [2] PVS says no
+ * but the trace says visible (a wrong answer) [3] trace visible.
+ * The baked PVS is SAMPLED (tools/bake_pvs.py), so it must be validated. */
+/* Default on since the dense re-bake (scratchpad bake_pvs_dense.py, ~20
+ * samples per subsector, a superset of the old PVS): 15 live views, ~450k
+ * traces, 0 wrong answers (the old sampled PVS gave 4 on E4M9). */
+#ifndef SIGHT_PVS
+#define SIGHT_PVS 1
+#endif
+#if SIGHT_PVS
+extern int Saturn_Pvs_Pair(int a, int b);
+volatile unsigned int saturn_sight_stats[4];
+#endif
+static boolean PS_CheckSightPvs(mobj_t *t1, mobj_t *t2)
+{
+#if SIGHT_PVS
+   int pv = Saturn_Pvs_Pair((int)(t1->subsector - subsectors), (int)(t2->subsector - subsectors));
+#if SIGHT_PVS == 2
+   boolean vis = PS_CheckSight2(t1, t2);
+   saturn_sight_stats[0]++;
+   if (vis) saturn_sight_stats[3]++;
+   if (pv == 0)
+   {
+      saturn_sight_stats[1]++;
+      if (vis) saturn_sight_stats[2]++;
+   }
+   return vis;
+#else
+   if (pv == 0)
+   {
+      saturn_sight_stats[1]++;
+      return false;
+   }
+   saturn_sight_stats[0]++;
+   return PS_CheckSight2(t1, t2);
+#endif
+#else
+   return PS_CheckSight2(t1, t2);
+#endif
+}
+
 static boolean P_MobjCanSightCheck(mobj_t *mobj)
 {
    // must be killable or be a monster spawner
@@ -491,7 +535,7 @@ static void P_CheckSights2(void)
       }
 #endif
 
-      if (PS_CheckSight2(mobj, mobj->target))
+      if (PS_CheckSightPvs(mobj, mobj->target))
          mobj->flags |= MF_SEETARGET;
    }
 }
@@ -547,7 +591,7 @@ boolean P_CheckSight(mobj_t *t1, mobj_t *t2)
 {
    if (!PS_RejectCheckSight(t1, t2))
       return false;
-   return PS_CheckSight2(t1, t2);      
+   return PS_CheckSightPvs(t1, t2);
 }
 
 // EOF

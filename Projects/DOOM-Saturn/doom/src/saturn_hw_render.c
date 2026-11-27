@@ -2097,6 +2097,33 @@ HW_HOT_O2 void Saturn_HW_RenderPlayerView(int displayplayer)
     HW_W2_Kick(pvs_row);            /* split frame: start the slave walk */
     HW_FrameWalk(pvs_row);
     HW_W2_EndWalk();                /* split frame: the master's walk is done */
+#if defined(HW_PVS_ORACLE) && HW_PVS_ORACLE
+    /* Upper-bound experiment (2026-11-27, offline-help item 3): the next
+     * frame's "PVS" = exactly the subsectors this frame visited (+ the
+     * camera's own). With a held camera that is a perfect visibility set:
+     * how much would a tighter offline PVS save at most? Needs
+     * -DHW_WALK2=0 (the split frame keeps two visit lists). */
+    {
+        static byte oracle_row[256];
+        int nss = numsubsectors < 2048 ? numsubsectors : 2048;
+        int i;
+        memset(oracle_row, 0, (size_t)((nss + 7) >> 3));
+        for (i = 0; i < saturn_visit_count; i++)
+        {
+            int s = saturn_sub_ranges[i].subnum;
+            if ((unsigned)s < (unsigned)nss)
+                oracle_row[s >> 3] |= (byte)(1u << (s & 7));
+        }
+        if (ssec)
+        {
+            int s = (int)(ssec - subsectors);
+            if ((unsigned)s < (unsigned)nss)
+                oracle_row[s >> 3] |= (byte)(1u << (s & 7));
+        }
+        last_pvs_row = oracle_row;              /* used while the camera holds */
+        HW_APERTURE->last_pvs_ssec = NULL;      /* rebuild the node visibility */
+    }
+#endif
 
 
     static int saturn_hw_sky_was_visible = 0;

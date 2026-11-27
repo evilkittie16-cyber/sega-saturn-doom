@@ -268,6 +268,49 @@ static void *hram_alloc(int size)
 
 void *Saturn_HramAlloc(int size) { return hram_alloc(size); }
 
+/* Low WRAM block for the level's pre-spawned mobjs (2026-11-27). They used
+ * to come from the Z zone = the RAM cart read uncached: in the E4M9 fight
+ * P_MobjThinker / sight / movement spent ~5 ms per frame on mobj reads.
+ * Reserved at the start of each level's texture placement (before the
+ * textures fill the tier); P_PreSpawnMobjs takes from it, overflow and
+ * later spawns still use the zone. */
+/* Default 0 (off): measured only ~0-1 frame on E4M9 (Low WRAM line fills
+ * cost about what the cart's single reads did), and the 40 KB it takes from
+ * the texture tier pushed E4M7's textures into the zone -> "Z_Malloc
+ * failed" on load (2026-11-27). Kept as a knob. */
+#ifndef SATURN_LW_MOBJ_RESERVE
+#define SATURN_LW_MOBJ_RESERVE 0u
+#endif
+static byte        *lw_mobj_block = NULL;
+static unsigned int lw_mobj_size = 0, lw_mobj_used = 0;
+unsigned int saturn_lw_mobj_used = 0;           /* debug */
+
+void Saturn_LwMobjReset(void)
+{
+    lw_mobj_block = NULL;
+    lw_mobj_size = lw_mobj_used = 0;
+    saturn_lw_mobj_used = 0;
+}
+
+static void lw_mobj_reserve(void)
+{
+    lw_mobj_block = (byte *)hram_alloc((int)SATURN_LW_MOBJ_RESERVE);
+    lw_mobj_size = lw_mobj_block ? SATURN_LW_MOBJ_RESERVE : 0;
+    lw_mobj_used = 0;
+}
+
+void *Saturn_LwMobjTake(unsigned int bytes)
+{
+    void *p;
+    bytes = (bytes + 15u) & ~15u;
+    if (!lw_mobj_block || lw_mobj_used + bytes > lw_mobj_size)
+        return NULL;
+    p = lw_mobj_block + lw_mobj_used;
+    lw_mobj_used += bytes;
+    saturn_lw_mobj_used = lw_mobj_used;
+    return p;
+}
+
 static unsigned int rtbl_used;
 
 void *Saturn_RtblAlloc(int size)
@@ -1041,6 +1084,7 @@ int Saturn_BakedTextures_Parse(byte *blob, unsigned fsize)
     hram_used = hram_used_boot;
     uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
     if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
+    lw_mobj_reserve();
     if (tex_cache) D_memset(tex_cache, 0, numtextures * sizeof(byte *));
     /* 2026-11-23: flats cached in the tier just reset (or in the previous
      * level's PU_LEVEL zone) would be overwritten by this level's textures:
@@ -1120,6 +1164,7 @@ int Saturn_BakedTex_Plan(const byte *blob, unsigned dirbytes, unsigned fsize,
     hram_used = hram_used_boot;
     uint32_t ge = ((uint32_t)saturn_wram_l_geom_end + 7u) & ~7u;
     if (ge > SATURN_HRAM_BASE + hram_used) hram_used = ge - SATURN_HRAM_BASE;
+    lw_mobj_reserve();
     if (tex_cache) D_memset(tex_cache, 0, numtextures * sizeof(byte *));
     /* 2026-11-23: flats cached in the tier just reset (or in the previous
      * level's PU_LEVEL zone) would be overwritten by this level's textures:

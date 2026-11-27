@@ -357,9 +357,25 @@ mobj_t *P_SpawnMobj (fixed_t x, fixed_t y, fixed_t z, mobjtype_t type)
 */
 void P_PreSpawnMobjs(int count, int staticcount)
 {
+#ifdef SATURN
+	/* Saturn (2026-11-27): Low WRAM instead of the RAM cart when there is
+	 * room (saturn_tex.c Saturn_LwMobjTake) */
+	extern void *Saturn_LwMobjTake(unsigned int bytes);
+#define SAT_MOBJ_ALLOC(n) ({ void *_p = Saturn_LwMobjTake((unsigned)(n)); _p ? _p : Z_Malloc((n), PU_LEVEL); })
+#else
+#define SAT_MOBJ_ALLOC(n) Z_Malloc((n), PU_LEVEL)
+#endif
 	if (count > 0)
 	{
-		mobj_t *mobj = Z_Malloc (sizeof(*mobj)*count, PU_LEVEL);
+#ifdef SATURN
+		/* High WRAM level pool first (p_setup.c LP_MOBJS), then Low WRAM */
+		extern void *Saturn_LevelPoolTakeMobjs(unsigned int bytes);
+		mobj_t *mobj = Saturn_LevelPoolTakeMobjs(sizeof(*mobj)*count);
+		if (!mobj)
+			mobj = SAT_MOBJ_ALLOC (sizeof(*mobj)*count);
+#else
+		mobj_t *mobj = SAT_MOBJ_ALLOC (sizeof(*mobj)*count);
+#endif
 		for (; count > 0; count--) {
 			P_AddMobjToList(mobj, (void *)&freemobjhead);
 			mobj++;
@@ -368,7 +384,7 @@ void P_PreSpawnMobjs(int count, int staticcount)
 
 	if (staticcount > 0)
 	{
-		uint8_t *mobj = Z_Malloc (static_mobj_size*staticcount, PU_LEVEL);
+		uint8_t *mobj = SAT_MOBJ_ALLOC (static_mobj_size*staticcount);
 		for (; staticcount > 0; staticcount--) {
 			P_AddMobjToList((void *)mobj, (void *)&freestaticmobjhead);
 			mobj += static_mobj_size;

@@ -74,6 +74,20 @@ const byte *Saturn_Pvs_GetRow(fixed_t x, fixed_t y)
 }
 #endif /* SATURN_PVS */
 
+/* Sight-check pre-test (2026-11-27, p_sight.c SIGHT_PVS): 0 = subsector b is
+ * not in subsector a's PVS row, 1 = it is, -1 = no PVS loaded. */
+int Saturn_Pvs_Pair(int a, int b)
+{
+#ifdef SATURN_PVS
+    if (pvs_blob == NULL || (unsigned)a >= pvs_nssec || (unsigned)b >= pvs_nssec)
+        return -1;
+    return (pvs_blob[(unsigned)a * pvs_rowbytes + ((unsigned)b >> 3)] >> (b & 7)) & 1;
+#else
+    (void)a; (void)b;
+    return -1;
+#endif
+}
+
 int Saturn_Pvs_Parse(byte *blob, unsigned fsize)
 {
 #ifdef SATURN_PVS
