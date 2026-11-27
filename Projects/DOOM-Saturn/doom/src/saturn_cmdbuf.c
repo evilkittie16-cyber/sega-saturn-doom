@@ -84,7 +84,14 @@ static void *cmdbuf_alloc_aligned32(int size)
 #define CMD_DMA_STATUS   (*(volatile uint32_t *)0x25FE007Cu)
 #define CMD_DMA_BUSY_BIT (1u << (4 + CMD_DMA_LEVEL * 4))
 #define CMD_DMA_CHUNK    4064u                 /* <= 4096 (level 1/2 count), multiple of 32 */
-#define CMD_DMA_MAX_ENT  (CMDBUF_MAX_VISIT * 2 + 64)
+/* The SCU reads the indirect table wrongly on real hardware unless the table
+ * is aligned on a boundary of its size rounded up to a power of 2 (Jo's
+ * vdp1_command_pipeline.c, which uses 8 KB at least). The emulators don't
+ * model it: the first 32-byte-aligned version froze the hardware on the first
+ * 3D frame (user, DOOM-1127C-DMA-RETAIL). Table <= 8 KB, aligned to 8 KB; a
+ * frame needing more entries CPU-copies the rest (cmd_dma_add). */
+#define CMD_DMA_TAB_ALIGN 8192u
+#define CMD_DMA_MAX_ENT  ((int)(CMD_DMA_TAB_ALIGN / 12u))     /* 682 */
 volatile int hw_cmd_dma = 1;                   /* runtime switch (pokeable) */
 unsigned int saturn_cmd_dma_entries = 0;       /* debug: table entries last frame */
 static uint32_t *cmd_dma_tab = NULL;           /* {bytes, dst, src} x CMD_DMA_MAX_ENT */
@@ -102,6 +109,13 @@ void Saturn_CmdBuf_DmaWait(void)
     unsigned int guard = 4000000u;
     while ((CMD_DMA_STATUS & CMD_DMA_BUSY_BIT) && --guard)
         ;
+    if (!guard)
+    {
+        /* hung (never seen once the table was aligned): stop the level and
+         * go back to the CPU copy instead of freezing the frame change */
+        CMD_DMA_REG(0x10) = 0;
+        hw_cmd_dma = 0;
+    }
 }
 
 /* Queue `count` commands from WRAM-H `src` to VRAM `dst` (dst is always the
@@ -202,7 +216,11 @@ void Saturn_CmdBuf_Init(void)
 
 #if HW_CMD_DMA && !defined(SATURN_WIN32)
     /* no room: the CPU copy stays (cmd_dma_tab NULL) */
-    cmd_dma_tab = (uint32_t *)cmdbuf_alloc_aligned32(CMD_DMA_MAX_ENT * 12);
+    {
+        void *raw = jo_malloc_with_behaviour((int)(CMD_DMA_TAB_ALIGN * 2u - 1u), 0);
+        cmd_dma_tab = raw ? (uint32_t *)(((uintptr_t)raw + CMD_DMA_TAB_ALIGN - 1u) & ~(uintptr_t)(CMD_DMA_TAB_ALIGN - 1u))
+                          : NULL;
+    }
 #endif
 }
 
