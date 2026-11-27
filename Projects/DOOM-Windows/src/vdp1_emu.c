@@ -102,6 +102,26 @@ static uint32_t s_palette32[256];
 static int s_palette_set = 0;
 static int s_frame_quad_pixels = 0;
 static int s_cur_quad = 0;
+/* Per-subsector pixel census (2026-11-26): saturn_cmdbuf.c tags each 3D
+ * command's word 7 with 0xA5A50000 | subnum and the first command with
+ * 0x5A5A0000 | mark generation. */
+#define OD_MAX_SUBS 8192
+static int16_t s_od_sub[704 * 512];        /* subsector owning each pixel, -1 none */
+static uint8_t s_od_watch[704 * 512];      /* OD_WATCH: pixel drawn by the watched subsector */
+static int s_cur_cls = 3;                  /* class of the current command: 0 wall 1 flat 2 sprite 3 other */
+int g_od_ovw[OD_MAX_SUBS][4];              /* pixels of sub A overwritten by another sub's class */
+static int s_od_watch_sub = -2;
+static int s_cur_sub = -1;
+static inline void od_overwrite(int pix)
+{
+    int prev = s_od_sub[pix];
+    if (prev >= 0 && prev < OD_MAX_SUBS && prev != s_cur_sub)
+        g_od_ovw[prev][s_cur_cls & 3]++;
+}
+int g_od_sub_px[OD_MAX_SUBS];              /* final pixels per subsector (last frame) */
+int g_od_sub_drawn[OD_MAX_SUBS];           /* pixels drawn per subsector incl. overdrawn */
+uint8_t g_od_sub_present[OD_MAX_SUBS];     /* subsector had commands in the list */
+unsigned int g_od_gen_drawn;               /* mark generation of the rasterised list */
 /* Overdraw analysis (2026-11-15): which textured quad last wrote each pixel
  * (0 = background, -1 = untextured polygon), and per-quad pixels / VDP1
  * cycles, so quads with no surviving pixel ("fully hidden") can be counted. */
@@ -429,6 +449,10 @@ static inline void vdp1_plot_dot(
                 int q = s_cur_quad <= OD_MAX_QUADS ? s_cur_quad : OD_MAX_QUADS;
                 s_od_owner[py * fb_w + px] = (int16_t)q;
                 s_od_px[q]++;
+                od_overwrite(py * fb_w + px);
+                s_od_sub[py * fb_w + px] = (int16_t)s_cur_sub;
+                if (s_cur_sub >= 0 && s_cur_sub < OD_MAX_SUBS) g_od_sub_drawn[s_cur_sub]++;
+                if (s_cur_sub == s_od_watch_sub) s_od_watch[py * fb_w + px] = 1;
             }
             if (tex_info) {
                 tex_info->strip_mask |= (uint16_t)(1u << ((iu >> 4) & 15));
@@ -438,8 +462,13 @@ static inline void vdp1_plot_dot(
     } else {
         fb[py * fb_w + px] = s_palette32[colr & 0xFF];
         s_frame_poly_pixels++;
-        if (py * fb_w + px < OD_MAX_PX)
+        if (py * fb_w + px < OD_MAX_PX) {
             s_od_owner[py * fb_w + px] = -1;
+            od_overwrite(py * fb_w + px);
+            s_od_sub[py * fb_w + px] = (int16_t)s_cur_sub;
+            if (s_cur_sub >= 0 && s_cur_sub < OD_MAX_SUBS) g_od_sub_drawn[s_cur_sub]++;
+            if (s_cur_sub == s_od_watch_sub) s_od_watch[py * fb_w + px] = 1;
+        }
     }
 }
 
@@ -857,6 +886,13 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
     s_frame_quad_pixels = 0;
     s_frame_poly_pixels = 0;
     memset(s_od_owner, 0, sizeof(s_od_owner));
+    memset(s_od_sub, 0xFF, sizeof(s_od_sub));
+    memset(g_od_sub_present, 0, sizeof(g_od_sub_present));
+    memset(g_od_sub_drawn, 0, sizeof(g_od_sub_drawn));
+    memset(g_od_ovw, 0, sizeof(g_od_ovw));
+    if (s_od_watch_sub == -2) { const char *e = getenv("OD_WATCH"); s_od_watch_sub = e ? atoi(e) : -1; }
+    if (s_od_watch_sub >= 0) memset(s_od_watch, 0, sizeof(s_od_watch));
+    s_cur_sub = -1;
     memset(s_od_px, 0, sizeof(s_od_px));
     memset(s_od_cyc, 0, sizeof(s_od_cyc));
     s_frame_polys = 0;
@@ -904,6 +940,20 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
         }
 
         hw_raster_cycles += 16u; /* 16-cycle command fetch (DoDrawing VDP1_EAT_CLOCKS(16)) */
+        {
+            uint32_t w7 = cmd_stream[7];
+            if ((w7 >> 16) == 0xA5A5u) {
+                s_cur_sub = (int)(w7 & 0x1FFFu);
+                s_cur_cls = (int)((w7 >> 13) & 3u);
+                if (s_cur_sub < OD_MAX_SUBS)
+                    g_od_sub_present[s_cur_sub] = 1;
+            } else {
+                s_cur_sub = -1;
+                s_cur_cls = 3;
+                if ((w7 >> 16) == 0x5A5Au)
+                    g_od_gen_drawn = w7 & 0xFFFFu;
+            }
+        }
         uint16_t ctrl = (uint16_t)(w0 >> 16);
         if (ctrl & 0x4000u) {
             cmd_stream += 8;
@@ -1086,6 +1136,47 @@ void VDP1_RenderFrame(uint32_t *dst_bgra, int fb_w, int fb_h, const uint8_t *vid
                 g_vdp1_od_hidden_px += (int)s_od_px[q];
                 g_vdp1_od_hidden_cyc += (int)s_od_cyc[q];
             }
+        }
+    }
+
+    /* Per-subsector pixel census (2026-11-26): final pixels per subsector,
+     * from the tags in the commands just drawn. */
+    {
+        int npx = fb_w * fb_h < OD_MAX_PX ? fb_w * fb_h : OD_MAX_PX;
+        memset(g_od_sub_px, 0, sizeof(g_od_sub_px));
+        for (int i = 0; i < npx; i++) {
+            int sub = s_od_sub[i];
+            if (sub >= 0 && sub < OD_MAX_SUBS)
+                g_od_sub_px[sub]++;
+        }
+        {
+            extern void HW_TinyCensus(const int *px, const uint8_t *present, int n, unsigned gen);
+            HW_TinyCensus(g_od_sub_px, g_od_sub_present, OD_MAX_SUBS, g_od_gen_drawn);
+        }
+        {
+            /* OD_WATCH=sub: who finally owns the pixels this subsector drew */
+            static int watch = -2;
+            if (watch == -2) { const char *e = getenv("OD_WATCH"); watch = e ? atoi(e) : -1; }
+            if (watch >= 0) {
+                static int hist[OD_MAX_SUBS + 1];
+                memset(hist, 0, sizeof(hist));
+                int n = 0;
+                for (int i = 0; i < npx; i++)
+                    if (s_od_watch[i]) { int o = s_od_sub[i]; hist[o < 0 ? OD_MAX_SUBS : o]++; n++; }
+                printf("[ODWATCH] sub %d drew %d px, now owned by:", watch, n);
+                for (int k = 0; k < 6; k++) {
+                    int best = -1, bv = 0;
+                    for (int o = 0; o <= OD_MAX_SUBS; o++) if (hist[o] > bv) { bv = hist[o]; best = o; }
+                    if (best < 0) break;
+                    printf(" %d:%d", best == OD_MAX_SUBS ? -1 : best, bv);
+                    hist[best] = 0;
+                }
+                printf("\n");
+            }
+        }
+        if (getenv("OD_DUMP")) {
+            FILE *f = fopen("sweep\\owner.raw", "wb");   /* int16 subsector per pixel */
+            if (f) { fwrite(s_od_sub, 2, npx, f); fclose(f); }
         }
     }
 

@@ -488,8 +488,10 @@ typedef struct __attribute__((aligned(16))) {
     uint32_t summary, any;      /* hw_solid_summary / hw_solid_any (occl queries read them) */
     int      count;
 } hw_solid_snap_t;
+#ifndef _MSC_VER    /* MSVC C mode (harness): no _Static_assert */
 _Static_assert(sizeof(hw_wall_rec_t) % 16u == 0 && sizeof(hw_wall_sub_t) % 16u == 0 &&
                sizeof(hw_solid_snap_t) % 16u == 0, "deferred-wall queue items: whole cache lines");
+#endif
 
 /* Queue in High WRAM (2026-11-24): once the level runs, HW_DeferTryHigh
  * moves the queue into whatever the Jo heap has left (~27 KB in pieces in a
@@ -2413,6 +2415,17 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
     int xb  = p1->px;
     int s_A = p0->s;
     int s_B = p1->s;
+#if HW_AP_LINEAR
+    /* scale at the visible span's two end columns (linear in screen x) */
+    int lin_s0 = s_A, lin_s1 = s_B;
+    if (xb > xa)
+    {
+        int c0 = ctx->seg_sx, c1 = ctx->seg_ex - 1;
+        lin_s0 = s_A + (int)(((long long)(s_B - s_A) * (c0 - xa)) / (xb - xa));
+        lin_s1 = s_A + (int)(((long long)(s_B - s_A) * (c1 - xa)) / (xb - xa));
+    }
+    int lin_yt0 = 0, lin_yt1 = 0, lin_yb0 = HW_VIEW_H, lin_yb1 = HW_VIEW_H;
+#endif
     if (__builtin_expect((xa < 0 || xb > HW_VIEW_W) && xb > xa, 0))
     {
         HW_ClipPortalScales(xa, xb, s_A, s_B);
@@ -2449,6 +2462,27 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
                     bsec_f->yt_attach = (int16_t)b_yt_att;
             }
             int yt_pad = (s_max < 8192) ? 0 : 1;
+#if HW_AP_LINEAR
+            if (HW_ApLinearOn())
+            {
+                /* each end's own edge height, 1 px safety (rounding) */
+                int e0 = HW_ProjY(dzt, lin_s0, vcy) - yt_pad - 1;
+                int e1 = HW_ProjY(dzt, lin_s1, vcy) - yt_pad - 1;
+                if (e0 < yt_min - yt_pad) e0 = yt_min - yt_pad;   /* never less than today's */
+                if (e1 < yt_min - yt_pad) e1 = yt_min - yt_pad;
+                if ((e0 > ctx->ytop_min || e1 > ctx->ytop_min) && !(yt_min - yt_pad > ctx->ytop_min))
+                {
+                    p_yt = yt_min - yt_pad;     /* recorded for the far end only */
+                    if (p_yt < 1) p_yt = 1;     /* flag "recorded"; the values come from lin_yt* */
+                    if (f_dz_ceil > b_dz_ceil)
+                    {
+                        int w_yt_att = HW_ProjY(f_dz_ceil, (f_dz_ceil >= 0) ? s_max : s_min, vcy);
+                        if (w_yt_att < yt_att) yt_att = w_yt_att;
+                    }
+                }
+                lin_yt0 = e0; lin_yt1 = e1;
+            }
+#endif
             if (yt_min - yt_pad > ctx->ytop_min)
             {
                 p_yt = yt_min - yt_pad;
@@ -2471,6 +2505,35 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
             bsec_f->yb_attach = (int16_t)b_yb_att;
 
         int yb_pad = (s_max < 8192) ? 0 : 1;
+#if HW_AP_LINEAR
+        if (HW_ApLinearOn())
+        {
+            int e0 = HW_ProjY(dzb, lin_s0, vcy) + yb_pad + 1;
+            int e1 = HW_ProjY(dzb, lin_s1, vcy) + yb_pad + 1;
+#ifdef SATURN_WIN32
+            {
+                extern int hw_trace_sub_on;
+                if (hw_trace_sub_on)
+                    printf("[PORTAL] xa %d xb %d sA %d sB %d seg %d..%d lin_s %d %d dzb %d f %d b %d yb_max %d e %d %d ybot_max %d near %d\n",
+                           xa, xb, p0->s, p1->s, ctx->seg_sx, ctx->seg_ex, lin_s0, lin_s1, dzb >> 16,
+                           f_dz_floor >> 16, b_dz_floor >> 16, yb_max, e0, e1, ctx->ybot_max, ctx->needs_near_clip);
+            }
+#endif
+            if (e0 > yb_max + yb_pad) e0 = yb_max + yb_pad;    /* never more than today's */
+            if (e1 > yb_max + yb_pad) e1 = yb_max + yb_pad;
+            if ((e0 < ctx->ybot_max || e1 < ctx->ybot_max) && !(yb_max + yb_pad < ctx->ybot_max))
+            {
+                p_yb = yb_max + yb_pad;
+                if (p_yb > vh) p_yb = vh - 1;
+                if (f_dz_floor < b_dz_floor)
+                {
+                    int w_yb_att = HW_ProjY(f_dz_floor, (f_dz_floor <= 0) ? s_max : s_min, vcy);
+                    if (w_yb_att > yb_att) yb_att = w_yb_att;
+                }
+            }
+            lin_yb0 = e0; lin_yb1 = e1;
+        }
+#endif
         if (yb_max + yb_pad < ctx->ybot_max)
         {
             p_yb = yb_max + yb_pad;
@@ -2482,6 +2545,18 @@ static HW_NOINLINE HW_HOT_O2 void HW_RecordSegPortalAperture(
         }
     }
 
+#if HW_AP_LINEAR
+    if (HW_ApLinearOn() && (p_yt > 0 || p_yb < vh))
+    {
+        /* the span carries the sx-end edge, hw_ap_lin_* the (ex-1)-end edge */
+        int rec_yt = (p_yt > 0), rec_yb = (p_yb < vh);
+        hw_ap_lin_yt_e = rec_yt ? lin_yt1 : 0;
+        hw_ap_lin_yb_e = rec_yb ? lin_yb1 : vh;
+        HW_RecordPortalSpan(((int)ctx->seg_sx << 16) | (uint16_t)ctx->seg_ex,
+                            rec_yt ? lin_yt0 : 0, rec_yb ? lin_yb0 : vh, (yt_att << 16) | (uint16_t)yb_att);
+    }
+    else
+#endif
     if (p_yt > 0 || p_yb < vh)
         HW_RecordPortalSpan(((int)ctx->seg_sx << 16) | (uint16_t)ctx->seg_ex, p_yt, p_yb, (yt_att << 16) | (uint16_t)yb_att);
 #if HW_PROF_SUBTIMERS

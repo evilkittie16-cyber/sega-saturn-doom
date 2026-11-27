@@ -1268,6 +1268,45 @@ void I_FinishUpdate(void)
                     char fn[160];
                     sprintf(fn, "sweep\\%s.bmp", s_sw_tag);
                     SaveFramebufferBMP(fn, s_combined_fb, COMBINED_W, COMBINED_H);
+                    {
+                        /* per-subsector pixel census: "subnum pixels" for
+                         * every subsector with commands in the drawn list */
+                        extern int g_od_sub_px[], g_od_sub_drawn[];
+                        extern uint8_t g_od_sub_present[];
+                        extern int g_vdp1_od_quads, g_vdp1_od_hidden, g_vdp1_od_hidden_px, g_vdp1_od_total_px;
+                        FILE *vf;
+                        sprintf(fn, "sweep\\%s.vis", s_sw_tag);
+                        vf = fopen(fn, "w");
+                        if (vf) {
+                            /* "sub final_px drawn_px"; last line: OD totals */
+                            for (int si = 0; si < 8192; si++)
+                                if (g_od_sub_present[si])
+                                    fprintf(vf, "%d %d %d\n", si, g_od_sub_px[si], g_od_sub_drawn[si]);
+                            fprintf(vf, "OD %d %d %d %d\n", g_vdp1_od_quads, g_vdp1_od_hidden,
+                                    g_vdp1_od_total_px, g_vdp1_od_hidden_px);
+                            fclose(vf);
+                        }
+                        /* every visit: "visit sub open cols final drawn m s" (open = tight
+                         * per-column test at visit time, -1 near; final/drawn = census) */
+                        {
+                            extern int hw_diag_open[], hw_diag_cols[];
+                            extern int saturn_visit_count;
+                            sprintf(fn, "sweep\\%s.vdiag", s_sw_tag);
+                            vf = fopen(fn, "w");
+                            if (vf) {
+                                for (int vi = 0; vi < saturn_visit_count; vi++) {
+                                    int sb = saturn_sub_ranges[vi].subnum;
+                                    if (sb >= 8192) continue;
+                                    extern int g_od_ovw[][4];
+                                    fprintf(vf, "%d %d %d %d %d %d %d %d %d %d %d %d\n", vi, sb, hw_diag_open[sb], hw_diag_cols[sb],
+                                            g_od_sub_px[sb], g_od_sub_drawn[sb],
+                                            (int)saturn_sub_ranges[vi].m_count, (int)saturn_sub_ranges[vi].s_count,
+                                            g_od_ovw[sb][0], g_od_ovw[sb][1], g_od_ovw[sb][2], g_od_ovw[sb][3]);
+                                }
+                                fclose(vf);
+                            }
+                        }
+                    }
                     printf("[SWEEP] %s E%dM%d %d %d %d | AvgErr:%6.2f%% MaxErr:%6.2f%% >=1%%:%5.1f%% | Quads:%3d (W:%3d F:%3d Drop:%d Ref:%d) Subs:%d\n",
                            s_sw_tag, s_sw_ep, s_sw_map, s_sw_x, s_sw_y, s_sw_deg,
                            g_telemetry.avg_err_pct, g_telemetry.max_err_pct, g_telemetry.ratio_gte_1,
@@ -1348,12 +1387,13 @@ void I_FinishUpdate(void)
         extern int g_walk_frames;
         static int s_pos_step = 0;
         static unsigned int s_last_fl = 0, s_last_vu = 0;
-        extern int g_pos_map, saturn_map, saturn_warp_map;
+        extern int g_pos_map, saturn_map, saturn_warp_map, saturn_episode;
         extern void Win32_RequestLevelWarp(int episode, int map);
         if (saturn_warp_map != 0)
             goto pos_done;
-        if (g_pos_map && saturn_map != g_pos_map) {
-            Win32_RequestLevelWarp(1, g_pos_map);
+        /* g_pos_map = episode * 100 + map (win_main.c -pos) */
+        if (g_pos_map && (saturn_map != g_pos_map % 100 || saturn_episode != g_pos_map / 100)) {
+            Win32_RequestLevelWarp(g_pos_map / 100, g_pos_map % 100);
             goto pos_done;
         }
         players[0].mo->momx = players[0].mo->momy = players[0].mo->momz = 0;
@@ -1417,6 +1457,16 @@ void I_FinishUpdate(void)
                Saturn_Vdp1_ArenaFree() >> 10,
                saturn_v1w_refuse,
                g_telemetry.hud_diag.total_quads, g_telemetry.hud_diag.wall_quads, g_telemetry.hud_diag.flat_quads);
+#if defined(HW_COARSE) && HW_COARSE
+        {
+            extern int saturn_visit_count;
+            extern unsigned int saturn_hw_coarse_nodes, saturn_hw_coarse_subs;
+            extern unsigned int saturn_hw_wall_quads, saturn_hw_flat_quads;
+            printf("[COARSE] visits:%d coarse_nodes:%u coarse_subs:%u wq:%u fq:%u\n",
+                   saturn_visit_count, saturn_hw_coarse_nodes, saturn_hw_coarse_subs,
+                   saturn_hw_wall_quads, saturn_hw_flat_quads);
+        }
+#endif
         fflush(stdout);
         s_last_fl = saturn_v1_page_flushes;
         s_last_vu = saturn_v1_variant_uploads;

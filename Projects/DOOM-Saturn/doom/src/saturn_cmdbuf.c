@@ -505,6 +505,21 @@ unsigned int Saturn_CmdBuf_ComputeDDA(void)
     return dda_total;
 }
 
+#ifdef SATURN_WIN32
+/* Harness only (2026-11-26, per-area pixel census): each delivered 3D
+ * command carries its subsector in word 7 (CMDGRDA, which vdp1_emu.c does
+ * not read) as 0xA5A50000 | subnum; the first command carries the
+ * marker 0x5A5A0000. The rasteriser reads them from the command it draws,
+ * whatever frame that is. */
+/* low 16 bits: subnum (13 bits) | class << 13 (0 wall, 1 floor/ceiling, 2 sprite) */
+static void od_mark(uint32_t *from, const uint32_t *to, unsigned subnum, unsigned cls)
+{
+    for (; from < to; from += 8)
+        from[7] = 0xA5A50000u | (subnum & 0x1FFFu) | (cls << 13);
+}
+extern uint16_t hw_diag_spr0[1024];
+#endif
+
 CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
 {
     /* Table to fill: SATURN_V1_USER0 in 1-cycle mode; in manual mode the
@@ -521,6 +536,9 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
     int x_offset = (352 - vw) >> 1;
     int clip_y1 = vh - 1;
     v1_write_userclip((volatile uint32_t *)vram32, x_offset, 0, (vw - 1) + x_offset, clip_y1);
+#ifdef SATURN_WIN32
+    vram32[7] = 0x5A5A0000u;
+#endif
     vram32 += 8;
 
     /* 2. Slot 1: Set local coord to (x_offset, 0) to center viewport in 352-wide screen */
@@ -614,11 +632,27 @@ CMDBUF_HOT_O2 void Saturn_CmdBuf_Deliver(void)
         {
             const sub_range_t *r = &ranges[i];
             int sc = r->s_count;
+#ifdef SATURN_WIN32
+            uint32_t *od0 = vram32;
+#endif
             if (sc > 0)
                 vram32 = copy_quads_32(vram32, cmd_s_base + ((uint32_t)r->s_start << 3), sc);
+#ifdef SATURN_WIN32
+            uint32_t *od1 = vram32;
+            od_mark(od0, od1, r->subnum, 1);
+#endif
             int mc = r->m_count;
             if (mc > 0)
                 vram32 = copy_quads_32(vram32, cmd_m + ((uint32_t)r->m_start << 3), mc);
+#ifdef SATURN_WIN32
+            {
+                int nw = mc;                /* walls first, then this visit's sprites */
+                if (i < 1024 && hw_diag_spr0[i] >= r->m_start && hw_diag_spr0[i] < r->m_start + mc)
+                    nw = hw_diag_spr0[i] - r->m_start;
+                od_mark(od1, od1 + nw * 8, r->subnum, 0);
+                od_mark(od1 + nw * 8, vram32, r->subnum, 2);
+            }
+#endif
         }
     }
     else

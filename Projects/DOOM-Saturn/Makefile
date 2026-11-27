@@ -130,10 +130,15 @@ EXTRA_DEFS ?=
 CCFLAGS += $(EXTRA_DEFS)
 # HW_WALK2 (2026-11-24): two-CPU screen split - the slave walks the BSP for
 # the right part of the screen with its own copy of the renderer
-# (saturn_hw_walk2.c). -DHW_WALK2=1 in EXTRA_DEFS also turns it on.
-HW_WALK2 ?= 0
+# (saturn_hw_walk2.c). Default ON since 2026-11-27 (user: "Coarse floors +
+# split"; dynamic mode 3 splits only frames where that measured cheaper).
+# -DHW_WALK2=0 in EXTRA_DEFS turns it off.
+HW_WALK2 ?= 1
 ifneq ($(findstring -DHW_WALK2=1,$(EXTRA_DEFS)),)
 HW_WALK2 := 1
+endif
+ifneq ($(findstring -DHW_WALK2=0,$(EXTRA_DEFS)),)
+HW_WALK2 := 0
 endif
 CCFLAGS += -DHW_WALK2=$(HW_WALK2)
 # JO_FS_MAX_FILES is 256 in Jo Engine v2026.1

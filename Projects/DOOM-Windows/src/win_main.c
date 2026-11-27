@@ -840,8 +840,8 @@ int main(int argc, char **argv)
             /* -pos X Y ANGLE_DEG: pin the camera (as the HUD prints it) and
              * log texture-cache activity per frame, then exit. */
             extern int g_pos_x, g_pos_y, g_pos_ang, g_pos_map;
-            extern int saturn_map;
-            g_pos_map = saturn_map;   /* -map must come first */
+            extern int saturn_map, saturn_episode;
+            g_pos_map = saturn_episode * 100 + saturn_map;   /* -map must come first */
             g_pos_x = atoi(argv[i + 1]);
             g_pos_y = atoi(argv[i + 2]);
             g_pos_ang = atoi(argv[i + 3]);
@@ -863,6 +863,15 @@ int main(int argc, char **argv)
              * player's view sinks to 8, low cameras stress near flats) */
             extern int g_pos_viewh;
             g_pos_viewh = atoi(argv[i + 1]);
+            i += 1;
+            continue;
+        }
+        if (strcmp(argv[i], "-coarse") == 0 && i + 1 < argc) {
+            /* -coarse T: coarse BSP nodes below T px (saturn_hw_coarse.c) */
+#if defined(HW_COARSE) && HW_COARSE    /* build with /DHW_COARSE=1 */
+            extern volatile int hw_coarse_t;
+            hw_coarse_t = atoi(argv[i + 1]);
+#endif
             i += 1;
             continue;
         }

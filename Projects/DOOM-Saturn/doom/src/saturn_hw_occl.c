@@ -470,9 +470,49 @@ static void HW_SubFlatInfoEnsure(void)
 #define HW_ASM_COMMIT (HW_ASM && HW_ASM_RESCAN && HW_DBG_OCCLUSION && HW_DBG_APERTURE && !HW_AP_HALF)
 #endif
 
+/* HW_AP_LINEAR (2026-11-26 prototype, C paths only - the harness): a portal
+ * span narrows each column to the wall edge's height AT THAT COLUMN (a
+ * flat wall's top/bottom edge projects to a straight screen line), not to
+ * the most conservative end value for the whole span. The span struct keeps
+ * the value at sx; hw_ap_lin_yt/yb hold the value at ex - 1. The harness
+ * sweep showed ~30-50% of the walked subsectors in dense E4 views ending
+ * 100% overdrawn, covered by nearer steps/ledges whose spans were recorded
+ * with the near-end height only. */
+#ifndef HW_AP_LINEAR
+#ifdef SATURN_WIN32
+#define HW_AP_LINEAR 0          /* harness prototype measured NO gain (2026-11-26): off */
+#else
+#define HW_AP_LINEAR 0          /* Saturn: hw_asm_portal / hw_asm_commit own the span layout */
+#endif
+#endif
+#if HW_AP_LINEAR
+static uint8_t hw_ap_lin_yt[HW_MAX_PORTAL_SPANS], hw_ap_lin_yb[HW_MAX_PORTAL_SPANS];
+static int hw_ap_lin_yt_e = 0, hw_ap_lin_yb_e = 0;   /* the next span's ex-1 values (set by the caller) */
+static int hw_ap_linear_on = -1;                     /* harness env HW_AP_LINEAR=0 turns it off */
+static inline int HW_ApLinearOn(void)
+{
+#ifdef SATURN_WIN32
+    if (hw_ap_linear_on < 0) { const char *e = getenv("HW_AP_LINEAR"); hw_ap_linear_on = e ? atoi(e) : 1; }
+    return hw_ap_linear_on;
+#else
+    return 1;
+#endif
+}
+#endif
+
 /* unused when hw_asm_portal (saturn_hw_walls.c) records spans itself */
 static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) void HW_RecordPortalSpan(int sx_ex, int ytop, int ybot, int yt_yb_att)
 {
+#if HW_AP_LINEAR
+    int lin = HW_ApLinearOn();
+    int ytop_e = lin ? hw_ap_lin_yt_e : ytop, ybot_e = lin ? hw_ap_lin_yb_e : ybot;
+    hw_ap_lin_yt_e = 0;
+    hw_ap_lin_yb_e = HW_VIEW_H;
+    if (ytop_e < 0) ytop_e = 0;
+    else if (ytop_e > HW_VIEW_H) ytop_e = HW_VIEW_H;
+    if (ybot_e < 0) ybot_e = 0;
+    else if (ybot_e > HW_VIEW_H) ybot_e = HW_VIEW_H;
+#endif
 #if HW_AP_1D
     (void)sx_ex; (void)ytop; (void)ybot; (void)yt_yb_att;
     return;
@@ -490,10 +530,25 @@ static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) void HW_RecordPortalSpan(in
     else if (yt_att > HW_VIEW_H) yt_att = HW_VIEW_H;
     if (yb_att < 0) yb_att = 0;
     else if (yb_att > HW_VIEW_H) yb_att = HW_VIEW_H;
+#if HW_AP_LINEAR
+    /* per column the edge can still pass the attach test at one end */
+#ifdef SATURN_WIN32
+    {
+        extern int hw_trace_sub_on;
+        if (hw_trace_sub_on)
+            printf("[SPAN] rec x %d..%d yt %d/%d yb %d/%d att yt %d yb %d\n", sx, ex, ytop, ytop_e, ybot, ybot_e, yt_att, yb_att);
+    }
+#endif
+    if (yt_att > (ytop > ytop_e ? ytop : ytop_e) + 1) ytop = ytop_e = 0;
+    if (yb_att < (ybot < ybot_e ? ybot : ybot_e) - 1) ybot = ybot_e = HW_VIEW_H;
+    if (sx >= ex || (ytop <= 0 && ytop_e <= 0 && ybot >= HW_VIEW_H && ybot_e >= HW_VIEW_H))
+        return;
+#else
     if (yt_att > ytop + 1) ytop = 0;
     if (yb_att < ybot - 1) ybot = HW_VIEW_H;
     if (sx >= ex || (ytop <= 0 && ybot >= HW_VIEW_H))
         return;
+#endif
     int idx = ap->portal_span_count;
     hw_portal_span_t *spans = ap->portal_spans;
     if (idx > 0)
@@ -505,12 +560,20 @@ static HW_NOINLINE HW_HOT_O2 __attribute__((unused)) void HW_RecordPortalSpan(in
             if (ybot < prev->ybot) prev->ybot = (uint8_t)ybot;
             if (yt_att < prev->yt_att) prev->yt_att = (uint8_t)yt_att;
             if (yb_att > prev->yb_att) prev->yb_att = (uint8_t)yb_att;
+#if HW_AP_LINEAR
+            if (ytop_e > hw_ap_lin_yt[idx - 1]) hw_ap_lin_yt[idx - 1] = (uint8_t)ytop_e;
+            if (ybot_e < hw_ap_lin_yb[idx - 1]) hw_ap_lin_yb[idx - 1] = (uint8_t)ybot_e;
+#endif
             return;
         }
     }
     if (idx < HW_MAX_PORTAL_SPANS)
     {
         hw_portal_span_t *cur = &spans[idx];
+#if HW_AP_LINEAR
+        hw_ap_lin_yt[idx] = (uint8_t)ytop_e;
+        hw_ap_lin_yb[idx] = (uint8_t)ybot_e;
+#endif
         cur->sx     = (int16_t)sx;
         cur->ex     = (int16_t)ex;
         cur->ytop   = (uint8_t)ytop;
@@ -972,7 +1035,48 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
     int yb_req  = yb_att + 2;
     unsigned int yb_span = (yb_req >= yb_base) ? (unsigned int)(yb_req - new_yb) : 0u;
 
-#if HW_AP_HALF
+#if HW_AP_LINEAR
+    {
+        /* per-column edge: ytop rounds down, ybot up (never over-narrow) */
+        int idx  = (int)(ps - ap->portal_spans);
+        int ytS  = ps->ytop, ytE = hw_ap_lin_yt[idx];
+        int ybS  = ps->ybot, ybE = hw_ap_lin_yb[idx];
+        int den  = ps->ex - 1 - ps->sx;
+#ifdef SATURN_WIN32
+        extern int hw_trace_sub_on;
+        if (hw_trace_sub_on)
+            printf("[SPANC] word %d x %d..%d do_yt %d do_yb %d yt_req %d yb_req %d | col %d: ytop %d ybot %d edge yt %d yb %d\n",
+                   w, x_s, x_e, do_yt, do_yb, yt_req, yb_req, x_s, ytop[x_s], ybot[x_s], ytS, ybS);
+#endif
+        for (int x = x_s; x < x_e; x++)
+        {
+            int nyt = ytS, nyb = ybS;
+            if (den > 0)
+            {
+                int num = x - ps->sx;
+                int dt = (ytE - ytS) * num, db = (ybE - ybS) * num;
+                nyt = ytS + ((dt >= 0) ? dt / den : -((-dt + den - 1) / den));     /* floor */
+                nyb = ybS + ((db >= 0) ? (db + den - 1) / den : -((-db) / den));   /* ceil */
+            }
+            int yt = ytop[x], yb = ybot[x], mod = 0;
+            if (do_yt && nyt > yt_req && yt >= yt_req && yt < nyt)
+            {
+                yt = nyt; ytop[x] = (uint8_t)nyt; mod = 1;
+            }
+            if (do_yb && yb_req >= nyb + 1 && yb >= nyb + 1 && yb <= yb_req)
+            {
+                yb = nyb; ybot[x] = (uint8_t)nyb; mod = 1;
+            }
+            if (mod)
+            {
+                w_mod = 1;
+                if (__builtin_expect(yt >= yb, 0))
+                    newly_closed |= hw_bit_lut[x & 31];
+            }
+        }
+        (void)yt_span; (void)yb_span; (void)yb_base; (void)new_yt; (void)new_yb;
+    }
+#elif HW_AP_HALF
     /* pairs fully inside [x_s, x_e) only; a closed pair closes both columns */
     {
         int h_s = (x_s + 1) >> 1;
@@ -1051,7 +1155,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordCols(
             return 2;
         return 1;
     }
+#if HW_AP_LINEAR
+    if (0)      /* per-column heights: let the caller rescan the word summary */
+#else
     if (w_mod && !touch_ret && !(w_and_flags & 8))
+#endif
     {
         hw_ap_word_t *aw = &hw_ap_words[w];
         int is_partial_clean = (w_and_flags & 4) && (x_s > x_w0 || x_e < x_w1);
@@ -1073,7 +1181,11 @@ static HW_NOINLINE HW_HOT_O2 int HW_UpdatePortalWordPartial(
     int w_and_flags, const hw_portal_span_t *ps)
 {
     int touch_ret = 0;
+#if HW_AP_LINEAR
+    if (0)      /* the whole-word fast path assumes one height per span */
+#else
     if (w_and_flags & 4)
+#endif
     {
         int w      = (int)((unsigned int)w_and_flags >> 8);
         int do_yt  = w_and_flags & 1;
@@ -1192,6 +1304,14 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(
     int new_yb = ps->ybot;
     int yt_att = ps->yt_att;
     int yb_att = ps->yb_att;
+#if HW_AP_LINEAR
+    {
+        /* filters only (the columns test exactly): the more narrowing end */
+        int idx = (int)(ps - HW_APERTURE->portal_spans);
+        if (hw_ap_lin_yt[idx] > new_yt) new_yt = hw_ap_lin_yt[idx];
+        if (hw_ap_lin_yb[idx] < new_yb) new_yb = hw_ap_lin_yb[idx];
+    }
+#endif
     int check_yt = (new_yt > 0 && yt_att <= new_yt + 1);
     int check_yb = (new_yb < saturn_view_h && yb_att >= new_yb - 1);
     if (!check_yt && !check_yb)
@@ -1207,8 +1327,8 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(
         hw_ap_word_t *aw = &hw_ap_words[w];
         uint32_t wbit = hw_bit_lut[w];
         int is_touched = (touched_words & wbit) != 0;
-        int do_yt = check_yt && (is_touched || ((ps->ytop > aw->yt_min) && (ps->yt_att <= aw->yt_max + 2)));
-        int do_yb = check_yb && (is_touched || ((ps->ybot < aw->yb_max) && (ps->yb_att >= aw->yb_min - 2)));
+        int do_yt = check_yt && (is_touched || ((new_yt > aw->yt_min) && (ps->yt_att <= aw->yt_max + 2)));
+        int do_yb = check_yb && (is_touched || ((new_yb < aw->yb_max) && (ps->yb_att >= aw->yb_min - 2)));
         if (!do_yt && !do_yb)
             continue;
 
