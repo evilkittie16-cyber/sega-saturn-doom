@@ -1210,8 +1210,11 @@ HW_W2_SHARED(volatile int32_t hw_far_cull, = HW_FAR_Z_UNITS << 12);
  * culled BSP nodes before, so it barely changed E4 views), the steps are
  * finer at long range, and a step that does not pay is taken back (see
  * Saturn_HW_AdaptiveDetail) - dense near scenes keep their far detail. */
+/* 2026-11-27 (user hardware photo, E1M1 window room at 33 FPS with L5: the
+ * courtyard buildings beyond 1280 units were missing): FULL by default -
+ * "render everything you can see". AUTO stays selectable (pause DETAIL). */
 #ifndef HW_AD_DEFAULT
-#define HW_AD_DEFAULT 1
+#define HW_AD_DEFAULT 0
 #endif
 HW_W2_SHARED(volatile int32_t hw_ad_mode, = HW_AD_DEFAULT);   /* 1 AUTO, 0 FULL (pause menu DETAIL) */
 HW_W2_SHARED(int saturn_hw_detail_level, = 0);                 /* HUD */
