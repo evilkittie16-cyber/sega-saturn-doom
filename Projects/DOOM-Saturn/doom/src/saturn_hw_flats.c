@@ -646,6 +646,10 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_EmitPolyQuads(vdp1_cmd_t *cmd_s_out,
     }
 }
 
+#ifndef HW_SCD_MEMO
+#define HW_SCD_MEMO 16      /* HW_ScreenClipDepth memo entries per CPU (power of 2; 0 = off) */
+#endif
+#define HW_SCD_SLOTS (HW_SCD_MEMO ? HW_SCD_MEMO : 1)
 typedef struct {
     vdp1_cmd_t             *cmd_s_out;
     saturn_proj_v_t        *proj_v;
@@ -706,6 +710,12 @@ typedef struct {
     uint8_t                 warp_cf;
     uint8_t                 warp_room;      /* saturn_warp_room: placeholders allowed */
     uint32_t                size_wbits;
+    /* HW_ScreenClipDepth memo (2026-11-27): a pure function of (y_w,
+     * limit), so a per-CPU direct-mapped table needs no invalidation.
+     * lim 0 = empty (the function clamps limit to >= 8). */
+    fixed_t                 scd_y[HW_SCD_SLOTS];
+    int32_t                 scd_lim[HW_SCD_SLOTS];
+    fixed_t                 scd_z[HW_SCD_SLOTS];
 } hw_flat_emit_ctx_t;
 
 /* Inline gate (2026-11-15): HW_FlatHoleBacking ran 182x per heavy frame at
@@ -1693,6 +1703,24 @@ static HW_NOINLINE HW_COLD_OS fixed_t HW_ScreenClipDepth(fixed_t y_w, int limit_
     return (fixed_t)(hi << FRACBITS);
 }
 
+/* Memoised HW_ScreenClipDepth (same result; one table per CPU's fctx). */
+HW_ALWAYS_INLINE fixed_t HW_ScreenClipDepthMemo(hw_flat_emit_ctx_t *fctx, fixed_t y_w, int limit_px)
+{
+#if HW_SCD_MEMO
+    unsigned k = ((unsigned)y_w >> 14 ^ (unsigned)y_w >> 18 ^ (unsigned)limit_px) & (HW_SCD_MEMO - 1);
+    if (fctx->scd_y[k] == y_w && fctx->scd_lim[k] == limit_px)
+        return fctx->scd_z[k];
+    fixed_t z = HW_ScreenClipDepth(y_w, limit_px);
+    fctx->scd_y[k] = y_w;
+    fctx->scd_lim[k] = limit_px;
+    fctx->scd_z[k] = z;
+    return z;
+#else
+    (void)fctx;
+    return HW_ScreenClipDepth(y_w, limit_px);
+#endif
+}
+
 /* Point where segment in->out (camera space) reaches depth z (in is in front). */
 HW_ALWAYS_INLINE void HW_SlideToDepth(fixed_t in_cx, fixed_t in_cz, fixed_t out_cx, fixed_t out_cz,
                                       fixed_t z, fixed_t *rcx, fixed_t *rcz, fixed_t *rf)
@@ -2484,9 +2512,9 @@ static HW_NOINLINE HW_HOT_O2 void HW_Worker_ProcessJob(
     fctx->ap_ybot          = (uint8_t)ap_ybot;
     /* Screen guard band of 16 px below / above the view for the banded emitter. */
     fctx->z_eff_floor = (emit_floor && quads && fctx->quv)
-        ? HW_ScreenClipDepth(y_floor_w, fctx->vh + 16 - fctx->vcy) : HW_NEAR_Z;
+        ? HW_ScreenClipDepthMemo(fctx, y_floor_w, fctx->vh + 16 - fctx->vcy) : HW_NEAR_Z;
     fctx->z_eff_ceil  = (emit_ceil && quads && fctx->quv)
-        ? HW_ScreenClipDepth(y_ceil_w, fctx->vcy + 16) : HW_NEAR_Z;
+        ? HW_ScreenClipDepthMemo(fctx, y_ceil_w, fctx->vcy + 16) : HW_NEAR_Z;
 
 #ifndef SATURN_WIN32
     if (solid_count <= 0)

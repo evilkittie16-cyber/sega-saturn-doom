@@ -300,7 +300,9 @@ typedef struct {
  * HW_MAX_AP_SUBSECTORS stays the size of the fast static flat-info table
  * (and the WRAM-L scratch layout); bigger maps use a PU_LEVEL table. */
 #define HW_MAX_AP_SECTORS     512
+#ifndef HW_MAX_AP_SUBSECTORS
 #define HW_MAX_AP_SUBSECTORS  608
+#endif
 #define HW_MAX_SUBSECTORS     1024
 #define HW_MAX_PORTAL_SEGS    336
 

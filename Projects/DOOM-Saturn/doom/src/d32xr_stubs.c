@@ -172,7 +172,10 @@ static byte scratch_buf[48 * 1024];
 static int  scratch_used = 0;
 
 __attribute__((aligned(16))) unsigned int saturn_master_oclut[3072];
-__attribute__((aligned(16))) uint32_t     hw_wram_h_sub_flat_info[608 * 4];
+#ifndef HW_MAX_AP_SUBSECTORS
+#define HW_MAX_AP_SUBSECTORS 608    /* must match saturn_hw_occl.c */
+#endif
+__attribute__((aligned(16))) uint32_t     hw_wram_h_sub_flat_info[HW_MAX_AP_SUBSECTORS * 4];
 __attribute__((aligned(16))) uint32_t     hw_wram_h_proj_verts_slave[960 * 4];
 #if defined(HW_WALK2) && HW_WALK2
 __attribute__((aligned(16))) uint32_t     hw_wram_h_slave_stack[1024];  /* + the split-frame walk */
