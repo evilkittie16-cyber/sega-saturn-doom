@@ -445,6 +445,12 @@ static int           saturn_fill_count = 0;
  * - the rest of the WAD fills in the background during play instead of a
  * 15-60 s load screen. */
 static int           saturn_fill_block_count = 0;
+/* SAROO XRAM: queue entries of passes 0-2 (flats, wall patches, sprites +
+ * the critical lumps): the level-load drain finishes these whatever the
+ * time, so nothing the renderer reads streams from CD mid-frame (it used to
+ * take 4+ level loads at 5 s each; the last wall patches came in as 100+ ms
+ * cold reads in play - user's E4M9 photo 2026-11-27, HUD Z12/9/0/0/1). */
+static int           saturn_fill_need_count = 0;
 #define XRAM_BLOCK_BYTES (SATURN_CART_REC_OFF - IWAD_DIR_BYTES)
 /* HUD fill readout (2026-11-25, Saturn_FillStats): first hot-region
  * offset, level loads seen, and the vblanks the last load spent in the
@@ -2268,6 +2274,8 @@ byte *I_WadBase(void)
     saturn_fill_block_count = -1;   /* set below (XRAM) or after the loop */
     for (pass = 0; pass < npasses; pass++)
     {
+        if (pass == 3)
+            saturn_fill_need_count = saturn_fill_count;   /* passes 0-2: what rendering reads */
         for (i = 0; i < numlumps; i++)
         {
             if (i < 4096 && (placed[i >> 3] & (1 << (i & 7))))
@@ -2309,7 +2317,15 @@ byte *I_WadBase(void)
             }
             else if (pass == 3)
             {
-                is_hot = 1;                     /* XRAM: everything left */
+                /* XRAM: everything left, except lumps the game never reads
+                 * in play: sound effects (DS*: s_sound.c loads all of them
+                 * into SCSP RAM once at startup), PC-speaker sounds (DP*) and
+                 * music (D_*: I_PlaySong is empty). They cost ~2 MB / ~5 s of
+                 * CD time ahead of the menus/intermission graphics
+                 * (2026-11-27, E4M9 hitch study). */
+                is_hot = !(dir[i].name[0] == 'D' &&
+                           (dir[i].name[1] == 'S' || dir[i].name[1] == 'P' ||
+                            dir[i].name[1] == '_'));
             }
             else /* pass == 2 */
             {
@@ -2530,10 +2546,16 @@ void saturn_iwad_fill_drain_all(void)
     {
         unsigned int v1 = saturn_vbl_count;
 
-        while (saturn_fill_active && saturn_fill_head < saturn_fill_count &&
-               (int)(saturn_vbl_count - v1) < XRAM_LOAD_SLICE_VBLS)
+        /* first the render lumps, to the end (60 s watchdog) ... */
+        while (saturn_fill_active && saturn_fill_head < saturn_fill_need_count &&
+               (int)(saturn_vbl_count - v1) < 60 * 60)
             saturn_iwad_background_fill();
-        saturn_fill_slice_vbls = (int)(saturn_vbl_count - v1);
+        unsigned int v2 = saturn_vbl_count;
+        /* ... then the usual 5 s slice of the rest */
+        while (saturn_fill_active && saturn_fill_head < saturn_fill_count &&
+               (int)(saturn_vbl_count - v2) < XRAM_LOAD_SLICE_VBLS)
+            saturn_iwad_background_fill();
+        saturn_fill_slice_vbls = (int)(saturn_vbl_count - v1);   /* HUD row 3 T x/n: both parts */
     }
     saturn_fill_boot_mode = 0;
     /* 2026-11-21: only switch the fill off when the queue really emptied;
