@@ -75,6 +75,83 @@ spawnthing_t* spawnthings;
 
 int16_t 	worldbbox[4];
 
+/* Per-level fast-RAM pool (2026-11-27, user: "move all you can into WRAM for
+ * each level"). The Z zone is the RAM cart, read through its cache-through
+ * alias: on the big maps every node/seg/line/vertex read by the game logic
+ * (sight checks, movement) was an uncached 16-bit A-bus access (5thPlanet,
+ * E4M9 fight: line-of-sight alone 13 ms per frame). This High WRAM pool
+ * replaces the old fixed arrays (608 subsectors / 256 sectors / 608 nodes,
+ * which the big maps overflowed into the cart anyway) and is handed out per
+ * level in order of use: LP_Plan reserves the arrays whose size is known
+ * from the lump lengths, by priority; the rest of the pool serves later
+ * requests (blocklinks, validcount, reject) first come first served.
+ * Anything that does not fit goes to the Z zone as before. Room for it:
+ * the makefile shrinks Jo's unused VDP1 command pipeline
+ * (JO_VDP1_MAX_COMMANDS). */
+#ifndef SATURN_LEVEL_POOL_BYTES
+#define SATURN_LEVEL_POOL_BYTES (88u * 1024u)
+#endif
+enum { LP_NODES, LP_BBOXES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_BMAP, LP_SIDES, LP_COUNT };
+static __attribute__((aligned(16))) uint8_t saturn_level_pool[SATURN_LEVEL_POOL_BYTES];
+static uint8_t *lp_slot[LP_COUNT];
+static unsigned int lp_next;                     /* first free byte of the pool */
+unsigned int saturn_level_pool_used = 0;         /* debug: bytes handed out this level */
+unsigned int saturn_level_pool_miss = 0;         /* debug: bit per LP_ slot / request that went to the zone */
+
+static unsigned int lp_round(unsigned int n) { return (n + 15u) & ~15u; }
+
+/* Lazy request from what the plan left (later, unknown-size arrays). */
+static void *LP_Alloc(unsigned int bytes, unsigned int miss_bit)
+{
+	bytes = lp_round(bytes);
+	if (bytes && lp_next + bytes <= SATURN_LEVEL_POOL_BYTES)
+	{
+		void *p = saturn_level_pool + lp_next;
+		lp_next += bytes;
+		saturn_level_pool_used = lp_next;
+		return p;
+	}
+	saturn_level_pool_miss |= miss_bit;
+	return NULL;
+}
+
+static void LP_Plan(int lumpnum)
+{
+	static const uint8_t order[LP_COUNT] = {
+		LP_NODES, LP_SSEC, LP_SECTORS, LP_SEGS, LP_LINES, LP_VERTS, LP_BBOXES, LP_BMAP, LP_SIDES
+	};
+	unsigned int need[LP_COUNT];
+	int i;
+	int nn = W_LumpLength(lumpnum + ML_NODES) / sizeof(mapnode_t);
+
+	need[LP_NODES]   = (unsigned)nn * sizeof(node_t);
+	need[LP_BBOXES]  = (unsigned)nn * sizeof(int16_t) * 8;
+	need[LP_SSEC]    = (unsigned)(W_LumpLength(lumpnum + ML_SSECTORS) / sizeof(mapsubsector_t) + 1) * sizeof(subsector_t);
+	need[LP_SECTORS] = (unsigned)(W_LumpLength(lumpnum + ML_SECTORS) / sizeof(mapsector_t)) * sizeof(sector_t);
+	need[LP_SEGS]    = (unsigned)(W_LumpLength(lumpnum + ML_SEGS) / sizeof(mapseg_t)) * sizeof(seg_t);
+	need[LP_LINES]   = (unsigned)(W_LumpLength(lumpnum + ML_LINEDEFS) / sizeof(maplinedef_t)) * sizeof(line_t);
+	need[LP_VERTS]   = (unsigned)(W_LumpLength(lumpnum + ML_VERTEXES) / sizeof(mapvertex_t)) * sizeof(mapvertex_t);
+	need[LP_BMAP]    = (unsigned)W_LumpLength(lumpnum + ML_BLOCKMAP);
+	need[LP_SIDES]   = (unsigned)(W_LumpLength(lumpnum + ML_SIDEDEFS) / sizeof(mapsidedef_t)) * sizeof(side_t);
+
+	lp_next = 0;
+	saturn_level_pool_used = 0;
+	saturn_level_pool_miss = 0;
+	for (i = 0; i < LP_COUNT; i++)
+	{
+		int s = order[i];
+		lp_slot[s] = (uint8_t *)LP_Alloc(need[s], 1u << s);
+	}
+}
+
+/* The planned block for slot s (once), or NULL = use the Z zone. */
+static void *LP_Take(int s)
+{
+	void *p = lp_slot[s];
+	lp_slot[s] = NULL;
+	return p;
+}
+
 /*
 =================
 =
@@ -91,8 +168,12 @@ void P_LoadVertexes (int lump)
 	mapvertex_t	*li;
 	
 	numvertexes = W_LumpLength (lump) / sizeof(mapvertex_t);
-	vertexes = Z_Malloc (numvertexes*sizeof(mapvertex_t) + 16,PU_LEVEL);
-	vertexes = (void*)(((uintptr_t)vertexes + 15) & ~15); // aline on cacheline boundary
+	vertexes = LP_Take(LP_VERTS);
+	if (!vertexes)
+	{
+		vertexes = Z_Malloc (numvertexes*sizeof(mapvertex_t) + 16,PU_LEVEL);
+		vertexes = (void*)(((uintptr_t)vertexes + 15) & ~15); // aline on cacheline boundary
+	}
 	data = W_GetLumpData(lump);
 
 	ml = (mapvertex_t *)data;
@@ -157,8 +238,12 @@ void P_LoadSegs (int lump)
 #endif
 
 	numsegs = W_LumpLength (lump) / sizeof(mapseg_t);
-	segs = Z_Malloc (numsegs*sizeof(seg_t)+16,PU_LEVEL);
-	segs = (void*)(((uintptr_t)segs + 15) & ~15); // aline on cacheline boundary
+	segs = LP_Take(LP_SEGS);
+	if (!segs)
+	{
+		segs = Z_Malloc (numsegs*sizeof(seg_t)+16,PU_LEVEL);
+		segs = (void*)(((uintptr_t)segs + 15) & ~15); // aline on cacheline boundary
+	}
 	D_memset (segs, 0, numsegs*sizeof(seg_t));
 	data = W_GetLumpData(lump);
 
@@ -187,15 +272,6 @@ void P_LoadSegs (int lump)
 =
 =================
 */
-
-#define SATURN_MAX_STATIC_SSECTORS 608
-#define SATURN_MAX_STATIC_SECTORS  256
-#define SATURN_MAX_STATIC_NODES    608
-
-static __attribute__((aligned(16))) subsector_t hw_wram_h_subsectors[SATURN_MAX_STATIC_SSECTORS];
-static __attribute__((aligned(16))) sector_t    hw_wram_h_sectors[SATURN_MAX_STATIC_SECTORS];
-static __attribute__((aligned(16))) node_t      hw_wram_h_nodes[SATURN_MAX_STATIC_NODES];
-static __attribute__((aligned(16))) int16_t     hw_wram_h_node_bboxes[SATURN_MAX_STATIC_NODES][2][4];
 
 void P_LoadSubsectors (int lump)
 {
@@ -235,9 +311,8 @@ void P_LoadSubsectors (int lump)
 
 	numsubsectors = W_LumpLength (lump) / sizeof(mapsubsector_t);
 	count = numsubsectors+1;
-	if (count <= SATURN_MAX_STATIC_SSECTORS)
-		subsectors = hw_wram_h_subsectors;
-	else
+	subsectors = LP_Take(LP_SSEC);
+	if (!subsectors)
 		subsectors = Z_Malloc (count*sizeof(subsector_t),PU_LEVEL);
 	data = W_GetLumpData(lump);
 
@@ -276,11 +351,8 @@ void P_LoadSectors (int lump)
 	int 			tag;
 			
 	numsectors = W_LumpLength (lump) / sizeof(mapsector_t);
-	if (numsectors <= SATURN_MAX_STATIC_SECTORS)
-	{
-		sectors = hw_wram_h_sectors;
-	}
-	else
+	sectors = LP_Take(LP_SECTORS);
+	if (!sectors)
 	{
 		sectors = Z_Malloc (numsectors*sizeof(sector_t) + 16,PU_LEVEL);
 		sectors = (void*)(((uintptr_t)sectors + 15) & ~15); // aline on cacheline boundary
@@ -478,11 +550,8 @@ void P_LoadNodes (int lump)
 #ifdef SATURN_WIN32
 	printf("P_LoadNodes: data=%p, allocating nodes\n", data); fflush(stdout);
 #endif
-	if (numnodes <= SATURN_MAX_STATIC_NODES)
-	{
-		nodes = hw_wram_h_nodes;
-	}
-	else
+	nodes = LP_Take(LP_NODES);
+	if (!nodes)
 	{
 		nodes = Z_Malloc (numnodes*sizeof(node_t) + 16,PU_LEVEL);
 		nodes = (void*)(((uintptr_t)nodes + 15) & ~15); // aline on cacheline boundary
@@ -490,9 +559,8 @@ void P_LoadNodes (int lump)
 	bboxes = (void *)I_FrameBuffer();
 
 	extern int16_t (*hw_node_bboxes)[2][4];
-	if (numnodes <= SATURN_MAX_STATIC_NODES)
-		hw_node_bboxes = hw_wram_h_node_bboxes;
-	else
+	hw_node_bboxes = LP_Take(LP_BBOXES);
+	if (!hw_node_bboxes)
 		hw_node_bboxes = Z_Malloc(numnodes * sizeof(int16_t) * 8, PU_LEVEL);
 
 	mn = (mapnode_t *)data;
@@ -639,8 +707,12 @@ void P_LoadLineDefs (int lump)
 	line_t			*ld;
 
 	numlines = W_LumpLength (lump) / sizeof(maplinedef_t);
-	lines = Z_Malloc (numlines*sizeof(line_t)+16,PU_LEVEL);
-	lines = (void*)(((uintptr_t)lines + 15) & ~15); // aline on cacheline boundary
+	lines = LP_Take(LP_LINES);
+	if (!lines)
+	{
+		lines = Z_Malloc (numlines*sizeof(line_t)+16,PU_LEVEL);
+		lines = (void*)(((uintptr_t)lines + 15) & ~15); // aline on cacheline boundary
+	}
 	D_memset (lines, 0, numlines*sizeof(line_t));
 	data = W_GetLumpData(lump);
 	numlinetags = 0;
@@ -734,8 +806,12 @@ void P_LoadSideDefs (int lump)
 		textures[i].usecount = 0;
 #endif	
 	numsides = W_LumpLength (lump) / sizeof(mapsidedef_t);
-	sides = Z_Malloc (numsides*sizeof(side_t)+16,PU_LEVEL);
-	sides = (void*)(((uintptr_t)sides + 15) & ~15); // aline on cacheline boundary
+	sides = LP_Take(LP_SIDES);
+	if (!sides)
+	{
+		sides = Z_Malloc (numsides*sizeof(side_t)+16,PU_LEVEL);
+		sides = (void*)(((uintptr_t)sides + 15) & ~15); // aline on cacheline boundary
+	}
 	D_memset (sides, 0, numsides*sizeof(side_t));
 	data = W_GetLumpData(lump);
 
@@ -780,7 +856,9 @@ void P_LoadRejectMatrix (int lump)
 	outsize = (numsectors + 1) * numsectors / 2;
 	outsize = (outsize + 7) / 8;
 
-	rejectmatrix = Z_Malloc (outsize,PU_LEVEL);
+	rejectmatrix = LP_Alloc(outsize, 1u << 16);
+	if (!rejectmatrix)
+		rejectmatrix = Z_Malloc (outsize,PU_LEVEL);
 	D_memset(rejectmatrix, 0, outsize);
 	data = W_GetLumpData(lump);
 
@@ -827,8 +905,18 @@ void P_LoadBlockMap (int lump)
 	int		i;
 	int		count;
 
-	blockmaplump = Z_Malloc (W_LumpLength (lump),PU_LEVEL);
+	blockmaplump = LP_Take(LP_BMAP);
+	if (!blockmaplump)
+		blockmaplump = Z_Malloc (W_LumpLength (lump),PU_LEVEL);
 	W_ReadLump (lump,blockmaplump);
+#ifndef SATURN_WIN32
+	{
+		/* W_ReadLump may fill it by DMA, behind the master's cache: the
+		 * pool held the previous level's data at these addresses */
+		extern void Saturn_MasterCachePurge(void);
+		Saturn_MasterCachePurge();
+	}
+#endif
 	count = W_LumpLength (lump)/2;
 	for (i=0 ; i<count ; i++)
 		blockmaplump[i] = LITTLESHORT(blockmaplump[i]);
@@ -840,7 +928,9 @@ void P_LoadBlockMap (int lump)
 
 /* clear out mobj chains */
 	count = sizeof(*blocklinks)* bmapwidth*bmapheight;
-	blocklinks = Z_Malloc (count,PU_LEVEL);
+	blocklinks = LP_Alloc(count, 1u << 17);
+	if (!blocklinks)
+		blocklinks = Z_Malloc (count,PU_LEVEL);
 	D_memset (blocklinks, 0, count);
 }
 
@@ -1217,6 +1307,9 @@ D_printf ("P_SetupLevel(%s,%i)\n",lumpname,skill);
 	}
 #endif
 
+	/* reserve the per-level High WRAM pool before the loads use it */
+	LP_Plan(lumpnum);
+
 /* note: most of this ordering is important	 */
 	/* Saturn debug sub-stage: MEDIUM PURPLE + the lump name while each map
 	 * struct load runs (each is a COLD lump streamed from CD through the
@@ -1303,10 +1396,14 @@ D_printf ("P_SetupLevel(%s,%i)\n",lumpname,skill);
 	printf("P_SetupLevel: Baked files loaded. Allocating validcount\n"); fflush(stdout);
 #endif
 
-	if ((size_t)(numlines + 1) * sizeof(*validcount) <= 0x2000u)
-		validcount = (VINT *)((uintptr_t)SATURN_WRAM_L_DIVLUT_ADDR + 0x6000u);
-	else
-		validcount = Z_Malloc((numlines + 1) * sizeof(*validcount), PU_LEVEL);
+	validcount = LP_Alloc((numlines + 1) * sizeof(*validcount), 1u << 18);
+	if (!validcount)
+	{
+		if ((size_t)(numlines + 1) * sizeof(*validcount) <= 0x2000u)
+			validcount = (VINT *)((uintptr_t)SATURN_WRAM_L_DIVLUT_ADDR + 0x6000u);
+		else
+			validcount = Z_Malloc((numlines + 1) * sizeof(*validcount), PU_LEVEL);
+	}
 	D_memset(validcount, 0, (numlines + 1) * sizeof(*validcount));
 	validcount[0] = 1; // cpu 0
 

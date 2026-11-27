@@ -187,8 +187,8 @@ unsigned int saturn_pad_edges = 0;
 
 void Saturn_G_Ticker(void)
 {
-#if SATURN_BENCH
-    return;     /* benchmark tour: frozen world (saturn_bench.c) */
+#if SATURN_BENCH && !defined(BENCH_LIVE)
+    return;     /* benchmark tour: frozen world (saturn_bench.c); -DBENCH_LIVE runs it (game-logic profiles) */
 #endif
     /* r105 UI: pause + quit-to-title. d32xr's MARS P_CheckCheats only
      * handles cheats once ALREADY paused — the toggle itself is ours.

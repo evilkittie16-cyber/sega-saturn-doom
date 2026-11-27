@@ -3048,3 +3048,12 @@ void hw_w2_init(void)
     }
 }
 #endif
+/* Master cache purge (p_setup.c P_LoadBlockMap): the per-level High WRAM
+ * pool is filled by W_ReadLump, possibly by DMA behind the master's cache,
+ * at addresses that held the previous level's data (2026-11-27). */
+void Saturn_MasterCachePurge(void)
+{
+#ifndef SATURN_WIN32
+    HW_PURGE_L1_CACHE();
+#endif
+}

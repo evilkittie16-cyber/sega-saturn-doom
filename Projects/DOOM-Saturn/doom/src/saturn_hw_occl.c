@@ -1348,6 +1348,9 @@ static HW_NOINLINE HW_HOT_O2 uint32_t HW_CommitPortalSpan(
 }
 #endif
 
+#if HW_ASM && !HW_ASM_COMMIT
+const void *const hw_asm_commit_ctx[15] = { 0 };   /* asm stays linked, unused (e.g. -DHW_DBG_OCCLUSION=0) */
+#endif
 #if HW_ASM_COMMIT
 extern void hw_asm_commit(void);
 _Static_assert(offsetof(hw_aperture_state_t, aperture_active) == 2 &&

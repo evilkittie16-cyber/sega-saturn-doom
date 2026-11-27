@@ -113,6 +113,10 @@ COMPILER_DIR=../../Compiler
 CCFLAGS += -I./doom/src -I./doom/d32xr
 # -fpermissive removed for C compilation
 CCFLAGS += -DMARS=1 -DSATURN=1
+# Jo's VDP1 command pipeline only draws a couple of 2D sprites here (the game
+# has its own VDP1 lists): 128 commands instead of 1000 frees ~63 KB of High
+# WRAM for the per-level fast pool (p_setup.c SATURN_LEVEL_POOL_BYTES).
+CCFLAGS += -DJO_VDP1_MAX_COMMANDS=128
 # Profiling build: `set SATURN_PROF=1` before compile.bat. Turns on the
 # per-subsector sub-timers, so the HUD prints B<bsp>/<aperture>/<occlusion>
 # and G<segs>/<wall quads>/<portals> (ms).
